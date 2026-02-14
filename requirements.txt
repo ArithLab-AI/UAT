@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg2-binary
+pydantic>=2.0
+pydantic-settings
+python-jose[cryptography]
+passlib[bcrypt,argon2]
+argon2-cffi
+python-dotenv
