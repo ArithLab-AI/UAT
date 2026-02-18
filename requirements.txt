@@ -8,3 +8,5 @@ python-jose[cryptography]
 passlib[bcrypt,argon2]
 argon2-cffi
 python-dotenv
+pydantic[email]
+python-jose
