@@ -1,7 +1,6 @@
 from pydantic import BaseModel
 from datetime import datetime
 
-
 class PlanResponse(BaseModel):
     id: int
     name: str
@@ -11,10 +10,8 @@ class PlanResponse(BaseModel):
     class Config:
         from_attributes = True
 
-
 class SubscribeRequest(BaseModel):
     plan_id: int
-
 
 class SubscriptionResponse(BaseModel):
     id: int
@@ -22,6 +19,7 @@ class SubscriptionResponse(BaseModel):
     start_date: datetime
     end_date: datetime
     status: str
+    remaining_days: int
 
     class Config:
         from_attributes = True

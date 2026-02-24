@@ -10,6 +10,7 @@ from app.config.deps import get_current_user, send_otp_email
 from app.config.config import settings
 from app.auth.security import hash_password, verify_password
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from app.models.subscription_models import SubscriptionPlan, UserSubscription
 
 security = HTTPBearer()
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -47,7 +48,20 @@ def register(payload: auth_schema.Register, db: Session = Depends(get_db)):
     db.add(user)
     db.commit()
     db.refresh(user)
-
+    free_plan = db.query(SubscriptionPlan).filter(
+        SubscriptionPlan.name == "Free",
+        SubscriptionPlan.is_active == True
+    ).first()
+    if free_plan:
+        subscription = UserSubscription(
+            user_id=user.id,
+            plan_id=free_plan.id,
+            start_date=datetime.utcnow(),
+            end_date=datetime.utcnow() + timedelta(days=free_plan.duration_days),
+            status="active"
+        )
+        db.add(subscription)
+        db.commit()
     return user
 
 @router.post("/login", response_model=auth_schema.Token)
