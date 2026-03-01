@@ -1,4 +1,5 @@
 import secrets
+import logging
 from app.models import auth_models
 from app.schemas import auth_schema
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -13,11 +14,14 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 security = HTTPBearer()
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+logger = logging.getLogger(__name__)
 
 @router.post("/register", response_model=auth_schema.UserResponse, status_code=201)
 def register(payload: auth_schema.Register, db: Session = Depends(get_db)):
+    logger.info("Register requested for email=%s username=%s", payload.email, payload.username)
 
     if len(payload.password) < 8:
+        logger.warning("Register rejected for email=%s: weak password", payload.email)
         raise HTTPException(
             status_code=400,
             detail="Password must be at least 8 characters"
@@ -28,6 +32,7 @@ def register(payload: auth_schema.Register, db: Session = Depends(get_db)):
     ).first()
 
     if existing_email:
+        logger.warning("Register rejected for email=%s: email already registered", payload.email)
         raise HTTPException(status_code=400, detail="Email already registered")
 
     existing_username = db.query(auth_models.User).filter(
@@ -35,6 +40,7 @@ def register(payload: auth_schema.Register, db: Session = Depends(get_db)):
     ).first()
 
     if existing_username:
+        logger.warning("Register rejected for username=%s: username already taken", payload.username)
         raise HTTPException(status_code=400, detail="Username already taken")
 
     user = auth_models.User(
@@ -47,29 +53,34 @@ def register(payload: auth_schema.Register, db: Session = Depends(get_db)):
     db.add(user)
     db.commit()
     db.refresh(user)
+    logger.info("User registered successfully user_id=%s email=%s", user.id, user.email)
 
     return user
 
 @router.post("/login", response_model=auth_schema.Token)
 def login(payload: auth_schema.Login, db: Session = Depends(get_db)):
+    logger.info("Login requested for email=%s", payload.email)
 
     user = db.query(auth_models.User).filter(
         auth_models.User.email == payload.email
     ).first()
 
     if not user or not user.password:
+        logger.warning("Login failed for email=%s: user not found or password missing", payload.email)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials"
         )
 
     if not verify_password(payload.password, user.password):
+        logger.warning("Login failed for email=%s: invalid credentials", payload.email)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials"
         )
 
     if not user.is_verified:
+        logger.warning("Login blocked for email=%s: account not verified", payload.email)
         raise HTTPException(
             status_code=403,
             detail="Account not verified"
@@ -80,6 +91,7 @@ def login(payload: auth_schema.Login, db: Session = Depends(get_db)):
 
     access_token = auth.create_access_token({"sub": user.email})
     refresh_token = auth.create_refresh_token({"sub": user.email})
+    logger.info("Login successful user_id=%s email=%s", user.id, user.email)
 
     return {
         "access_token": access_token,
@@ -89,12 +101,14 @@ def login(payload: auth_schema.Login, db: Session = Depends(get_db)):
 
 @router.post("/request-otp")
 def request_otp(payload: auth_schema.RequestOTP, db: Session = Depends(get_db)):
+    logger.info("OTP request initiated for email=%s", payload.email)
 
     user = db.query(auth_models.User).filter(
         auth_models.User.email == payload.email
     ).first()
 
     if not user:
+        logger.warning("OTP request failed: user not found for email=%s", payload.email)
         raise HTTPException(status_code=404, detail="User not found")
 
     db.query(auth_models.OTP).filter(
@@ -116,11 +130,13 @@ def request_otp(payload: auth_schema.RequestOTP, db: Session = Depends(get_db)):
     db.commit()
 
     send_otp_email(payload.email, otp_code)
+    logger.info("OTP generated and sent for email=%s", payload.email)
 
     return {"message": "OTP sent successfully"}
 
 @router.post("/verify-otp", response_model=auth_schema.Token)
 def verify_otp(payload: auth_schema.VerifyOTP, db: Session = Depends(get_db)):
+    logger.info("OTP verification requested for email=%s", payload.email)
 
     db_otp = db.query(auth_models.OTP).filter(
         auth_models.OTP.email == payload.email,
@@ -128,12 +144,15 @@ def verify_otp(payload: auth_schema.VerifyOTP, db: Session = Depends(get_db)):
     ).order_by(auth_models.OTP.id.desc()).first()
 
     if not db_otp:
+        logger.warning("OTP verification failed for email=%s: OTP not found", payload.email)
         raise HTTPException(status_code=400, detail="OTP not found")
 
     if db_otp.expires_at < datetime.utcnow():
+        logger.warning("OTP verification failed for email=%s: OTP expired", payload.email)
         raise HTTPException(status_code=400, detail="OTP expired")
 
     if db_otp.otp_code != payload.otp:
+        logger.warning("OTP verification failed for email=%s: invalid OTP", payload.email)
         raise HTTPException(status_code=400, detail="Invalid OTP")
 
     user = db.query(auth_models.User).filter(
@@ -141,6 +160,7 @@ def verify_otp(payload: auth_schema.VerifyOTP, db: Session = Depends(get_db)):
     ).first()
 
     if not user:
+        logger.warning("OTP verification failed for email=%s: user not found", payload.email)
         raise HTTPException(status_code=404, detail="User not found")
 
     db_otp.is_used = True
@@ -149,6 +169,7 @@ def verify_otp(payload: auth_schema.VerifyOTP, db: Session = Depends(get_db)):
 
     access_token = auth.create_access_token({"sub": user.email})
     refresh_token = auth.create_refresh_token({"sub": user.email})
+    logger.info("OTP verification successful for user_id=%s email=%s", user.id, user.email)
 
     return {
         "access_token": access_token,
@@ -158,12 +179,14 @@ def verify_otp(payload: auth_schema.VerifyOTP, db: Session = Depends(get_db)):
 
 @router.post("/forgot-password")
 def forgot_password(payload: auth_schema.ForgotPassword, db: Session = Depends(get_db)):
+    logger.info("Forgot-password requested for email=%s", payload.email)
 
     user = db.query(auth_models.User).filter(
         auth_models.User.email == payload.email
     ).first()
 
     if not user:
+        logger.warning("Forgot-password failed: user not found for email=%s", payload.email)
         raise HTTPException(status_code=404, detail="User not found")
 
     # Delete previous unused OTPs
@@ -186,13 +209,16 @@ def forgot_password(payload: auth_schema.ForgotPassword, db: Session = Depends(g
     db.commit()
 
     send_otp_email(user.email, otp_code)
+    logger.info("Forgot-password OTP sent for user_id=%s email=%s", user.id, user.email)
 
     return {"message": "Password reset OTP sent"}
 
 @router.post("/reset-password")
 def reset_password(payload: auth_schema.ResetPassword, db: Session = Depends(get_db)):
+    logger.info("Reset-password requested for email=%s", payload.email)
 
     if len(payload.new_password) < 8:
+        logger.warning("Reset-password rejected for email=%s: weak password", payload.email)
         raise HTTPException(
             status_code=400,
             detail="Password must be at least 8 characters"
@@ -204,12 +230,15 @@ def reset_password(payload: auth_schema.ResetPassword, db: Session = Depends(get
     ).order_by(auth_models.OTP.id.desc()).first()
 
     if not db_otp:
+        logger.warning("Reset-password failed for email=%s: OTP not found", payload.email)
         raise HTTPException(status_code=400, detail="OTP not found")
 
     if db_otp.expires_at < datetime.utcnow():
+        logger.warning("Reset-password failed for email=%s: OTP expired", payload.email)
         raise HTTPException(status_code=400, detail="OTP expired")
 
     if db_otp.otp_code != payload.otp:
+        logger.warning("Reset-password failed for email=%s: invalid OTP", payload.email)
         raise HTTPException(status_code=400, detail="Invalid OTP")
 
     user = db.query(auth_models.User).filter(
@@ -217,17 +246,20 @@ def reset_password(payload: auth_schema.ResetPassword, db: Session = Depends(get
     ).first()
 
     if not user:
+        logger.warning("Reset-password failed: user not found for email=%s", payload.email)
         raise HTTPException(status_code=404, detail="User not found")
 
     user.password = hash_password(payload.new_password)
     db_otp.is_used = True
 
     db.commit()
+    logger.info("Password reset successful for user_id=%s email=%s", user.id, user.email)
 
     return {"message": "Password reset successful"}
 
 @router.get("/protected", response_model=auth_schema.ProtectedResponse)
 def protected_route(current_user: auth_models.User = Depends(get_current_user)):
+    logger.info("Protected route accessed by user_id=%s", current_user.id)
     return {
         "message": f"Welcome back, {current_user.username}",
         "user": {
@@ -248,8 +280,6 @@ def logout(
 
     db.add(blacklisted_token)
     db.commit()
+    logger.info("User logged out and token blacklisted")
 
     return {"message": "Successfully logged out"}
-
-
-
