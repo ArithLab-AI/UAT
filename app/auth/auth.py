@@ -1,6 +1,9 @@
 from datetime import datetime, timedelta
+import logging
 from jose import jwt
 from app.config.config import settings
+
+logger = logging.getLogger(__name__)
 
 def create_token(data: dict, expires_delta: timedelta, token_type: str):
     to_encode = data.copy()
@@ -10,11 +13,18 @@ def create_token(data: dict, expires_delta: timedelta, token_type: str):
         "exp": now + expires_delta,
         "type": token_type
     })
-    return jwt.encode(
+    token = jwt.encode(
         to_encode,
         settings.SECRET_KEY,
         algorithm=settings.ALGORITHM
     )
+    logger.debug(
+        "Created %s token for subject=%s exp=%s",
+        token_type,
+        to_encode.get("sub"),
+        to_encode.get("exp"),
+    )
+    return token
 
 def create_access_token(data: dict):
     return create_token(

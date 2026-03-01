@@ -1,5 +1,8 @@
+import logging
 from sqlalchemy.orm import Session
 from app.models.subscription_models import SubscriptionPlan
+
+logger = logging.getLogger(__name__)
 
 def seed_subscription_plans(db: Session):
     plans = [
@@ -37,9 +40,12 @@ def seed_subscription_plans(db: Session):
         },
     ]
 
+    inserted_count = 0
     for plan in plans:
         existing = db.query(SubscriptionPlan).filter_by(name=plan["name"]).first()
         if not existing:
             db.add(SubscriptionPlan(**plan))
+            inserted_count += 1
 
     db.commit()
+    logger.info("Subscription plans seeded: inserted=%s total_defined=%s", inserted_count, len(plans))
