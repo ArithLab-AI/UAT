@@ -1,9 +1,6 @@
 name: Deploy Backend to AWS App Runner
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 env:
