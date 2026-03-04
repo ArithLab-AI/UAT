@@ -5,8 +5,8 @@ from app.routes.auth_route import router as auth_router
 from app.routes.subscription_route import router as subscription_router
 from app.routes.health_route import router as health_router
 from app.db.database import engine, Base, SessionLocal
-from app.config.settings import settings
-from app.utils.seed import seed_subscription_plans
+from app.config.config import settings
+from app.utils.subs_plan_seed import seed_subscription_plans
 
 configure_logging()
 logger = get_logger(__name__)
