@@ -46,6 +46,8 @@ def register(payload: auth_schema.Register, db: Session = Depends(get_db)):
     user = auth_models.User(
         email=payload.email,
         username=payload.username,
+        first_name=payload.first_name,
+        last_name=payload.last_name,
         password=hash_password(payload.password),
         is_verified=True
     )
