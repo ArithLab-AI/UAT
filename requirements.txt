@@ -10,3 +10,4 @@ argon2-cffi
 python-dotenv
 pydantic[email]
 python-jose
+python-multipart

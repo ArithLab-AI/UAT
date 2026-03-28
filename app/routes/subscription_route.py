@@ -45,14 +45,19 @@ def subscribe(
         raise HTTPException(status_code=404, detail="Plan not found")
 
     # Expire old subscription if exists
-    old_subscription = db.query(UserSubscription).filter(
+    old_subscriptions = db.query(UserSubscription).filter(
         UserSubscription.user_id == current_user.id,
         UserSubscription.status == "active"
-    ).first()
+    ).all()
 
-    if old_subscription:
-        old_subscription.status = "expired"
-        logger.info("Expired previous subscription id=%s for user_id=%s", old_subscription.id, current_user.id)
+    if old_subscriptions:
+        for old_subscription in old_subscriptions:
+            old_subscription.status = "expired"
+            logger.info(
+                "Expired previous subscription id=%s for user_id=%s",
+                old_subscription.id,
+                current_user.id,
+            )
 
     start_date = datetime.utcnow()
     end_date = start_date + timedelta(days=plan.duration_days)
@@ -83,7 +88,7 @@ def my_subscription(
     subscription = db.query(UserSubscription).filter(
         UserSubscription.user_id == current_user.id,
         UserSubscription.status == "active"
-    ).first()
+    ).order_by(UserSubscription.id.desc()).first()
 
     if not subscription:
         logger.warning("No active subscription for user_id=%s", current_user.id)
@@ -110,7 +115,7 @@ def cancel_subscription(
     subscription = db.query(UserSubscription).filter(
         UserSubscription.user_id == current_user.id,
         UserSubscription.status == "active"
-    ).first()
+    ).order_by(UserSubscription.id.desc()).first()
 
     if not subscription:
         logger.warning("Cancel subscription failed: no active subscription for user_id=%s", current_user.id)

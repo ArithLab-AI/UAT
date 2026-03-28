@@ -2,10 +2,12 @@ import time
 from fastapi import FastAPI, Request
 from app.core.logging_config import configure_logging, get_logger
 from app.routes.auth_route import router as auth_router
+from app.routes.csv_dataset_route import router as csv_dataset_router
 from app.routes.subscription_route import router as subscription_router
 from app.routes.health_route import router as health_router
 from app.db.database import engine, Base, SessionLocal
 from app.config.config import settings
+from app.utils.csv_dataset_setup import ensure_csv_dataset_schema
 from app.utils.subs_plan_seed import seed_subscription_plans
 
 configure_logging()
@@ -13,9 +15,10 @@ logger = get_logger(__name__)
 
 app = FastAPI(title="Authentication API")
 
+app.include_router(health_router)
 app.include_router(auth_router)
 app.include_router(subscription_router)
-app.include_router(health_router)
+app.include_router(csv_dataset_router)
 
 
 @app.middleware("http")
@@ -59,6 +62,7 @@ def startup_event():
         return
 
     Base.metadata.create_all(bind=engine)
+    ensure_csv_dataset_schema(engine)
     db = SessionLocal()
     try:
         seed_subscription_plans(db)
