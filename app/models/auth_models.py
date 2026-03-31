@@ -2,6 +2,7 @@ from sqlalchemy import Column, Integer, String, DateTime, Boolean
 from sqlalchemy.sql import func
 from app.db.database import Base
 from datetime import datetime
+from app.enum.user_role_enum import UserRoleEnum
 
 class User(Base):
     __tablename__ = "users"
@@ -12,6 +13,9 @@ class User(Base):
     first_name = Column(String, nullable=True)
     last_name = Column(String, nullable=True)
     password = Column(String, nullable=True)
+    user_role = Column(Integer,nullable=False,
+        server_default=str(UserRoleEnum.buisiness.value),
+    )
     is_verified = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     last_login = Column(DateTime(timezone=True), nullable=True)
@@ -23,7 +27,7 @@ class OTP(Base):
     email = Column(String, index=True)
     otp_code = Column(String, nullable=False)
     expires_at = Column(DateTime, nullable=False)
-    is_used = Column(Boolean, default=False) 
+    is_used = Column(Boolean, default=False)
 
 class TokenBlacklist(Base):
     __tablename__ = "token_blacklist"

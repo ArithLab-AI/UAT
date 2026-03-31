@@ -10,6 +10,7 @@ from app.db.database import get_db
 from app.config.deps import get_current_user, send_otp_email
 from app.config.config import settings
 from app.auth.security import hash_password, verify_password
+from app.services.subscription_service import ensure_default_free_subscription
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 security = HTTPBearer()
@@ -48,6 +49,7 @@ def register(payload: auth_schema.Register, db: Session = Depends(get_db)):
         username=payload.username,
         first_name=payload.first_name,
         last_name=payload.last_name,
+        user_role=payload.user_role,
         password=hash_password(payload.password),
         is_verified=True
     )
@@ -89,6 +91,7 @@ def login(payload: auth_schema.Login, db: Session = Depends(get_db)):
         )
 
     user.last_login = datetime.utcnow()
+    ensure_default_free_subscription(db, user.id)
     db.commit()
 
     access_token = auth.create_access_token({"sub": user.email})
@@ -167,6 +170,7 @@ def verify_otp(payload: auth_schema.VerifyOTP, db: Session = Depends(get_db)):
 
     db_otp.is_used = True
     user.last_login = datetime.utcnow()
+    ensure_default_free_subscription(db, user.id)
     db.commit()
 
     access_token = auth.create_access_token({"sub": user.email})
@@ -267,6 +271,7 @@ def protected_route(current_user: auth_models.User = Depends(get_current_user)):
         "user": {
             "username": current_user.username,
             "email": current_user.email,
+            "user_role": current_user.user_role,
             "last_login": current_user.last_login
         }
     }

@@ -2,7 +2,6 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
-
 from app.db.database import get_db
 from app.models.subscription_models import SubscriptionPlan, UserSubscription
 from app.models.auth_models import User
@@ -17,11 +16,20 @@ router = APIRouter(prefix="/subscriptions", tags=["Subscriptions"])
 logger = logging.getLogger(__name__)
 
 @router.get("/plans", response_model=list[PlanResponse])
-def get_plans(db: Session = Depends(get_db)):
+def get_plans(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     plans = db.query(SubscriptionPlan).filter(
+        SubscriptionPlan.user_role == current_user.user_role,
         SubscriptionPlan.is_active == True
     ).all()
-    logger.info("Fetched %s active subscription plans", len(plans))
+    logger.info(
+        "Fetched %s active subscription plans for user_id=%s user_role=%s",
+        len(plans),
+        current_user.id,
+        current_user.user_role,
+    )
     return plans
 
 @router.post("/subscribe", response_model=SubscriptionResponse)
@@ -44,15 +52,33 @@ def subscribe(
         )
         raise HTTPException(status_code=404, detail="Plan not found")
 
+    if plan.user_role != current_user.user_role:
+        logger.warning(
+            "Subscribe failed for user_id=%s: plan_id=%s role mismatch user_role=%s plan_role=%s",
+            current_user.id,
+            payload.plan_id,
+            current_user.user_role,
+            plan.user_role,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="You can only subscribe to plans for your user role",
+        )
+
     # Expire old subscription if exists
-    old_subscription = db.query(UserSubscription).filter(
+    old_subscriptions = db.query(UserSubscription).filter(
         UserSubscription.user_id == current_user.id,
         UserSubscription.status == "active"
-    ).first()
+    ).all()
 
-    if old_subscription:
-        old_subscription.status = "expired"
-        logger.info("Expired previous subscription id=%s for user_id=%s", old_subscription.id, current_user.id)
+    if old_subscriptions:
+        for old_subscription in old_subscriptions:
+            old_subscription.status = "expired"
+            logger.info(
+                "Expired previous subscription id=%s for user_id=%s",
+                old_subscription.id,
+                current_user.id,
+            )
 
     start_date = datetime.utcnow()
     end_date = start_date + timedelta(days=plan.duration_days)
@@ -73,7 +99,6 @@ def subscribe(
     return new_subscription
 
 
-# 🔹 3. My Subscription
 @router.get("/my-subscription", response_model=SubscriptionResponse)
 def my_subscription(
     db: Session = Depends(get_db),
@@ -83,7 +108,7 @@ def my_subscription(
     subscription = db.query(UserSubscription).filter(
         UserSubscription.user_id == current_user.id,
         UserSubscription.status == "active"
-    ).first()
+    ).order_by(UserSubscription.id.desc()).first()
 
     if not subscription:
         logger.warning("No active subscription for user_id=%s", current_user.id)
@@ -99,8 +124,6 @@ def my_subscription(
     logger.info("Active subscription id=%s returned for user_id=%s", subscription.id, current_user.id)
     return subscription
 
-
-# 🔹 4. Cancel Subscription
 @router.post("/cancel")
 def cancel_subscription(
     db: Session = Depends(get_db),
@@ -110,7 +133,7 @@ def cancel_subscription(
     subscription = db.query(UserSubscription).filter(
         UserSubscription.user_id == current_user.id,
         UserSubscription.status == "active"
-    ).first()
+    ).order_by(UserSubscription.id.desc()).first()
 
     if not subscription:
         logger.warning("Cancel subscription failed: no active subscription for user_id=%s", current_user.id)
