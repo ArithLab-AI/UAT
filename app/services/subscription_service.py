@@ -1,14 +1,18 @@
 import logging
 from datetime import datetime, timedelta
-
 from sqlalchemy.orm import Session
-
+from app.models.auth_models import User
 from app.models.subscription_models import SubscriptionPlan, UserSubscription
 
 logger = logging.getLogger(__name__)
 
 
 def ensure_default_free_subscription(db: Session, user_id: int) -> UserSubscription | None:
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        logger.warning("Cannot assign default subscription: user_id=%s not found", user_id)
+        return None
+
     active_subscriptions = (
         db.query(UserSubscription)
         .filter(
@@ -39,14 +43,20 @@ def ensure_default_free_subscription(db: Session, user_id: int) -> UserSubscript
     free_plan = (
         db.query(SubscriptionPlan)
         .filter(
-            SubscriptionPlan.name == "Free",
+            SubscriptionPlan.user_role == user.user_role,
+            SubscriptionPlan.price == 0,
             SubscriptionPlan.is_active == True,
         )
+        .order_by(SubscriptionPlan.id.asc())
         .first()
     )
 
     if not free_plan:
-        logger.warning("Free plan not found for user_id=%s", user_id)
+        logger.warning(
+            "Default free plan not found for user_id=%s user_role=%s",
+            user_id,
+            user.user_role,
+        )
         return None
 
     new_subscription = UserSubscription(
@@ -57,5 +67,10 @@ def ensure_default_free_subscription(db: Session, user_id: int) -> UserSubscript
         status="active",
     )
     db.add(new_subscription)
-    logger.info("Assigned free plan id=%s to user_id=%s", free_plan.id, user_id)
+    logger.info(
+        "Assigned default free plan id=%s to user_id=%s user_role=%s",
+        free_plan.id,
+        user_id,
+        user.user_role,
+    )
     return new_subscription

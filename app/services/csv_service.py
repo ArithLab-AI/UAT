@@ -2,11 +2,9 @@ import csv
 import io
 import re
 from pathlib import Path
-
 from fastapi import HTTPException, UploadFile
 from sqlalchemy import Column, Integer, MetaData, Table, Text, inspect, select
 from sqlalchemy.orm import Session
-
 from app.models.csv_dataset_models import (
     CsvMergedDataset,
     CsvUploadedDataset,
@@ -134,6 +132,32 @@ def build_dataset_name(explicit_name: str | None, file_name: str) -> str:
     return _normalize_dataset_name(Path(file_name).stem.replace("_", " ").replace("-", " "))
 
 
+def _validate_matching_merge_headers(source_datasets: list[CsvUploadedDataset]) -> list[str]:
+    if len(source_datasets) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="At least two uploaded datasets are required to merge",
+        )
+
+    reference_columns = source_datasets[0].columns
+    mismatched_datasets = [
+        dataset.name
+        for dataset in source_datasets[1:]
+        if dataset.columns != reference_columns
+    ]
+
+    if mismatched_datasets:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Selected CSV files cannot be merged because their headers do not match "
+                f"exactly. Mismatched datasets: {', '.join(mismatched_datasets)}"
+            ),
+        )
+
+    return reference_columns
+
+
 def create_uploaded_dataset(
     db: Session,
     *,
@@ -170,11 +194,7 @@ def merge_uploaded_datasets(
     source_datasets: list[CsvUploadedDataset],
     user_id: int,
 ) -> CsvMergedDataset:
-    ordered_columns: list[str] = []
-    for dataset in source_datasets:
-        for column in dataset.columns:
-            if column not in ordered_columns:
-                ordered_columns.append(column)
+    ordered_columns = _validate_matching_merge_headers(source_datasets)
 
     merged_dataset = CsvMergedDataset(
         name=_normalize_dataset_name(merged_name),

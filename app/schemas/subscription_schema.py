@@ -1,10 +1,10 @@
 from pydantic import BaseModel
 from datetime import datetime
 
-
 class PlanResponse(BaseModel):
     id: int
     name: str
+    user_role: int
     price: float
     duration_days: int
 

@@ -3,16 +3,15 @@ from sqlalchemy.orm import relationship
 from datetime import datetime
 from app.db.database import Base
 
-
 class SubscriptionPlan(Base):
     __tablename__ = "subscription_plans"
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, unique=True, nullable=False)
+    user_role = Column(Integer, nullable=False, server_default="2")
     price = Column(Float, nullable=False)
     duration_days = Column(Integer, nullable=False)
     is_active = Column(Boolean, default=True)
-
 
 class UserSubscription(Base):
     __tablename__ = "user_subscriptions"

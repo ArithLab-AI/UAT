@@ -49,6 +49,7 @@ def register(payload: auth_schema.Register, db: Session = Depends(get_db)):
         username=payload.username,
         first_name=payload.first_name,
         last_name=payload.last_name,
+        user_role=payload.user_role,
         password=hash_password(payload.password),
         is_verified=True
     )
@@ -270,6 +271,7 @@ def protected_route(current_user: auth_models.User = Depends(get_current_user)):
         "user": {
             "username": current_user.username,
             "email": current_user.email,
+            "user_role": current_user.user_role,
             "last_login": current_user.last_login
         }
     }

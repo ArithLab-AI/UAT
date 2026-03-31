@@ -1,10 +1,7 @@
 from datetime import datetime
-
 from sqlalchemy import Column, DateTime, ForeignKey, Integer, JSON, String
 from sqlalchemy.orm import relationship
-
 from app.db.database import Base
-
 
 class CsvUploadedDataset(Base):
     __tablename__ = "csv_uploaded_datasets"
@@ -17,9 +14,7 @@ class CsvUploadedDataset(Base):
     total_rows = Column(Integer, default=0, nullable=False)
     columns = Column(JSON, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
     created_by = relationship("User")
-
 
 class CsvMergedDataset(Base):
     __tablename__ = "csv_merged_datasets"
@@ -32,5 +27,4 @@ class CsvMergedDataset(Base):
     total_rows = Column(Integer, default=0, nullable=False)
     columns = Column(JSON, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
     created_by = relationship("User")

@@ -2,7 +2,6 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
-
 from app.db.database import get_db
 from app.models.subscription_models import SubscriptionPlan, UserSubscription
 from app.models.auth_models import User
@@ -17,11 +16,20 @@ router = APIRouter(prefix="/subscriptions", tags=["Subscriptions"])
 logger = logging.getLogger(__name__)
 
 @router.get("/plans", response_model=list[PlanResponse])
-def get_plans(db: Session = Depends(get_db)):
+def get_plans(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     plans = db.query(SubscriptionPlan).filter(
+        SubscriptionPlan.user_role == current_user.user_role,
         SubscriptionPlan.is_active == True
     ).all()
-    logger.info("Fetched %s active subscription plans", len(plans))
+    logger.info(
+        "Fetched %s active subscription plans for user_id=%s user_role=%s",
+        len(plans),
+        current_user.id,
+        current_user.user_role,
+    )
     return plans
 
 @router.post("/subscribe", response_model=SubscriptionResponse)
@@ -43,6 +51,19 @@ def subscribe(
             payload.plan_id,
         )
         raise HTTPException(status_code=404, detail="Plan not found")
+
+    if plan.user_role != current_user.user_role:
+        logger.warning(
+            "Subscribe failed for user_id=%s: plan_id=%s role mismatch user_role=%s plan_role=%s",
+            current_user.id,
+            payload.plan_id,
+            current_user.user_role,
+            plan.user_role,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="You can only subscribe to plans for your user role",
+        )
 
     # Expire old subscription if exists
     old_subscriptions = db.query(UserSubscription).filter(
@@ -78,7 +99,6 @@ def subscribe(
     return new_subscription
 
 
-# 🔹 3. My Subscription
 @router.get("/my-subscription", response_model=SubscriptionResponse)
 def my_subscription(
     db: Session = Depends(get_db),
@@ -104,8 +124,6 @@ def my_subscription(
     logger.info("Active subscription id=%s returned for user_id=%s", subscription.id, current_user.id)
     return subscription
 
-
-# 🔹 4. Cancel Subscription
 @router.post("/cancel")
 def cancel_subscription(
     db: Session = Depends(get_db),

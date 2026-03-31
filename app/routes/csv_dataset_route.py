@@ -92,31 +92,6 @@ async def upload_multiple_csv_datasets(
     )
     return created_datasets
 
-
-@router.get("", response_model=CsvDatasetListResponse)
-def list_csv_datasets(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    uploaded_datasets = (
-        db.query(CsvUploadedDataset)
-        .filter(CsvUploadedDataset.created_by_user_id == current_user.id)
-        .order_by(CsvUploadedDataset.id.desc())
-        .all()
-    )
-    merged_datasets = (
-        db.query(CsvMergedDataset)
-        .filter(CsvMergedDataset.created_by_user_id == current_user.id)
-        .order_by(CsvMergedDataset.id.desc())
-        .all()
-    )
-
-    return {
-        "uploaded_datasets": uploaded_datasets,
-        "merged_datasets": merged_datasets,
-    }
-
-
 @router.post("/merge", response_model=CsvMergedDatasetResponse, status_code=201)
 def merge_csv_datasets(
     payload: MergeCsvDatasetsRequest,
@@ -158,3 +133,26 @@ def merge_csv_datasets(
         current_user.id,
     )
     return merged_dataset
+
+@router.get("", response_model=CsvDatasetListResponse)
+def list_csv_datasets(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    uploaded_datasets = (
+        db.query(CsvUploadedDataset)
+        .filter(CsvUploadedDataset.created_by_user_id == current_user.id)
+        .order_by(CsvUploadedDataset.id.desc())
+        .all()
+    )
+    merged_datasets = (
+        db.query(CsvMergedDataset)
+        .filter(CsvMergedDataset.created_by_user_id == current_user.id)
+        .order_by(CsvMergedDataset.id.desc())
+        .all()
+    )
+
+    return {
+        "uploaded_datasets": uploaded_datasets,
+        "merged_datasets": merged_datasets,
+    }

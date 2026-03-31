@@ -5,7 +5,6 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
 from email.mime.text import MIMEText
 from sqlalchemy.orm import Session
-
 from app.config.config import settings
 from app.db.database import get_db
 from app.models.auth_models import TokenBlacklist, User
