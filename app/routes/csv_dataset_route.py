@@ -62,7 +62,10 @@ async def upload_multiple_csv_datasets(
     files = form.getlist("files")
 
     if not files:
-        raise HTTPException(status_code=400, detail="At least one CSV file is required")
+        raise HTTPException(
+            status_code=400,
+            detail="At least one CSV, XLSX, or XLS file is required",
+        )
 
     created_datasets = []
     for file in files:
@@ -86,7 +89,7 @@ async def upload_multiple_csv_datasets(
         db.refresh(dataset)
 
     logger.info(
-        "Created %s uploaded CSV datasets for user_id=%s",
+        "Created %s uploaded datasets for user_id=%s",
         len(created_datasets),
         current_user.id,
     )
