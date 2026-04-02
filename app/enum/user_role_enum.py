@@ -8,7 +8,9 @@ def normalize_user_role(value: int | str | UserRoleEnum) -> int:
     if isinstance(value, UserRoleEnum):
         return value.value
     if isinstance(value, int):
-        return UserRoleEnum(value).value
+        if value in {role.value for role in UserRoleEnum}:
+            return UserRoleEnum(value).value
+        raise ValueError("user_role must be 1 for buisiness or 2 for customer Segmants (Self Emp.)")
     if isinstance(value, str):
         stripped_value = value.strip()
         if stripped_value in {"1", "2"}:

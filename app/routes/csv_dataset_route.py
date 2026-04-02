@@ -1,6 +1,6 @@
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
 
 from app.config.deps import get_current_user
@@ -8,9 +8,9 @@ from app.db.database import get_db
 from app.models.auth_models import User
 from app.models.csv_dataset_models import CsvMergedDataset, CsvUploadedDataset
 from app.schemas.csv_dataset_schema import (
-    CsvDatasetListResponse,
-    CsvMergedDatasetResponse,
-    CsvUploadedDatasetResponse,
+    CsvDatasetListSuccessResponse,
+    CsvMergedDatasetSuccessResponse,
+    CsvUploadedDatasetListSuccessResponse,
     MergeCsvDatasetsRequest,
 )
 from app.services.csv_service import (
@@ -19,6 +19,7 @@ from app.services.csv_service import (
     merge_uploaded_datasets,
     parse_csv_upload,
 )
+from app.utils.responses import error_response, success_response
 
 UPLOAD_MULTIPLE_OPENAPI = {
     "requestBody": {
@@ -49,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 @router.post(
     "/upload-multiple",
-    response_model=list[CsvUploadedDatasetResponse],
+    response_model=CsvUploadedDatasetListSuccessResponse,
     status_code=201,
     openapi_extra=UPLOAD_MULTIPLE_OPENAPI,
 )
@@ -62,7 +63,7 @@ async def upload_multiple_csv_datasets(
     files = form.getlist("files")
 
     if not files:
-        raise HTTPException(
+        raise error_response(
             status_code=400,
             detail="At least one CSV, XLSX, or XLS file is required",
         )
@@ -70,14 +71,15 @@ async def upload_multiple_csv_datasets(
     created_datasets = []
     for file in files:
         if not hasattr(file, "filename") or not hasattr(file, "read"):
-            raise HTTPException(status_code=400, detail="Invalid file input")
-        file_name, columns, rows = await parse_csv_upload(file)
+            raise error_response(status_code=400, detail="Invalid file input")
+        file_name, columns, internal_columns, rows = await parse_csv_upload(file)
         dataset_name = build_dataset_name(None, file_name)
         dataset = create_uploaded_dataset(
             db,
             dataset_name=dataset_name,
             file_name=file_name,
             columns=columns,
+            internal_columns=internal_columns,
             rows=rows,
             user_id=current_user.id,
         )
@@ -93,9 +95,13 @@ async def upload_multiple_csv_datasets(
         len(created_datasets),
         current_user.id,
     )
-    return created_datasets
+    return success_response(
+        "Uploaded datasets created successfully",
+        status_code=201,
+        data=created_datasets,
+    )
 
-@router.post("/merge", response_model=CsvMergedDatasetResponse, status_code=201)
+@router.post("/merge", response_model=CsvMergedDatasetSuccessResponse, status_code=201)
 def merge_csv_datasets(
     payload: MergeCsvDatasetsRequest,
     db: Session = Depends(get_db),
@@ -112,7 +118,7 @@ def merge_csv_datasets(
     )
 
     if len(fetched_datasets) != len(source_ids):
-        raise HTTPException(
+        raise error_response(
             status_code=404,
             detail="One or more source dataset IDs were not found",
         )
@@ -135,9 +141,13 @@ def merge_csv_datasets(
         merged_dataset.id,
         current_user.id,
     )
-    return merged_dataset
+    return success_response(
+        "Datasets merged successfully",
+        status_code=201,
+        data=merged_dataset,
+    )
 
-@router.get("", response_model=CsvDatasetListResponse)
+@router.get("", response_model=CsvDatasetListSuccessResponse)
 def list_csv_datasets(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -155,7 +165,10 @@ def list_csv_datasets(
         .all()
     )
 
-    return {
-        "uploaded_datasets": uploaded_datasets,
-        "merged_datasets": merged_datasets,
-    }
+    return success_response(
+        "Datasets fetched successfully",
+        data={
+            "uploaded_datasets": uploaded_datasets,
+            "merged_datasets": merged_datasets,
+        },
+    )

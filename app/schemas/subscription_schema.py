@@ -1,5 +1,6 @@
 from pydantic import BaseModel
 from datetime import datetime
+from app.schemas.common_schema import SuccessResponse
 
 class PlanResponse(BaseModel):
     id: int
@@ -25,3 +26,7 @@ class SubscriptionResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+PlanListSuccessResponse = SuccessResponse[list[PlanResponse]]
+SubscriptionSuccessResponse = SuccessResponse[SubscriptionResponse]

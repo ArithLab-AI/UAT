@@ -4,6 +4,7 @@ from typing import Optional
 from pydantic import BaseModel, EmailStr, validator
 
 from app.enum.user_role_enum import normalize_user_role
+from app.schemas.common_schema import SuccessResponse
 
 
 class Register(BaseModel):
@@ -60,16 +61,13 @@ class UserResponse(BaseModel):
         from_attributes = True
 
 
-class ProtectedUser(BaseModel):
+class ProtectedUserData(BaseModel):
     username: str
     email: EmailStr
     user_role: int
     last_login: Optional[datetime]
 
-    class Config:
-        from_attributes = True
 
-
-class ProtectedResponse(BaseModel):
-    message: str
-    user: ProtectedUser
+UserSuccessResponse = SuccessResponse[UserResponse]
+TokenSuccessResponse = SuccessResponse[Token]
+ProtectedSuccessResponse = SuccessResponse[ProtectedUserData]

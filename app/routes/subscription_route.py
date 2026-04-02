@@ -1,21 +1,20 @@
 import logging
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from app.db.database import get_db
 from app.models.subscription_models import SubscriptionPlan, UserSubscription
 from app.models.auth_models import User
-from app.schemas.subscription_schema import (
-    PlanResponse,
-    SubscribeRequest,
-    SubscriptionResponse
-)
+from app.schemas import subscription_schema
+from app.schemas.common_schema import MessageSuccessResponse
+from app.schemas.subscription_schema import SubscribeRequest
 from app.config.deps import get_current_user
+from app.utils.responses import error_response, success_response
 
 router = APIRouter(prefix="/subscriptions", tags=["Subscriptions"])
 logger = logging.getLogger(__name__)
 
-@router.get("/plans", response_model=list[PlanResponse])
+@router.get("/plans", response_model=subscription_schema.PlanListSuccessResponse)
 def get_plans(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -30,9 +29,9 @@ def get_plans(
         current_user.id,
         current_user.user_role,
     )
-    return plans
+    return success_response("Plans fetched successfully", data=plans)
 
-@router.post("/subscribe", response_model=SubscriptionResponse)
+@router.post("/subscribe", response_model=subscription_schema.SubscriptionSuccessResponse)
 def subscribe(
     payload: SubscribeRequest,
     db: Session = Depends(get_db),
@@ -50,7 +49,7 @@ def subscribe(
             current_user.id,
             payload.plan_id,
         )
-        raise HTTPException(status_code=404, detail="Plan not found")
+        raise error_response(status_code=404, detail="Plan not found")
 
     if plan.user_role != current_user.user_role:
         logger.warning(
@@ -60,7 +59,7 @@ def subscribe(
             current_user.user_role,
             plan.user_role,
         )
-        raise HTTPException(
+        raise error_response(
             status_code=400,
             detail="You can only subscribe to plans for your user role",
         )
@@ -96,10 +95,10 @@ def subscribe(
     db.refresh(new_subscription)
     logger.info("Subscription created id=%s for user_id=%s", new_subscription.id, current_user.id)
 
-    return new_subscription
+    return success_response("Subscription created successfully", data=new_subscription)
 
 
-@router.get("/my-subscription", response_model=SubscriptionResponse)
+@router.get("/my-subscription", response_model=subscription_schema.SubscriptionSuccessResponse)
 def my_subscription(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -112,19 +111,19 @@ def my_subscription(
 
     if not subscription:
         logger.warning("No active subscription for user_id=%s", current_user.id)
-        raise HTTPException(status_code=404, detail="No active subscription")
+        raise error_response(status_code=404, detail="No active subscription")
 
     # Auto-expire if past date
     if subscription.end_date < datetime.utcnow():
         subscription.status = "expired"
         db.commit()
         logger.warning("Subscription id=%s auto-expired for user_id=%s", subscription.id, current_user.id)
-        raise HTTPException(status_code=400, detail="Subscription expired")
+        raise error_response(status_code=400, detail="Subscription expired")
 
     logger.info("Active subscription id=%s returned for user_id=%s", subscription.id, current_user.id)
-    return subscription
+    return success_response("Subscription fetched successfully", data=subscription)
 
-@router.post("/cancel")
+@router.post("/cancel", response_model=MessageSuccessResponse)
 def cancel_subscription(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -137,10 +136,10 @@ def cancel_subscription(
 
     if not subscription:
         logger.warning("Cancel subscription failed: no active subscription for user_id=%s", current_user.id)
-        raise HTTPException(status_code=404, detail="No active subscription")
+        raise error_response(status_code=404, detail="No active subscription")
 
     subscription.status = "canceled"
     db.commit()
     logger.info("Subscription id=%s canceled for user_id=%s", subscription.id, current_user.id)
 
-    return {"message": "Subscription canceled successfully"}
+    return success_response("Subscription canceled successfully", data=None)
