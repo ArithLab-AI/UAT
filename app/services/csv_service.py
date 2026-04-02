@@ -4,22 +4,22 @@ import re
 from typing import Any
 from datetime import date, datetime, time
 from pathlib import Path
-
 import openpyxl
 import xlrd
-from fastapi import HTTPException, UploadFile
+from fastapi import UploadFile
 from sqlalchemy import Column, Integer, MetaData, Table, Text, inspect, select
 from sqlalchemy.orm import Session
 from app.models.csv_dataset_models import (
     CsvMergedDataset,
     CsvUploadedDataset,
 )
+from app.utils.responses import error_response
 
 
 def _normalize_dataset_name(name: str) -> str:
     cleaned_name = " ".join(name.strip().split())
     if not cleaned_name:
-        raise HTTPException(status_code=400, detail="Dataset name cannot be empty")
+        raise error_response(status_code=400, detail="Dataset name cannot be empty")
     return cleaned_name
 
 
@@ -104,52 +104,58 @@ def _canonicalize_column_name(value: Any) -> str:
     return normalized_value
 
 
-def _validate_columns(file_name: str, columns: list[Any]) -> list[str]:
+def _normalize_columns(file_name: str, columns: list[Any]) -> tuple[list[str], list[str]]:
     if not columns:
-        raise HTTPException(
+        raise error_response(
             status_code=400,
             detail=f"{file_name} does not contain a header row",
         )
 
-    normalized_columns = [_canonicalize_column_name(column) for column in columns]
-    if len(normalized_columns) != len(columns):
-        raise HTTPException(
-            status_code=400,
-            detail=f"{file_name} contains blank column names",
-        )
-    if len(set(normalized_columns)) != len(normalized_columns):
-        raise HTTPException(
-            status_code=400,
-            detail=f"{file_name} contains duplicate column names",
-        )
-    return normalized_columns
+    original_columns: list[str] = []
+    internal_columns: list[str] = []
+    seen_columns: dict[str, int] = {}
+
+    for index, column in enumerate(columns, start=1):
+        original_name = _normalize_header_value(column) or f"column_{index}"
+        original_columns.append(original_name)
+        base_name = _canonicalize_column_name(column) or f"column_{index}"
+        duplicate_count = seen_columns.get(base_name, 0)
+        seen_columns[base_name] = duplicate_count + 1
+        if duplicate_count:
+            internal_columns.append(f"{base_name}_{duplicate_count + 1}")
+        else:
+            internal_columns.append(base_name)
+
+    return original_columns, internal_columns
 
 
-def _parse_csv_content(file_name: str, content: bytes) -> tuple[list[str], list[dict]]:
+def _parse_csv_content(file_name: str, content: bytes) -> tuple[list[str], list[str], list[dict]]:
     try:
         text_content = content.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
-        raise HTTPException(
+        raise error_response(
             status_code=400,
             detail=f"{file_name} must be UTF-8 encoded",
         ) from exc
 
-    csv_reader = csv.DictReader(io.StringIO(text_content))
-    columns = csv_reader.fieldnames
-    normalized_columns = _validate_columns(file_name, columns)
+    csv_reader = csv.reader(io.StringIO(text_content))
+    columns = next(csv_reader, None)
+    original_columns, internal_columns = _normalize_columns(file_name, columns or [])
 
     rows = []
     for row in csv_reader:
         cleaned_row = {
-            normalized_columns[column_index]: _normalize_scalar_value(row.get(original_column, ""))
-            for column_index, original_column in enumerate(columns)
+            internal_columns[column_index]: _normalize_scalar_value(
+                row[column_index] if column_index < len(row) else ""
+            )
+            for column_index in range(len(internal_columns))
         }
         rows.append(cleaned_row)
 
-    return normalized_columns, rows
+    return original_columns, internal_columns, rows
 
 
-def _parse_xlsx_content(file_name: str, content: bytes) -> tuple[list[str], list[dict]]:
+def _parse_xlsx_content(file_name: str, content: bytes) -> tuple[list[str], list[str], list[dict]]:
     try:
         workbook = openpyxl.load_workbook(
             filename=io.BytesIO(content),
@@ -157,72 +163,72 @@ def _parse_xlsx_content(file_name: str, content: bytes) -> tuple[list[str], list
             data_only=True,
         )
     except Exception as exc:
-        raise HTTPException(
+        raise error_response(
             status_code=400,
             detail=f"{file_name} could not be read as an XLSX file",
         ) from exc
 
     sheet = workbook.worksheets[0] if workbook.worksheets else None
     if sheet is None:
-        raise HTTPException(status_code=400, detail=f"{file_name} does not contain any sheets")
+        raise error_response(status_code=400, detail=f"{file_name} does not contain any sheets")
 
     iterator = sheet.iter_rows(values_only=True)
     header_row = next(iterator, None)
-    normalized_columns = _validate_columns(file_name, list(header_row) if header_row is not None else [])
+    original_columns, internal_columns = _normalize_columns(file_name, list(header_row) if header_row is not None else [])
 
     rows = []
     for row in iterator:
         row_values = list(row or [])
         cleaned_row = {
-            normalized_columns[index]: _normalize_scalar_value(
+            internal_columns[index]: _normalize_scalar_value(
                 row_values[index] if index < len(row_values) else None
             )
-            for index in range(len(normalized_columns))
+            for index in range(len(internal_columns))
         }
         rows.append(cleaned_row)
 
     workbook.close()
-    return normalized_columns, rows
+    return original_columns, internal_columns, rows
 
 
-def _parse_xls_content(file_name: str, content: bytes) -> tuple[list[str], list[dict]]:
+def _parse_xls_content(file_name: str, content: bytes) -> tuple[list[str], list[str], list[dict]]:
     try:
         workbook = xlrd.open_workbook(file_contents=content)
     except Exception as exc:
-        raise HTTPException(
+        raise error_response(
             status_code=400,
             detail=f"{file_name} could not be read as an XLS file",
         ) from exc
 
     if workbook.nsheets == 0:
-        raise HTTPException(status_code=400, detail=f"{file_name} does not contain any sheets")
+        raise error_response(status_code=400, detail=f"{file_name} does not contain any sheets")
 
     sheet = workbook.sheet_by_index(0)
     header_row = sheet.row_values(0) if sheet.nrows else []
-    normalized_columns = _validate_columns(file_name, header_row)
+    original_columns, internal_columns = _normalize_columns(file_name, header_row)
 
     rows = []
     for row_index in range(1, sheet.nrows):
         row_values = sheet.row_values(row_index)
         cleaned_row = {
-            normalized_columns[index]: _normalize_scalar_value(
+            internal_columns[index]: _normalize_scalar_value(
                 row_values[index] if index < len(row_values) else None
             )
-            for index in range(len(normalized_columns))
+            for index in range(len(internal_columns))
         }
         rows.append(cleaned_row)
 
-    return normalized_columns, rows
+    return original_columns, internal_columns, rows
 
 
-async def parse_csv_upload(file: UploadFile) -> tuple[str, list[str], list[dict]]:
+async def parse_csv_upload(file: UploadFile) -> tuple[str, list[str], list[str], list[dict]]:
     if not file.filename:
-        raise HTTPException(status_code=400, detail="Uploaded file must have a name")
+        raise error_response(status_code=400, detail="Uploaded file must have a name")
 
     suffix = Path(file.filename).suffix.lower()
     allowed_extensions = {".csv", ".xlsx", ".xls"}
     if suffix not in allowed_extensions:
-        raise HTTPException(
+        raise error_response(
             status_code=400,
             detail="Only CSV, XLSX, and XLS files are allowed",
         )
@@ -230,16 +236,16 @@ async def parse_csv_upload(file: UploadFile) -> tuple[str, list[str], list[dict]
     try:
         content = await file.read()
         if not content:
-            raise HTTPException(status_code=400, detail=f"{file.filename} is empty")
+            raise error_response(status_code=400, detail=f"{file.filename} is empty")
 
         if suffix == ".csv":
-            normalized_columns, rows = _parse_csv_content(file.filename, content)
+            original_columns, internal_columns, rows = _parse_csv_content(file.filename, content)
         elif suffix == ".xlsx":
-            normalized_columns, rows = _parse_xlsx_content(file.filename, content)
+            original_columns, internal_columns, rows = _parse_xlsx_content(file.filename, content)
         else:
-            normalized_columns, rows = _parse_xls_content(file.filename, content)
+            original_columns, internal_columns, rows = _parse_xls_content(file.filename, content)
 
-        return file.filename, normalized_columns, rows
+        return file.filename, original_columns, internal_columns, rows
     finally:
         await file.close()
 
@@ -254,15 +260,14 @@ def _build_merge_column_mappings(
     source_datasets: list[CsvUploadedDataset],
 ) -> tuple[list[str], dict[int, dict[str, str]]]:
     if len(source_datasets) < 2:
-        raise HTTPException(
+        raise error_response(
             status_code=400,
             detail="At least two uploaded datasets are required to merge",
         )
 
-    reference_columns = source_datasets[0].columns
-    ordered_columns = [_canonicalize_column_name(column) for column in reference_columns]
+    ordered_columns = list(source_datasets[0].internal_columns)
     if len(set(ordered_columns)) != len(ordered_columns):
-        raise HTTPException(
+        raise error_response(
             status_code=400,
             detail=(
                 f"{source_datasets[0].name} cannot be merged because it contains duplicate "
@@ -271,16 +276,16 @@ def _build_merge_column_mappings(
         )
 
     column_mappings: dict[int, dict[str, str]] = {
-        source_datasets[0].id: dict(zip(ordered_columns, reference_columns))
+        source_datasets[0].id: dict(zip(ordered_columns, source_datasets[0].internal_columns))
     }
     mismatched_datasets = [
         dataset.name
         for dataset in source_datasets[1:]
-        if [_canonicalize_column_name(column) for column in dataset.columns] != ordered_columns
+        if list(dataset.internal_columns) != ordered_columns
     ]
 
     if mismatched_datasets:
-        raise HTTPException(
+        raise error_response(
             status_code=400,
             detail=(
                 "Selected dataset files cannot be merged because their headers do not match "
@@ -289,16 +294,16 @@ def _build_merge_column_mappings(
         )
 
     for dataset in source_datasets[1:]:
-        canonical_columns = [_canonicalize_column_name(column) for column in dataset.columns]
+        canonical_columns = list(dataset.internal_columns)
         if len(set(canonical_columns)) != len(canonical_columns):
-            raise HTTPException(
+            raise error_response(
                 status_code=400,
                 detail=(
                     f"{dataset.name} cannot be merged because it contains duplicate column "
                     "names after header normalization"
                 ),
             )
-        column_mappings[dataset.id] = dict(zip(ordered_columns, dataset.columns))
+        column_mappings[dataset.id] = dict(zip(ordered_columns, dataset.internal_columns))
 
     return ordered_columns, column_mappings
 
@@ -309,6 +314,7 @@ def create_uploaded_dataset(
     dataset_name: str,
     file_name: str,
     columns: list[str],
+    internal_columns: list[str],
     rows: list[dict],
     user_id: int,
 ) -> CsvUploadedDataset:
@@ -319,13 +325,14 @@ def create_uploaded_dataset(
         created_by_user_id=user_id,
         total_rows=len(rows),
         columns=columns,
+        internal_columns=internal_columns,
     )
     db.add(dataset)
     db.flush()
     create_physical_csv_table(
         db,
         table_name=dataset.table_name,
-        columns=columns,
+        columns=internal_columns,
         rows=rows,
     )
 
@@ -346,7 +353,8 @@ def merge_uploaded_datasets(
         table_name=_generate_table_name(db, "merged", merged_name),
         created_by_user_id=user_id,
         source_dataset_ids=[dataset.id for dataset in source_datasets],
-        columns=ordered_columns,
+        columns=list(source_datasets[0].columns),
+        internal_columns=ordered_columns,
         total_rows=0,
     )
     db.add(merged_dataset)
@@ -357,7 +365,7 @@ def merge_uploaded_datasets(
         dataset_rows = fetch_table_rows(
             db,
             table_name=dataset.table_name,
-            columns=dataset.columns,
+            columns=dataset.internal_columns,
         )
         dataset_column_mapping = column_mappings[dataset.id]
         for row in dataset_rows:

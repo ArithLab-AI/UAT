@@ -1,5 +1,6 @@
 from datetime import datetime
 from pydantic import BaseModel, Field
+from app.schemas.common_schema import SuccessResponse
 
 class CsvDatasetSummaryResponse(BaseModel):
     id: int
@@ -29,3 +30,8 @@ class CsvDatasetListResponse(BaseModel):
 class MergeCsvDatasetsRequest(BaseModel):
     merged_name: str = Field(..., min_length=1, max_length=255)
     source_dataset_ids: list[int] = Field(..., min_length=2)
+
+
+CsvUploadedDatasetListSuccessResponse = SuccessResponse[list[CsvUploadedDatasetResponse]]
+CsvMergedDatasetSuccessResponse = SuccessResponse[CsvMergedDatasetResponse]
+CsvDatasetListSuccessResponse = SuccessResponse[CsvDatasetListResponse]

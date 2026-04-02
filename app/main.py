@@ -1,4 +1,5 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from app.routes.auth_route import router as auth_router
 from app.routes.csv_dataset_route import router as csv_dataset_router
 from app.routes.subscription_route import router as subscription_router
@@ -7,6 +8,7 @@ from app.db.database import engine, Base, SessionLocal
 from app.config.config import settings
 from app.utils.auth_schema_setup import ensure_auth_schema
 from app.utils.csv_dataset_setup import ensure_csv_dataset_schema
+from app.utils.responses import http_exception_response, validation_error_response
 from app.utils.subs_plan_seed import seed_subscription_plans
 from app.utils.subscription_schema_setup import ensure_subscription_schema
 
@@ -16,6 +18,16 @@ app.include_router(health_router)
 app.include_router(auth_router)
 app.include_router(subscription_router)
 app.include_router(csv_dataset_router)
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    return validation_error_response(exc)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return http_exception_response(exc)
 
 
 @app.middleware("http")

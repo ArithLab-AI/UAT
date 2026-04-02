@@ -13,6 +13,7 @@ class CsvUploadedDataset(Base):
     created_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     total_rows = Column(Integer, default=0, nullable=False)
     columns = Column(JSON, nullable=False)
+    internal_columns = Column(JSON, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     created_by = relationship("User")
 
@@ -26,5 +27,6 @@ class CsvMergedDataset(Base):
     source_dataset_ids = Column(JSON, nullable=False)
     total_rows = Column(Integer, default=0, nullable=False)
     columns = Column(JSON, nullable=False)
+    internal_columns = Column(JSON, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     created_by = relationship("User")
