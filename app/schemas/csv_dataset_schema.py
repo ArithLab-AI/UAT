@@ -19,8 +19,14 @@ class CsvUploadedDatasetResponse(CsvDatasetSummaryResponse):
     file_size: int
 
 
+class CsvMergedSourceDatasetResponse(BaseModel):
+    id: int
+    file_name: str
+
+
 class CsvMergedDatasetResponse(CsvDatasetSummaryResponse):
     source_dataset_ids: list[int]
+    source_datasets: list[CsvMergedSourceDatasetResponse]
 
 
 class CsvDatasetListResponse(BaseModel):
