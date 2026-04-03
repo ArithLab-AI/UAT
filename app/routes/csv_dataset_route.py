@@ -50,6 +50,29 @@ router = APIRouter(prefix="/csv-datasets", tags=["CSV Datasets"])
 logger = logging.getLogger(__name__)
 
 
+def _serialize_merged_dataset(
+    merged_dataset: CsvMergedDataset,
+    source_dataset_map: dict[int, CsvUploadedDataset],
+):
+    return {
+        "id": merged_dataset.id,
+        "name": merged_dataset.name,
+        "table_name": merged_dataset.table_name,
+        "total_rows": merged_dataset.total_rows,
+        "columns": merged_dataset.columns,
+        "created_at": merged_dataset.created_at,
+        "source_dataset_ids": merged_dataset.source_dataset_ids,
+        "source_datasets": [
+            {
+                "id": source_id,
+                "file_name": source_dataset_map[source_id].file_name,
+            }
+            for source_id in merged_dataset.source_dataset_ids
+            if source_id in source_dataset_map
+        ],
+    }
+
+
 @router.post(
     "/upload-multiple",
     response_model=CsvUploadedDatasetListSuccessResponse,
@@ -147,7 +170,7 @@ def merge_csv_datasets(
     return success_response(
         "Datasets merged successfully",
         status_code=201,
-        data=merged_dataset,
+        data=_serialize_merged_dataset(merged_dataset, source_dataset_map),
     )
 
 @router.get("", response_model=CsvDatasetListSuccessResponse)
@@ -167,12 +190,33 @@ def list_csv_datasets(
         .order_by(CsvMergedDataset.id.desc())
         .all()
     )
+    source_dataset_ids = sorted(
+        {
+            source_id
+            for merged_dataset in merged_datasets
+            for source_id in merged_dataset.source_dataset_ids
+        }
+    )
+    source_datasets = (
+        db.query(CsvUploadedDataset)
+        .filter(
+            CsvUploadedDataset.created_by_user_id == current_user.id,
+            CsvUploadedDataset.id.in_(source_dataset_ids),
+        )
+        .all()
+        if source_dataset_ids
+        else []
+    )
+    source_dataset_map = {dataset.id: dataset for dataset in source_datasets}
 
     return success_response(
         "Datasets fetched successfully",
         data={
             "uploaded_datasets": uploaded_datasets,
-            "merged_datasets": merged_datasets,
+            "merged_datasets": [
+                _serialize_merged_dataset(merged_dataset, source_dataset_map)
+                for merged_dataset in merged_datasets
+            ],
         },
     )
 
