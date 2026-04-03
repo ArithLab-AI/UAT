@@ -13,9 +13,11 @@ from app.schemas.csv_dataset_schema import (
     CsvUploadedDatasetListSuccessResponse,
     MergeCsvDatasetsRequest,
 )
+from app.schemas.common_schema import MessageSuccessResponse
 from app.services.csv_service import (
     build_dataset_name,
     create_uploaded_dataset,
+    delete_uploaded_dataset,
     merge_uploaded_datasets,
     parse_csv_upload,
 )
@@ -72,12 +74,13 @@ async def upload_multiple_csv_datasets(
     for file in files:
         if not hasattr(file, "filename") or not hasattr(file, "read"):
             raise error_response(status_code=400, detail="Invalid file input")
-        file_name, columns, internal_columns, rows = await parse_csv_upload(file)
+        file_name, file_size, columns, internal_columns, rows = await parse_csv_upload(file)
         dataset_name = build_dataset_name(None, file_name)
         dataset = create_uploaded_dataset(
             db,
             dataset_name=dataset_name,
             file_name=file_name,
+            file_size=file_size,
             columns=columns,
             internal_columns=internal_columns,
             rows=rows,
@@ -172,3 +175,32 @@ def list_csv_datasets(
             "merged_datasets": merged_datasets,
         },
     )
+
+
+@router.delete("/uploaded/{dataset_id}", response_model=MessageSuccessResponse)
+def delete_csv_uploaded_dataset(
+    dataset_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    dataset = (
+        db.query(CsvUploadedDataset)
+        .filter(
+            CsvUploadedDataset.id == dataset_id,
+            CsvUploadedDataset.created_by_user_id == current_user.id,
+        )
+        .first()
+    )
+
+    if not dataset:
+        raise error_response(status_code=404, detail="Uploaded dataset not found")
+
+    delete_uploaded_dataset(db, dataset=dataset)
+    db.commit()
+
+    logger.info(
+        "Deleted uploaded dataset_id=%s for user_id=%s",
+        dataset_id,
+        current_user.id,
+    )
+    return success_response("Uploaded dataset deleted successfully", data=None)

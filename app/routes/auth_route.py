@@ -141,9 +141,14 @@ def request_otp(payload: auth_schema.RequestOTP, db: Session = Depends(get_db)):
     )
 
     db.add(db_otp)
-    db.commit()
+    db.flush()
 
-    send_otp_email(payload.email, otp_code)
+    try:
+        send_otp_email(payload.email, otp_code)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     logger.info("OTP generated and sent for email=%s", payload.email)
 
     return success_response("OTP sent successfully", data=None)
@@ -224,9 +229,14 @@ def forgot_password(payload: auth_schema.ForgotPassword, db: Session = Depends(g
     )
 
     db.add(db_otp)
-    db.commit()
+    db.flush()
 
-    send_otp_email(user.email, otp_code)
+    try:
+        send_otp_email(user.email, otp_code)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     logger.info("Forgot-password OTP sent for user_id=%s email=%s", user.id, user.email)
 
     return success_response("Password reset OTP sent", data=None)
