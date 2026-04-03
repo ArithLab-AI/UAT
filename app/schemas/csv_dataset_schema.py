@@ -16,6 +16,7 @@ class CsvDatasetSummaryResponse(BaseModel):
 
 class CsvUploadedDatasetResponse(CsvDatasetSummaryResponse):
     file_name: str
+    file_size: int
 
 
 class CsvMergedDatasetResponse(CsvDatasetSummaryResponse):

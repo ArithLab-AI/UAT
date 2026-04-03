@@ -78,6 +78,15 @@ def fetch_table_rows(
     return [dict(row._mapping) for row in result]
 
 
+def drop_physical_csv_table(db: Session, *, table_name: str) -> None:
+    inspector = inspect(db.bind)
+    if not inspector.has_table(table_name):
+        return
+
+    reflected_table = Table(table_name, MetaData(), autoload_with=db.bind)
+    reflected_table.drop(bind=db.bind)
+
+
 def _normalize_scalar_value(value):
     if value is None:
         return None
@@ -221,7 +230,7 @@ def _parse_xls_content(file_name: str, content: bytes) -> tuple[list[str], list[
     return original_columns, internal_columns, rows
 
 
-async def parse_csv_upload(file: UploadFile) -> tuple[str, list[str], list[str], list[dict]]:
+async def parse_csv_upload(file: UploadFile) -> tuple[str, int, list[str], list[str], list[dict]]:
     if not file.filename:
         raise error_response(status_code=400, detail="Uploaded file must have a name")
 
@@ -237,6 +246,7 @@ async def parse_csv_upload(file: UploadFile) -> tuple[str, list[str], list[str],
         content = await file.read()
         if not content:
             raise error_response(status_code=400, detail=f"{file.filename} is empty")
+        file_size = len(content)
 
         if suffix == ".csv":
             original_columns, internal_columns, rows = _parse_csv_content(file.filename, content)
@@ -245,7 +255,7 @@ async def parse_csv_upload(file: UploadFile) -> tuple[str, list[str], list[str],
         else:
             original_columns, internal_columns, rows = _parse_xls_content(file.filename, content)
 
-        return file.filename, original_columns, internal_columns, rows
+        return file.filename, file_size, original_columns, internal_columns, rows
     finally:
         await file.close()
 
@@ -313,6 +323,7 @@ def create_uploaded_dataset(
     *,
     dataset_name: str,
     file_name: str,
+    file_size: int,
     columns: list[str],
     internal_columns: list[str],
     rows: list[dict],
@@ -321,6 +332,7 @@ def create_uploaded_dataset(
     dataset = CsvUploadedDataset(
         name=dataset_name,
         file_name=file_name,
+        file_size=file_size,
         table_name=_generate_table_name(db, "upload", dataset_name),
         created_by_user_id=user_id,
         total_rows=len(rows),
@@ -384,3 +396,12 @@ def merge_uploaded_datasets(
     )
     merged_dataset.total_rows = len(merged_rows)
     return merged_dataset
+
+
+def delete_uploaded_dataset(
+    db: Session,
+    *,
+    dataset: CsvUploadedDataset,
+) -> None:
+    drop_physical_csv_table(db, table_name=dataset.table_name)
+    db.delete(dataset)

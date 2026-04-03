@@ -26,6 +26,14 @@ def ensure_csv_dataset_schema(engine) -> None:
                         "WHERE internal_columns IS NULL"
                     )
                 )
+        if "file_size" not in uploaded_columns:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "ALTER TABLE csv_uploaded_datasets "
+                        "ADD COLUMN file_size INTEGER NOT NULL DEFAULT 0"
+                    )
+                )
 
     if inspector.has_table("csv_merged_datasets"):
         merged_columns = {column["name"] for column in inspector.get_columns("csv_merged_datasets")}
