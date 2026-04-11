@@ -13,3 +13,5 @@ python-jose
 python-multipart
 openpyxl
 xlrd
+boto3
+pandas>=2.1.0

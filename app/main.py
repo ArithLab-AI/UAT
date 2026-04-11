@@ -4,10 +4,13 @@ from app.routes.auth_route import router as auth_router
 from app.routes.csv_dataset_route import router as csv_dataset_router
 from app.routes.subscription_route import router as subscription_router
 from app.routes.health_route import router as health_router
+from app.routes.upload_file_route import router as upload_file_router
 from app.db.database import engine, Base, SessionLocal
 from app.config.config import settings
 from app.utils.auth_schema_setup import ensure_auth_schema
 from app.utils.csv_dataset_setup import ensure_csv_dataset_schema
+from app.utils.file_upload_schema_setup import ensure_file_upload_schema
+from app.utils.object_storage import get_object_storage_service
 from app.utils.responses import http_exception_response, validation_error_response
 from app.utils.subs_plan_seed import seed_subscription_plans
 from app.utils.subscription_schema_setup import ensure_subscription_schema
@@ -18,6 +21,7 @@ app.include_router(health_router)
 app.include_router(auth_router)
 app.include_router(subscription_router)
 app.include_router(csv_dataset_router)
+app.include_router(upload_file_router)
 
 
 @app.exception_handler(RequestValidationError)
@@ -56,6 +60,8 @@ def startup_event():
     ensure_auth_schema(engine)
     ensure_subscription_schema(engine)
     ensure_csv_dataset_schema(engine)
+    ensure_file_upload_schema(engine)
+    get_object_storage_service().ensure_bucket()
     db = SessionLocal()
     try:
         seed_subscription_plans(db)

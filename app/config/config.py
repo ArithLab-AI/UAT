@@ -19,6 +19,14 @@ class Settings(BaseSettings):
     SMTP_HOST: Optional[str] = None
     SMTP_PORT: Optional[int] = None
 
+     # Storage settings
+    S3_ENDPOINT_URL: Optional[str] = None
+    S3_ACCESS_KEY_ID: Optional[str] = None
+    S3_SECRET_ACCESS_KEY: Optional[str] = None
+    S3_BUCKET_NAME: Optional[str] = None
+    S3_REGION: str = "us-east-1"
+    CHUNK_SIZE: int = 1000
+
     class Config:
         env_file = ".env"
 
