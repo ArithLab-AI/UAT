@@ -2,7 +2,7 @@ from sqlalchemy import Column, Integer, String, DateTime, Boolean
 from sqlalchemy.sql import func
 from app.db.database import Base
 from datetime import datetime
-from app.enum.user_role_enum import UserRoleEnum
+from app.enum.user_role_enum import DEFAULT_USER_ROLE
 
 class User(Base):
     __tablename__ = "users"
@@ -14,7 +14,7 @@ class User(Base):
     last_name = Column(String, nullable=True)
     password = Column(String, nullable=True)
     user_role = Column(Integer,nullable=False,
-        server_default=str(UserRoleEnum.buisiness.value),
+        server_default=str(DEFAULT_USER_ROLE),
     )
     is_verified = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

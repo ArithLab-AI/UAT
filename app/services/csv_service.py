@@ -1,18 +1,20 @@
 import csv
 import io
 import re
+import tempfile
+from contextlib import contextmanager
 from typing import Any
 from datetime import date, datetime, time
 from pathlib import Path
 import openpyxl
 import xlrd
 from fastapi import UploadFile
-from sqlalchemy import Column, Integer, MetaData, Table, Text, inspect, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 from app.models.csv_dataset_models import (
     CsvMergedDataset,
     CsvUploadedDataset,
 )
+from app.utils.object_storage import get_object_storage_service
 from app.utils.responses import error_response
 
 
@@ -29,13 +31,14 @@ def _build_table_slug(name: str) -> str:
 
 
 def _generate_table_name(db: Session, prefix: str, dataset_name: str) -> str:
-    inspector = inspect(db.bind)
     base_slug = _build_table_slug(dataset_name)
     candidate = f"{prefix}_{base_slug}"[:55].rstrip("_")
     table_name = candidate
     counter = 1
 
-    while inspector.has_table(table_name):
+    while db.query(CsvUploadedDataset.id).filter(CsvUploadedDataset.table_name == table_name).first() or db.query(
+        CsvMergedDataset.id
+    ).filter(CsvMergedDataset.table_name == table_name).first():
         suffix = f"_{counter}"
         table_name = f"{candidate[: 63 - len(suffix)]}{suffix}"
         counter += 1
@@ -43,48 +46,81 @@ def _generate_table_name(db: Session, prefix: str, dataset_name: str) -> str:
     return table_name
 
 
-def _build_physical_table(table_name: str, columns: list[str]) -> Table:
-    metadata = MetaData()
-    return Table(
-        table_name,
-        metadata,
-        Column("id", Integer, primary_key=True, autoincrement=True),
-        *[Column(column, Text, nullable=True) for column in columns],
-    )
+def _csv_dataset_storage_key(table_name: str) -> str:
+    return f"csv_datasets/{table_name}.csv"
 
 
-def create_physical_csv_table(
-    db: Session,
+@contextmanager
+def _temporary_csv_file(prefix: str):
+    temp_file = tempfile.NamedTemporaryFile(prefix=prefix, suffix=".csv", delete=False)
+    temp_file.close()
+    temp_path = Path(temp_file.name)
+    try:
+        yield temp_path
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _write_rows_to_csv_file(file_path: Path, columns: list[str], rows: list[dict]) -> None:
+    with file_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({column: row.get(column) for column in columns})
+
+
+def _upload_rows_to_object_storage(
     *,
     table_name: str,
     columns: list[str],
     rows: list[dict],
-) -> None:
-    dynamic_table = _build_physical_table(table_name, columns)
-    dynamic_table.create(bind=db.bind)
+) -> tuple[str, str]:
+    storage_service = get_object_storage_service()
+    if not storage_service.enabled:
+        raise error_response(
+            status_code=500,
+            detail="AWS S3 bucket is not configured for CSV dataset storage",
+        )
 
-    if rows:
-        db.execute(dynamic_table.insert(), rows)
+    storage_key = _csv_dataset_storage_key(table_name)
+    with _temporary_csv_file(prefix=f"{table_name}_") as temp_path:
+        _write_rows_to_csv_file(temp_path, columns, rows)
+        file_url = storage_service.upload_file(str(temp_path), storage_key)
+    return storage_key, file_url
 
 
-def fetch_table_rows(
-    db: Session,
+def _fetch_dataset_rows(
     *,
     table_name: str,
     columns: list[str],
+    storage_key: str | None = None,
 ) -> list[dict]:
-    reflected_table = Table(table_name, MetaData(), autoload_with=db.bind)
-    result = db.execute(select(*[reflected_table.c[column] for column in columns]))
-    return [dict(row._mapping) for row in result]
+    storage_service = get_object_storage_service()
+    if not storage_service.enabled:
+        raise error_response(
+            status_code=500,
+            detail="AWS S3 bucket is not configured for CSV dataset storage",
+        )
+
+    storage_key = storage_key or _csv_dataset_storage_key(table_name)
+    with _temporary_csv_file(prefix=f"{table_name}_") as temp_path:
+        restored = storage_service.download_file(storage_key, str(temp_path))
+        if not restored:
+            raise error_response(
+                status_code=404,
+                detail=f"Dataset data for {table_name} was not found in object storage",
+            )
+
+        with temp_path.open("r", newline="", encoding="utf-8-sig") as csv_file:
+            reader = csv.DictReader(csv_file)
+            return [
+                {column: row.get(column) for column in columns}
+                for row in reader
+            ]
 
 
-def drop_physical_csv_table(db: Session, *, table_name: str) -> None:
-    inspector = inspect(db.bind)
-    if not inspector.has_table(table_name):
-        return
-
-    reflected_table = Table(table_name, MetaData(), autoload_with=db.bind)
-    reflected_table.drop(bind=db.bind)
+def _delete_dataset_rows(*, table_name: str, storage_key: str | None = None) -> None:
+    get_object_storage_service().delete_file(storage_key or _csv_dataset_storage_key(table_name))
 
 
 def _normalize_scalar_value(value):
@@ -266,6 +302,20 @@ def build_dataset_name(explicit_name: str | None, file_name: str) -> str:
     return _normalize_dataset_name(Path(file_name).stem.replace("_", " ").replace("-", " "))
 
 
+def count_user_active_datasets(db: Session, user_id: int) -> int:
+    uploaded_count = (
+        db.query(CsvUploadedDataset)
+        .filter(CsvUploadedDataset.created_by_user_id == user_id)
+        .count()
+    )
+    merged_count = (
+        db.query(CsvMergedDataset)
+        .filter(CsvMergedDataset.created_by_user_id == user_id)
+        .count()
+    )
+    return uploaded_count + merged_count
+
+
 def _build_merge_column_mappings(
     source_datasets: list[CsvUploadedDataset],
 ) -> tuple[list[str], dict[int, dict[str, str]]]:
@@ -329,24 +379,26 @@ def create_uploaded_dataset(
     rows: list[dict],
     user_id: int,
 ) -> CsvUploadedDataset:
+    table_name = _generate_table_name(db, "upload", dataset_name)
+    storage_key, file_url = _upload_rows_to_object_storage(
+        table_name=table_name,
+        columns=internal_columns,
+        rows=rows,
+    )
+
     dataset = CsvUploadedDataset(
         name=dataset_name,
         file_name=file_name,
         file_size=file_size,
-        table_name=_generate_table_name(db, "upload", dataset_name),
+        table_name=table_name,
+        storage_key=storage_key,
+        file_url=file_url,
         created_by_user_id=user_id,
         total_rows=len(rows),
         columns=columns,
         internal_columns=internal_columns,
     )
     db.add(dataset)
-    db.flush()
-    create_physical_csv_table(
-        db,
-        table_name=dataset.table_name,
-        columns=internal_columns,
-        rows=rows,
-    )
 
     return dataset
 
@@ -359,25 +411,14 @@ def merge_uploaded_datasets(
     user_id: int,
 ) -> CsvMergedDataset:
     ordered_columns, column_mappings = _build_merge_column_mappings(source_datasets)
-
-    merged_dataset = CsvMergedDataset(
-        name=_normalize_dataset_name(merged_name),
-        table_name=_generate_table_name(db, "merged", merged_name),
-        created_by_user_id=user_id,
-        source_dataset_ids=[dataset.id for dataset in source_datasets],
-        columns=list(source_datasets[0].columns),
-        internal_columns=ordered_columns,
-        total_rows=0,
-    )
-    db.add(merged_dataset)
-    db.flush()
+    table_name = _generate_table_name(db, "merged", merged_name)
 
     merged_rows: list[dict] = []
     for dataset in source_datasets:
-        dataset_rows = fetch_table_rows(
-            db,
+        dataset_rows = _fetch_dataset_rows(
             table_name=dataset.table_name,
             columns=dataset.internal_columns,
+            storage_key=dataset.storage_key,
         )
         dataset_column_mapping = column_mappings[dataset.id]
         for row in dataset_rows:
@@ -388,20 +429,34 @@ def merge_uploaded_datasets(
                 }
             )
 
-    create_physical_csv_table(
-        db,
-        table_name=merged_dataset.table_name,
+    storage_key, file_url = _upload_rows_to_object_storage(
+        table_name=table_name,
         columns=ordered_columns,
         rows=merged_rows,
     )
-    merged_dataset.total_rows = len(merged_rows)
+
+    merged_dataset = CsvMergedDataset(
+        name=_normalize_dataset_name(merged_name),
+        table_name=table_name,
+        storage_key=storage_key,
+        file_url=file_url,
+        created_by_user_id=user_id,
+        source_dataset_ids=[dataset.id for dataset in source_datasets],
+        columns=list(source_datasets[0].columns),
+        internal_columns=ordered_columns,
+        total_rows=len(merged_rows),
+    )
+    db.add(merged_dataset)
+
     return merged_dataset
 
 
 def delete_uploaded_dataset(
-    db: Session,
     *,
     dataset: CsvUploadedDataset,
 ) -> None:
-    drop_physical_csv_table(db, table_name=dataset.table_name)
-    db.delete(dataset)
+    _delete_dataset_rows(table_name=dataset.table_name, storage_key=dataset.storage_key)
+    session = object_session(dataset)
+    if session is None:
+        raise error_response(status_code=500, detail="Dataset session is not available")
+    session.delete(dataset)

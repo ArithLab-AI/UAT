@@ -1,5 +1,7 @@
 from sqlalchemy import inspect, text
 
+from app.enum.user_role_enum import DEFAULT_USER_ROLE
+
 def ensure_auth_schema(engine) -> None:
     inspector = inspect(engine)
 
@@ -14,6 +16,6 @@ def ensure_auth_schema(engine) -> None:
         connection.execute(
             text(
                 "ALTER TABLE users "
-                "ADD COLUMN user_role INTEGER NOT NULL DEFAULT 2"
+                f"ADD COLUMN user_role INTEGER NOT NULL DEFAULT {DEFAULT_USER_ROLE}"
             )
         )

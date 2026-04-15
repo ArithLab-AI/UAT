@@ -6,6 +6,8 @@ class CsvDatasetSummaryResponse(BaseModel):
     id: int
     name: str
     table_name: str
+    storage_key: str | None = None
+    file_url: str | None = None
     total_rows: int
     columns: list[str]
     created_at: datetime

@@ -3,6 +3,7 @@ from typing import Optional
 
 from pydantic import BaseModel, EmailStr, validator
 
+from app.enum.user_role_enum import DEFAULT_USER_ROLE
 from app.enum.user_role_enum import normalize_user_role
 from app.schemas.common_schema import SuccessResponse
 
@@ -13,7 +14,7 @@ class Register(BaseModel):
     password: str
     first_name: str
     last_name: str
-    user_role: int
+    user_role: int = DEFAULT_USER_ROLE
 
     @validator("user_role", pre=True)
     def validate_user_role(cls, value):
