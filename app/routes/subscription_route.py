@@ -9,10 +9,18 @@ from app.schemas import subscription_schema
 from app.schemas.common_schema import MessageSuccessResponse
 from app.schemas.subscription_schema import SubscribeRequest
 from app.config.deps import get_current_user
+from app.services.subscription_service import normalize_plan_tier
 from app.utils.responses import error_response, success_response
 
 router = APIRouter(prefix="/subscriptions", tags=["Subscriptions"])
 logger = logging.getLogger(__name__)
+
+PLAN_SORT_ORDER = {
+    "free": 0,
+    "lite": 1,
+    "pro": 2,
+    "enterprise": 3,
+}
 
 @router.get("/plans", response_model=subscription_schema.PlanListSuccessResponse)
 def get_plans(
@@ -20,14 +28,13 @@ def get_plans(
     current_user: User = Depends(get_current_user),
 ):
     plans = db.query(SubscriptionPlan).filter(
-        SubscriptionPlan.user_role == current_user.user_role,
         SubscriptionPlan.is_active == True
     ).all()
+    plans.sort(key=lambda plan: (PLAN_SORT_ORDER.get(normalize_plan_tier(plan.name), 99), plan.id))
     logger.info(
-        "Fetched %s active subscription plans for user_id=%s user_role=%s",
+        "Fetched %s active subscription plans for user_id=%s",
         len(plans),
         current_user.id,
-        current_user.user_role,
     )
     return success_response("Plans fetched successfully", data=plans)
 
@@ -50,19 +57,6 @@ def subscribe(
             payload.plan_id,
         )
         raise error_response(status_code=404, detail="Plan not found")
-
-    if plan.user_role != current_user.user_role:
-        logger.warning(
-            "Subscribe failed for user_id=%s: plan_id=%s role mismatch user_role=%s plan_role=%s",
-            current_user.id,
-            payload.plan_id,
-            current_user.user_role,
-            plan.user_role,
-        )
-        raise error_response(
-            status_code=400,
-            detail="You can only subscribe to plans for your user role",
-        )
 
     # Expire old subscription if exists
     old_subscriptions = db.query(UserSubscription).filter(

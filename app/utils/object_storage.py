@@ -108,6 +108,22 @@ class ObjectStorageService:
             )
             return False
 
+    def delete_file(self, key: str) -> bool:
+        if not self.enabled:
+            return False
+
+        client = self._get_client()
+        try:
+            client.delete_object(Bucket=self.bucket_name, Key=key)
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Failed to delete object storage key '%s': %s",
+                key,
+                exc,
+            )
+            return False
+
     def object_uri(self, key: str) -> str:
         return f"s3://{self.bucket_name}/{key}"
 
