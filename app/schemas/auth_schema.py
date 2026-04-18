@@ -67,6 +67,12 @@ class ProtectedUserData(BaseModel):
     email: EmailStr
     user_role: int
     last_login: Optional[datetime]
+    retention_plan: Optional[str] = None
+    retention_pending_days: Optional[int] = None
+    retention_pending_hours: Optional[int] = None
+    next_file_expiry_at: Optional[datetime] = None
+    next_expiring_file_name: Optional[str] = None
+    retained_file_count: int = 0
 
 
 UserSuccessResponse = SuccessResponse[UserResponse]
