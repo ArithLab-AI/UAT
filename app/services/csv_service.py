@@ -460,3 +460,14 @@ def delete_uploaded_dataset(
     if session is None:
         raise error_response(status_code=500, detail="Dataset session is not available")
     session.delete(dataset)
+
+
+def delete_merged_dataset(
+    *,
+    dataset: CsvMergedDataset,
+) -> None:
+    _delete_dataset_rows(table_name=dataset.table_name, storage_key=dataset.storage_key)
+    session = object_session(dataset)
+    if session is None:
+        raise error_response(status_code=500, detail="Dataset session is not available")
+    session.delete(dataset)

@@ -12,6 +12,7 @@ from app.config.config import settings
 from app.auth.security import hash_password, verify_password
 from app.schemas.common_schema import MessageSuccessResponse
 from app.services.subscription_service import ensure_default_free_subscription
+from app.services.file_retention_service import get_user_retention_summary
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from app.utils.responses import error_response, success_response
 
@@ -286,8 +287,12 @@ def reset_password(payload: auth_schema.ResetPassword, db: Session = Depends(get
     return success_response("Password reset successful", data=None)
 
 @router.get("/protected", response_model=auth_schema.ProtectedSuccessResponse)
-def protected_route(current_user: auth_models.User = Depends(get_current_user)):
+def protected_route(
+    current_user: auth_models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     logger.info("Protected route accessed by user_id=%s", current_user.id)
+    retention_summary = get_user_retention_summary(db, current_user.id)
     return success_response(
         f"Welcome back, {current_user.username}",
         data={
@@ -295,6 +300,7 @@ def protected_route(current_user: auth_models.User = Depends(get_current_user)):
             "email": current_user.email,
             "user_role": current_user.user_role,
             "last_login": current_user.last_login,
+            **retention_summary,
         },
     )
 

@@ -1,7 +1,9 @@
 import logging
 from datetime import datetime, timedelta
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.models.auth_models import User
+from app.models.csv_dataset_models import CsvUploadedDataset
 from app.models.subscription_models import SubscriptionPlan, UserSubscription
 
 logger = logging.getLogger(__name__)
@@ -49,6 +51,26 @@ def normalize_plan_tier(plan_name: str | None) -> str:
 
 def get_plan_capabilities(plan_name: str | None) -> dict:
     return PLAN_CAPABILITIES[normalize_plan_tier(plan_name)]
+
+
+def get_user_storage_summary(db: Session, user_id: int, plan_name: str | None) -> dict:
+    plan_capabilities = get_plan_capabilities(plan_name)
+    total_file_size_bytes = plan_capabilities["max_file_size_bytes"]
+    used_file_size_bytes = (
+        db.query(func.coalesce(func.sum(CsvUploadedDataset.file_size), 0))
+        .filter(CsvUploadedDataset.created_by_user_id == user_id)
+        .scalar()
+    ) or 0
+
+    remaining_file_size_bytes = None
+    if total_file_size_bytes is not None:
+        remaining_file_size_bytes = max(total_file_size_bytes - used_file_size_bytes, 0)
+
+    return {
+        "total_file_size_bytes": total_file_size_bytes,
+        "used_file_size_bytes": used_file_size_bytes,
+        "remaining_file_size_bytes": remaining_file_size_bytes
+    }
 
 
 def get_active_subscription(db: Session, user_id: int) -> UserSubscription | None:
