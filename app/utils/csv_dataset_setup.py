@@ -8,6 +8,7 @@ def ensure_csv_dataset_schema(engine) -> None:
 
     if inspector.has_table("csv_uploaded_datasets"):
         uploaded_columns = {column["name"] for column in inspector.get_columns("csv_uploaded_datasets")}
+        _ensure_retention_columns(engine, "csv_uploaded_datasets", uploaded_columns)
         if "table_name" not in uploaded_columns:
             with engine.begin() as connection:
                 connection.execute(text("ALTER TABLE csv_uploaded_datasets ADD COLUMN table_name VARCHAR"))
@@ -105,3 +106,18 @@ def ensure_csv_dataset_schema(engine) -> None:
                     ),
                     {"bucket_name": bucket_name},
                 )
+
+
+def _ensure_retention_columns(engine, table_name: str, columns: set[str]) -> None:
+    with engine.begin() as connection:
+        if "is_retention" not in columns:
+            connection.execute(
+                text(
+                    f"ALTER TABLE {table_name} "
+                    "ADD COLUMN is_retention BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+            )
+        if "retention_until" not in columns:
+            connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN retention_until TIMESTAMP"))
+        if "retention_at" not in columns:
+            connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN retention_at TIMESTAMP"))

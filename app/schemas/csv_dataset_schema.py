@@ -8,6 +8,7 @@ class CsvDatasetSummaryResponse(BaseModel):
     table_name: str
     storage_key: str | None = None
     file_url: str | None = None
+    file_size: int
     total_rows: int
     columns: list[str]
     created_at: datetime
@@ -19,6 +20,9 @@ class CsvDatasetSummaryResponse(BaseModel):
 class CsvUploadedDatasetResponse(CsvDatasetSummaryResponse):
     file_name: str
     file_size: int
+    is_retention: bool = False
+    retention_until: datetime | None = None
+    retention_at: datetime | None = None
 
 
 class CsvMergedSourceDatasetResponse(BaseModel):
@@ -27,7 +31,6 @@ class CsvMergedSourceDatasetResponse(BaseModel):
 
 
 class CsvMergedDatasetResponse(CsvDatasetSummaryResponse):
-    source_dataset_ids: list[int]
     source_datasets: list[CsvMergedSourceDatasetResponse]
 
 

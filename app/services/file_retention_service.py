@@ -8,12 +8,13 @@ from sqlalchemy.orm import Session
 
 from app.db.database import SessionLocal
 from app.models.auth_models import User
-from app.models.csv_dataset_models import CsvMergedDataset, CsvUploadedDataset
+from app.models.csv_dataset_models import CsvUploadedDataset
 from app.models.subscription_models import UserSubscription
-from app.services.csv_service import delete_merged_dataset, delete_uploaded_dataset
-from app.services.subscription_service import normalize_plan_tier
+from app.services.csv_service import delete_uploaded_dataset
+from app.services.subscription_service import get_active_subscription, normalize_plan_tier
 from app.utils.email_utils import send_plain_email, smtp_settings_complete
 from app.utils.mail_body import retention_warning_mail_body
+from app.utils.responses import error_response
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,7 @@ FREE_RETENTION_HOURS = 24
 RETENTION_WARNING_DAYS = 2
 RETENTION_JOB_INTERVAL_SECONDS = 12 * 60 * 60
 DEFAULT_PAID_RETENTION_DAYS = 30
+PAID_RETENTION_EXTENSION_DAYS = 2
 ANONYMOUS_UPLOAD_EMAIL = "guest-upload@local.invalid"
 
 _retention_stop_event = threading.Event()
@@ -70,7 +72,15 @@ def _get_latest_subscription(db: Session, user_id: int) -> UserSubscription | No
     )
 
 
-def _get_retention_deadline(
+def _get_paid_retention_days(subscription: UserSubscription | None) -> int:
+    return (
+        subscription.plan.duration_days
+        if subscription and subscription.plan and subscription.plan.duration_days
+        else DEFAULT_PAID_RETENTION_DAYS
+    )
+
+
+def _get_base_retention_deadline(
     *,
     created_at: datetime,
     tier: str,
@@ -79,13 +89,121 @@ def _get_retention_deadline(
     if tier == "free":
         return created_at + timedelta(hours=FREE_RETENTION_HOURS)
     if tier in {"lite", "pro"}:
-        duration_days = (
-            subscription.plan.duration_days
-            if subscription and subscription.plan and subscription.plan.duration_days
-            else DEFAULT_PAID_RETENTION_DAYS
-        )
-        return created_at + timedelta(days=duration_days)
+        return created_at + timedelta(days=_get_paid_retention_days(subscription))
     return None
+
+
+def _get_paid_retention_limit(
+    *,
+    created_at: datetime,
+    subscription: UserSubscription | None,
+) -> datetime:
+    return created_at + timedelta(
+        days=_get_paid_retention_days(subscription) + PAID_RETENTION_EXTENSION_DAYS
+    )
+
+
+def get_retention_expiry_for_user(
+    *,
+    db: Session,
+    user_id: int,
+    created_at: datetime,
+) -> datetime | None:
+    subscription = get_active_subscription(db, user_id)
+    plan_name = subscription.plan.name if subscription and subscription.plan else None
+    tier = normalize_plan_tier(plan_name)
+    return _get_base_retention_deadline(
+        created_at=created_at,
+        tier=tier,
+        subscription=subscription,
+    )
+
+
+def set_dataset_retention_expiry(
+    *,
+    db: Session,
+    dataset,
+    user_id: int,
+) -> datetime | None:
+    if not dataset.created_at:
+        dataset.created_at = datetime.utcnow()
+
+    expiry_at = get_retention_expiry_for_user(
+        db=db,
+        user_id=user_id,
+        created_at=dataset.created_at,
+    )
+    dataset.retention_until = expiry_at
+    dataset.retention_at = datetime.utcnow() if expiry_at else None
+    dataset.is_retention = expiry_at is not None
+    return expiry_at
+
+
+def _get_retention_deadline(
+    *,
+    dataset,
+    tier: str,
+    subscription: UserSubscription | None,
+) -> datetime | None:
+    deadline = _get_base_retention_deadline(
+        created_at=dataset.created_at,
+        tier=tier,
+        subscription=subscription,
+    )
+    if deadline is None:
+        return None
+
+    if not dataset.retention_until:
+        return deadline
+
+    if tier in {"lite", "pro"}:
+        return min(
+            dataset.retention_until,
+            _get_paid_retention_limit(
+                created_at=dataset.created_at,
+                subscription=subscription,
+            ),
+        )
+
+    deadline = min(deadline, dataset.retention_until)
+
+    return deadline
+
+
+def retention_dataset_for_user(
+    *,
+    db: Session,
+    dataset,
+    user_id: int,
+) -> datetime:
+    subscription = get_active_subscription(db, user_id)
+    plan_name = subscription.plan.name if subscription and subscription.plan else None
+    tier = normalize_plan_tier(plan_name)
+
+    if tier not in {"lite", "pro"}:
+        raise error_response(
+            status_code=403,
+            detail="File retention is available only for Lite and Pro plans.",
+        )
+
+    now = datetime.utcnow()
+    retention_until = _get_paid_retention_limit(
+        created_at=dataset.created_at,
+        subscription=subscription,
+    )
+    if retention_until <= now:
+        raise error_response(
+            status_code=400,
+            detail=(
+                "This file can no longer be retained. Retention is limited to "
+                f"your subscription period plus {PAID_RETENTION_EXTENSION_DAYS} days."
+            ),
+        )
+
+    dataset.is_retention = True
+    dataset.retention_until = retention_until
+    dataset.retention_at = now
+    return retention_until
 
 
 def _get_user_retention_policy(db: Session, user_id: int) -> tuple[str, str, UserSubscription | None]:
@@ -104,24 +222,10 @@ def get_user_retention_summary(db: Session, user_id: int) -> dict:
         .filter(CsvUploadedDataset.created_by_user_id == user_id)
         .all()
     )
-    merged_datasets = (
-        db.query(CsvMergedDataset)
-        .filter(CsvMergedDataset.created_by_user_id == user_id)
-        .all()
-    )
 
     for dataset in uploaded_datasets:
         deadline = _get_retention_deadline(
-            created_at=dataset.created_at,
-            tier=tier,
-            subscription=subscription,
-        )
-        if deadline is not None and deadline > now:
-            datasets.append((dataset.name, deadline))
-
-    for dataset in merged_datasets:
-        deadline = _get_retention_deadline(
-            created_at=dataset.created_at,
+            dataset=dataset,
             tier=tier,
             subscription=subscription,
         )
@@ -134,7 +238,7 @@ def get_user_retention_summary(db: Session, user_id: int) -> dict:
             "retention_pending_days": None,
             "retention_pending_hours": None,
             "next_file_expiry_at": None,
-            "retained_file_count": 0,
+            "retention_file_count": 0,
         }
 
     next_file_name, next_expiry_at = min(datasets, key=lambda item: item[1])
@@ -146,7 +250,7 @@ def get_user_retention_summary(db: Session, user_id: int) -> dict:
         "retention_pending_hours": math.ceil(remaining_seconds / 3600),
         "next_file_expiry_at": next_expiry_at,
         "next_expiring_file_name": next_file_name,
-        "retained_file_count": len(datasets),
+        "retention_file_count": len(datasets),
     }
 
 
@@ -202,7 +306,7 @@ def _process_retention_datasets(
             retention_cache,
         )
         deadline = _get_retention_deadline(
-            created_at=dataset.created_at,
+            dataset=dataset,
             tier=tier,
             subscription=subscription,
         )
@@ -245,14 +349,6 @@ def run_file_retention_cycle() -> None:
             .order_by(CsvUploadedDataset.created_at.asc())
             .all()
         )
-        merged_datasets = (
-            db.query(CsvMergedDataset)
-            .join(User, CsvMergedDataset.created_by_user_id == User.id)
-            .filter(User.email != ANONYMOUS_UPLOAD_EMAIL)
-            .order_by(CsvMergedDataset.created_at.asc())
-            .all()
-        )
-
         retention_cache: dict[int, tuple[str, str, UserSubscription | None]] = {}
 
         _process_retention_datasets(
@@ -263,15 +359,6 @@ def run_file_retention_cycle() -> None:
             warning_groups=warning_groups,
             delete_callback=delete_uploaded_dataset,
             log_label="uploaded dataset",
-        )
-        _process_retention_datasets(
-            db=db,
-            datasets=merged_datasets,
-            now=now,
-            retention_cache=retention_cache,
-            warning_groups=warning_groups,
-            delete_callback=delete_merged_dataset,
-            log_label="merged dataset",
         )
 
         db.commit()
