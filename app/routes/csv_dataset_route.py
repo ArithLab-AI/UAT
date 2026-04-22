@@ -23,6 +23,10 @@ from app.services.csv_service import (
     merge_uploaded_datasets,
     parse_csv_upload,
 )
+from app.services.file_retention_service import (
+    retention_dataset_for_user,
+    set_dataset_retention_expiry,
+)
 from app.services.subscription_service import get_user_plan_capabilities
 from app.utils.responses import error_response, success_response
 
@@ -70,28 +74,37 @@ def _format_file_size_limit(limit_bytes: int | None) -> str:
     return f"{limit_bytes // (1024 * 1024)} MB"
 
 
-def _serialize_merged_dataset(
-    merged_dataset: CsvMergedDataset,
-    source_dataset_map: dict[int, CsvUploadedDataset],
-):
+def _serialize_merged_dataset(merged_dataset, source_dataset_map=None):
+    metadata = merged_dataset.source_datasets_metadata or []
+    source_dataset_map = source_dataset_map or {}
+    seen_source_ids = set()
+
+    source_datasets = []
+    for item in metadata:
+        source_id = item["id"]
+        if source_id in seen_source_ids:
+            continue
+
+        seen_source_ids.add(source_id)
+        src = source_dataset_map.get(source_id)
+        source_datasets.append(
+            {
+                "id": source_id,
+                "file_name": src.file_name if src else item["file_name"],
+            }
+        )
+
     return {
         "id": merged_dataset.id,
         "name": merged_dataset.name,
         "table_name": merged_dataset.table_name,
         "storage_key": merged_dataset.storage_key,
         "file_url": merged_dataset.file_url,
+        "file_size": merged_dataset.file_size,
         "total_rows": merged_dataset.total_rows,
         "columns": merged_dataset.columns,
         "created_at": merged_dataset.created_at,
-        "source_dataset_ids": merged_dataset.source_dataset_ids,
-        "source_datasets": [
-            {
-                "id": source_id,
-                "file_name": source_dataset_map[source_id].file_name,
-            }
-            for source_id in merged_dataset.source_dataset_ids
-            if source_id in source_dataset_map
-        ],
+        "source_datasets": source_datasets,
     }
 
 
@@ -161,6 +174,11 @@ async def upload_multiple_csv_datasets(
             columns=columns,
             internal_columns=internal_columns,
             rows=rows,
+            user_id=current_user.id,
+        )
+        set_dataset_retention_expiry(
+            db=db,
+            dataset=dataset,
             user_id=current_user.id,
         )
         created_datasets.append(dataset)
@@ -274,9 +292,9 @@ def list_csv_datasets(
     )
     source_dataset_ids = sorted(
         {
-            source_id
+            item["id"]
             for merged_dataset in merged_datasets
-            for source_id in merged_dataset.source_dataset_ids
+            for item in (merged_dataset.source_datasets_metadata or [])
         }
     )
     source_datasets = (
@@ -299,6 +317,49 @@ def list_csv_datasets(
                 _serialize_merged_dataset(merged_dataset, source_dataset_map)
                 for merged_dataset in merged_datasets
             ],
+        },
+    )
+
+
+@router.post("/uploaded/{dataset_id}/retention", response_model=MessageSuccessResponse)
+def retention_csv_uploaded_dataset(
+    dataset_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    dataset = (
+        db.query(CsvUploadedDataset)
+        .filter(
+            CsvUploadedDataset.id == dataset_id,
+            CsvUploadedDataset.created_by_user_id == current_user.id,
+        )
+        .first()
+    )
+
+    if not dataset:
+        raise error_response(status_code=404, detail="Uploaded dataset not found")
+
+    retention_until = retention_dataset_for_user(
+        db=db,
+        dataset=dataset,
+        user_id=current_user.id,
+    )
+    db.commit()
+    db.refresh(dataset)
+
+    logger.info(
+        "retention uploaded dataset_id=%s for user_id=%s until=%s",
+        dataset_id,
+        current_user.id,
+        retention_until,
+    )
+    return success_response(
+        "Uploaded dataset retention expiry updated successfully",
+        data={
+            "dataset_id": dataset.id,
+            "is_retention": dataset.is_retention,
+            "retention_until": dataset.retention_until,
+            "retention_at": dataset.retention_at,
         },
     )
 

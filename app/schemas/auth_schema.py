@@ -72,7 +72,7 @@ class ProtectedUserData(BaseModel):
     retention_pending_hours: Optional[int] = None
     next_file_expiry_at: Optional[datetime] = None
     next_expiring_file_name: Optional[str] = None
-    retained_file_count: int = 0
+    retention_file_count: int = 0
 
 
 UserSuccessResponse = SuccessResponse[UserResponse]

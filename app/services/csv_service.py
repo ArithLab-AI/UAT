@@ -1,6 +1,7 @@
 import csv
 import io
 import re
+import os
 import tempfile
 from contextlib import contextmanager
 from typing import Any
@@ -85,8 +86,9 @@ def _upload_rows_to_object_storage(
     storage_key = _csv_dataset_storage_key(table_name)
     with _temporary_csv_file(prefix=f"{table_name}_") as temp_path:
         _write_rows_to_csv_file(temp_path, columns, rows)
+        file_size = os.path.getsize(temp_path)
         file_url = storage_service.upload_file(str(temp_path), storage_key)
-    return storage_key, file_url
+    return storage_key, file_url, file_size
 
 
 def _fetch_dataset_rows(
@@ -380,7 +382,7 @@ def create_uploaded_dataset(
     user_id: int,
 ) -> CsvUploadedDataset:
     table_name = _generate_table_name(db, "upload", dataset_name)
-    storage_key, file_url = _upload_rows_to_object_storage(
+    storage_key, file_url, file_size = _upload_rows_to_object_storage(
         table_name=table_name,
         columns=internal_columns,
         rows=rows,
@@ -429,7 +431,7 @@ def merge_uploaded_datasets(
                 }
             )
 
-    storage_key, file_url = _upload_rows_to_object_storage(
+    storage_key, file_url, file_size = _upload_rows_to_object_storage(
         table_name=table_name,
         columns=ordered_columns,
         rows=merged_rows,
@@ -440,8 +442,12 @@ def merge_uploaded_datasets(
         table_name=table_name,
         storage_key=storage_key,
         file_url=file_url,
+        file_size=file_size,
         created_by_user_id=user_id,
-        source_dataset_ids=[dataset.id for dataset in source_datasets],
+        source_datasets_metadata=[
+            {"id": dataset.id, "file_name": dataset.file_name}
+            for dataset in source_datasets
+        ],
         columns=list(source_datasets[0].columns),
         internal_columns=ordered_columns,
         total_rows=len(merged_rows),

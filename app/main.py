@@ -27,7 +27,6 @@ app.include_router(subscription_router)
 app.include_router(csv_dataset_router)
 app.include_router(upload_file_router)
 
-
 @app.exception_handler(RequestValidationError)
 async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
     return validation_error_response(exc)
@@ -36,16 +35,6 @@ async def request_validation_exception_handler(request: Request, exc: RequestVal
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     return http_exception_response(exc)
-
-
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    try:
-        response = await call_next(request)
-    except Exception:
-        raise
-
-    return response
 
 
 @app.on_event("startup")
