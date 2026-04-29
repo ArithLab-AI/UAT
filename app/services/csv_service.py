@@ -6,7 +6,7 @@ import tempfile
 from contextlib import contextmanager
 from typing import Any
 from datetime import date, datetime, time
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import openpyxl
 import xlrd
 from fastapi import UploadFile
@@ -51,6 +51,10 @@ def _csv_dataset_storage_key(table_name: str) -> str:
     return f"csv_datasets/{table_name}.csv"
 
 
+def _clean_upload_file_name(file_name: str) -> str:
+    return Path(PureWindowsPath(file_name).name).name
+
+
 @contextmanager
 def _temporary_csv_file(prefix: str):
     temp_file = tempfile.NamedTemporaryFile(prefix=prefix, suffix=".csv", delete=False)
@@ -75,7 +79,7 @@ def _upload_rows_to_object_storage(
     table_name: str,
     columns: list[str],
     rows: list[dict],
-) -> tuple[str, str]:
+) -> tuple[str, str, int]:
     storage_service = get_object_storage_service()
     if not storage_service.enabled:
         raise error_response(
@@ -176,6 +180,14 @@ def _normalize_columns(file_name: str, columns: list[Any]) -> tuple[list[str], l
     return original_columns, internal_columns
 
 
+def _get_csv_dialect(text_content: str):
+    sample = text_content[:4096]
+    try:
+        return csv.Sniffer().sniff(sample, delimiters=",;\t|")
+    except csv.Error:
+        return csv.excel
+
+
 def _parse_csv_content(file_name: str, content: bytes) -> tuple[list[str], list[str], list[dict]]:
     try:
         text_content = content.decode("utf-8-sig")
@@ -185,7 +197,7 @@ def _parse_csv_content(file_name: str, content: bytes) -> tuple[list[str], list[
             detail=f"{file_name} must be UTF-8 encoded",
         ) from exc
 
-    csv_reader = csv.reader(io.StringIO(text_content))
+    csv_reader = csv.reader(io.StringIO(text_content), dialect=_get_csv_dialect(text_content))
     columns = next(csv_reader, None)
     original_columns, internal_columns = _normalize_columns(file_name, columns or [])
 
@@ -272,7 +284,8 @@ async def parse_csv_upload(file: UploadFile) -> tuple[str, int, list[str], list[
     if not file.filename:
         raise error_response(status_code=400, detail="Uploaded file must have a name")
 
-    suffix = Path(file.filename).suffix.lower()
+    file_name = _clean_upload_file_name(file.filename)
+    suffix = Path(file_name).suffix.lower()
     allowed_extensions = {".csv", ".xlsx", ".xls"}
     if suffix not in allowed_extensions:
         raise error_response(
@@ -283,17 +296,17 @@ async def parse_csv_upload(file: UploadFile) -> tuple[str, int, list[str], list[
     try:
         content = await file.read()
         if not content:
-            raise error_response(status_code=400, detail=f"{file.filename} is empty")
+            raise error_response(status_code=400, detail=f"{file_name} is empty")
         file_size = len(content)
 
         if suffix == ".csv":
-            original_columns, internal_columns, rows = _parse_csv_content(file.filename, content)
+            original_columns, internal_columns, rows = _parse_csv_content(file_name, content)
         elif suffix == ".xlsx":
-            original_columns, internal_columns, rows = _parse_xlsx_content(file.filename, content)
+            original_columns, internal_columns, rows = _parse_xlsx_content(file_name, content)
         else:
-            original_columns, internal_columns, rows = _parse_xls_content(file.filename, content)
+            original_columns, internal_columns, rows = _parse_xls_content(file_name, content)
 
-        return file.filename, file_size, original_columns, internal_columns, rows
+        return file_name, file_size, original_columns, internal_columns, rows
     finally:
         await file.close()
 
@@ -382,7 +395,7 @@ def create_uploaded_dataset(
     user_id: int,
 ) -> CsvUploadedDataset:
     table_name = _generate_table_name(db, "upload", dataset_name)
-    storage_key, file_url, file_size = _upload_rows_to_object_storage(
+    storage_key, file_url, _ = _upload_rows_to_object_storage(
         table_name=table_name,
         columns=internal_columns,
         rows=rows,
@@ -399,6 +412,7 @@ def create_uploaded_dataset(
         total_rows=len(rows),
         columns=columns,
         internal_columns=internal_columns,
+        created_at=datetime.utcnow(),
     )
     db.add(dataset)
 

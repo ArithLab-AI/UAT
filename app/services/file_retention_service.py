@@ -103,6 +103,33 @@ def _get_paid_retention_limit(
     )
 
 
+def _get_effective_retention_deadline(
+    *,
+    dataset,
+    tier: str,
+    subscription: UserSubscription | None,
+) -> datetime | None:
+    deadline = _get_base_retention_deadline(
+        created_at=dataset.created_at,
+        tier=tier,
+        subscription=subscription,
+    )
+    if deadline is None:
+        return None
+
+    if not dataset.retention_until:
+        return deadline
+
+    if tier in {"lite", "pro"}:
+        retention_limit = _get_paid_retention_limit(
+            created_at=dataset.created_at,
+            subscription=subscription,
+        )
+        return min(max(deadline, dataset.retention_until), retention_limit)
+
+    return min(deadline, dataset.retention_until)
+
+
 def get_retention_expiry_for_user(
     *,
     db: Session,
@@ -145,29 +172,11 @@ def _get_retention_deadline(
     tier: str,
     subscription: UserSubscription | None,
 ) -> datetime | None:
-    deadline = _get_base_retention_deadline(
-        created_at=dataset.created_at,
+    return _get_effective_retention_deadline(
+        dataset=dataset,
         tier=tier,
         subscription=subscription,
     )
-    if deadline is None:
-        return None
-
-    if not dataset.retention_until:
-        return deadline
-
-    if tier in {"lite", "pro"}:
-        return min(
-            dataset.retention_until,
-            _get_paid_retention_limit(
-                created_at=dataset.created_at,
-                subscription=subscription,
-            ),
-        )
-
-    deadline = min(deadline, dataset.retention_until)
-
-    return deadline
 
 
 def retention_dataset_for_user(
@@ -204,6 +213,46 @@ def retention_dataset_for_user(
     dataset.retention_until = retention_until
     dataset.retention_at = now
     return retention_until
+
+
+def sync_user_dataset_retention_expiries(db: Session, user_id: int) -> int:
+    subscription = get_active_subscription(db, user_id)
+    plan_name = subscription.plan.name if subscription and subscription.plan else None
+    tier = normalize_plan_tier(plan_name)
+    now = datetime.utcnow()
+    updated_count = 0
+
+    datasets = (
+        db.query(CsvUploadedDataset)
+        .filter(CsvUploadedDataset.created_by_user_id == user_id)
+        .all()
+    )
+
+    for dataset in datasets:
+        if not dataset.created_at:
+            dataset.created_at = now
+
+        expiry_at = _get_effective_retention_deadline(
+            dataset=dataset,
+            tier=tier,
+            subscription=subscription,
+        )
+        if expiry_at is None:
+            continue
+
+        changed = False
+        if dataset.retention_until != expiry_at:
+            dataset.retention_until = expiry_at
+            changed = True
+
+        if not dataset.is_retention:
+            dataset.is_retention = True
+            changed = True
+
+        if changed:
+            updated_count += 1
+
+    return updated_count
 
 
 def _get_user_retention_policy(db: Session, user_id: int) -> tuple[str, str, UserSubscription | None]:

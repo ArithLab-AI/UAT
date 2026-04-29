@@ -19,6 +19,7 @@ from app.services.csv_service import (
     build_dataset_name,
     count_user_active_datasets,
     create_uploaded_dataset,
+    delete_merged_dataset,
     delete_uploaded_dataset,
     merge_uploaded_datasets,
     parse_csv_upload,
@@ -391,3 +392,32 @@ def delete_csv_uploaded_dataset(
         current_user.id,
     )
     return success_response("Uploaded dataset deleted successfully", data=None)
+
+
+@router.delete("/merged/{dataset_id}", response_model=MessageSuccessResponse)
+def delete_csv_merged_dataset(
+    dataset_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    dataset = (
+        db.query(CsvMergedDataset)
+        .filter(
+            CsvMergedDataset.id == dataset_id,
+            CsvMergedDataset.created_by_user_id == current_user.id,
+        )
+        .first()
+    )
+
+    if not dataset:
+        raise error_response(status_code=404, detail="Merged dataset not found")
+
+    delete_merged_dataset(dataset=dataset)
+    db.commit()
+
+    logger.info(
+        "Deleted merged dataset_id=%s for user_id=%s",
+        dataset_id,
+        current_user.id,
+    )
+    return success_response("Merged dataset deleted successfully", data=None)
