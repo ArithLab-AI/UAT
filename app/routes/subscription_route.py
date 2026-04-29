@@ -9,6 +9,7 @@ from app.schemas import subscription_schema
 from app.schemas.common_schema import MessageSuccessResponse
 from app.schemas.subscription_schema import SubscribeRequest
 from app.config.deps import get_current_user
+from app.services.file_retention_service import sync_user_dataset_retention_expiries
 from app.services.subscription_service import get_user_storage_summary, normalize_plan_tier
 from app.utils.responses import error_response, success_response
 
@@ -105,6 +106,8 @@ def subscribe(
     )
 
     db.add(new_subscription)
+    db.flush()
+    sync_user_dataset_retention_expiries(db, current_user.id)
     db.commit()
     db.refresh(new_subscription)
     logger.info("Subscription created id=%s for user_id=%s", new_subscription.id, current_user.id)
