@@ -51,6 +51,10 @@ class Token(BaseModel):
     token_type: str
 
 
+class RefreshToken(BaseModel):
+    refresh_token: str
+
+
 class UserResponse(BaseModel):
     email: EmailStr
     username: str
