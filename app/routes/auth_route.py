@@ -3,6 +3,7 @@ import logging
 from app.models import auth_models
 from app.schemas import auth_schema
 from fastapi import APIRouter, Depends, status
+from jose import jwt, JWTError
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from app.auth import auth
@@ -107,6 +108,65 @@ def login(payload: auth_schema.Login, db: Session = Depends(get_db)):
 
     return success_response(
         "Login successful",
+        data={
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+        },
+    )
+
+@router.post("/refresh", response_model=auth_schema.TokenSuccessResponse)
+def refresh_token(payload: auth_schema.RefreshToken, db: Session = Depends(get_db)):
+    logger.info("Token refresh requested")
+
+    blacklisted = db.query(auth_models.TokenBlacklist).filter(
+        auth_models.TokenBlacklist.token == payload.refresh_token
+    ).first()
+
+    if blacklisted:
+        logger.warning("Token refresh rejected: refresh token is blacklisted")
+        raise error_response(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been revoked"
+        )
+
+    try:
+        token_payload = jwt.decode(
+            payload.refresh_token,
+            settings.SECRET_KEY,
+            algorithms=[settings.ALGORITHM]
+        )
+        email = token_payload.get("sub")
+        token_type = token_payload.get("type")
+
+        if not email or token_type != "refresh":
+            logger.warning("Token refresh rejected: invalid refresh token payload")
+            raise error_response(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid refresh token"
+            )
+
+    except JWTError:
+        logger.warning("Token refresh rejected: invalid or expired refresh token")
+        raise error_response(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token"
+        )
+
+    user = db.query(auth_models.User).filter(
+        auth_models.User.email == email
+    ).first()
+
+    if not user:
+        logger.warning("Token refresh rejected: user not found for email=%s", email)
+        raise error_response(status_code=404, detail="User not found")
+
+    access_token = auth.create_access_token({"sub": user.email})
+    refresh_token = auth.create_refresh_token({"sub": user.email})
+    logger.info("Token refreshed successfully for user_id=%s email=%s", user.id, user.email)
+
+    return success_response(
+        "Token refreshed successfully",
         data={
             "access_token": access_token,
             "refresh_token": refresh_token,
