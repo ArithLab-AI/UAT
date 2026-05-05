@@ -161,8 +161,6 @@ def set_dataset_retention_expiry(
         created_at=dataset.created_at,
     )
     dataset.retention_until = expiry_at
-    dataset.retention_at = datetime.utcnow() if expiry_at else None
-    dataset.is_retention = expiry_at is not None
     return expiry_at
 
 
@@ -243,10 +241,6 @@ def sync_user_dataset_retention_expiries(db: Session, user_id: int) -> int:
         changed = False
         if dataset.retention_until != expiry_at:
             dataset.retention_until = expiry_at
-            changed = True
-
-        if not dataset.is_retention:
-            dataset.is_retention = True
             changed = True
 
         if changed:
