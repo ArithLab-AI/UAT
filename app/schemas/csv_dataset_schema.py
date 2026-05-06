@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 from pydantic import BaseModel, Field
 from app.schemas.common_schema import SuccessResponse
 
@@ -39,9 +40,31 @@ class CsvDatasetListResponse(BaseModel):
     merged_datasets: list[CsvMergedDatasetResponse]
 
 
+class MergeJoinColumnMapping(BaseModel):
+    left_column: str = Field(..., min_length=1)
+    right_column: str = Field(..., min_length=1)
+
+
 class MergeCsvDatasetsRequest(BaseModel):
     merged_name: str = Field(..., min_length=1, max_length=255)
     source_dataset_ids: list[int] = Field(..., min_length=2)
+    merge_type: Literal["inner", "left", "right", "full"] | None = None
+    join_columns: list[MergeJoinColumnMapping] | None = None
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "merged_name": "Customer Orders",
+                "source_dataset_ids": [1, 2],
+                "merge_type": "left",
+                "join_columns": [
+                    {
+                        "left_column": "Email",
+                        "right_column": "Email",
+                    }
+                ],
+            }
+        }
 
 
 CsvUploadedDatasetListSuccessResponse = SuccessResponse[list[CsvUploadedDatasetResponse]]

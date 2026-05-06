@@ -8,6 +8,7 @@ from typing import Any
 from datetime import date, datetime, time
 from pathlib import Path, PureWindowsPath
 import openpyxl
+import pandas as pd
 import xlrd
 from fastapi import UploadFile
 from sqlalchemy.orm import Session, object_session
@@ -72,6 +73,17 @@ def _write_rows_to_csv_file(file_path: Path, columns: list[str], rows: list[dict
         writer.writeheader()
         for row in rows:
             writer.writerow({column: row.get(column) for column in columns})
+
+
+def _build_row_from_values(
+    internal_columns: list[str],
+    values: list[Any],
+    missing_value: Any = None,
+) -> dict:
+    return {
+        column: _normalize_scalar_value(values[index] if index < len(values) else missing_value)
+        for index, column in enumerate(internal_columns)
+    }
 
 
 def _upload_rows_to_object_storage(
@@ -203,13 +215,7 @@ def _parse_csv_content(file_name: str, content: bytes) -> tuple[list[str], list[
 
     rows = []
     for row in csv_reader:
-        cleaned_row = {
-            internal_columns[column_index]: _normalize_scalar_value(
-                row[column_index] if column_index < len(row) else ""
-            )
-            for column_index in range(len(internal_columns))
-        }
-        rows.append(cleaned_row)
+        rows.append(_build_row_from_values(internal_columns, row, missing_value=""))
 
     return original_columns, internal_columns, rows
 
@@ -237,14 +243,7 @@ def _parse_xlsx_content(file_name: str, content: bytes) -> tuple[list[str], list
 
     rows = []
     for row in iterator:
-        row_values = list(row or [])
-        cleaned_row = {
-            internal_columns[index]: _normalize_scalar_value(
-                row_values[index] if index < len(row_values) else None
-            )
-            for index in range(len(internal_columns))
-        }
-        rows.append(cleaned_row)
+        rows.append(_build_row_from_values(internal_columns, list(row or [])))
 
     workbook.close()
     return original_columns, internal_columns, rows
@@ -268,14 +267,7 @@ def _parse_xls_content(file_name: str, content: bytes) -> tuple[list[str], list[
 
     rows = []
     for row_index in range(1, sheet.nrows):
-        row_values = sheet.row_values(row_index)
-        cleaned_row = {
-            internal_columns[index]: _normalize_scalar_value(
-                row_values[index] if index < len(row_values) else None
-            )
-            for index in range(len(internal_columns))
-        }
-        rows.append(cleaned_row)
+        rows.append(_build_row_from_values(internal_columns, sheet.row_values(row_index)))
 
     return original_columns, internal_columns, rows
 
@@ -383,6 +375,228 @@ def _build_merge_column_mappings(
     return ordered_columns, column_mappings
 
 
+MERGE_TYPE_INFO = {
+    "inner": "Includes only the rows that have matching values in both datasets.",
+    "left": "Includes all rows from the first dataset and matching rows from the second dataset.",
+    "right": "Includes all rows from the second dataset and matching rows from the first dataset.",
+    "full": "Includes all rows from both datasets, whether matching records exist or not.",
+}
+
+PREFERRED_JOIN_COLUMN_NAMES = {
+    "id",
+    "email",
+    "email_id",
+    "user_id",
+    "customer_id",
+    "phone",
+    "mobile",
+}
+
+
+def _column_lookup_key(column_name: Any) -> str:
+    return str(column_name).strip().lower()
+
+
+def _column_lookup(dataset: CsvUploadedDataset) -> dict[str, tuple[str, str]]:
+    lookup = {}
+    for original_column, internal_column in zip(dataset.columns, dataset.internal_columns):
+        lookup[_column_lookup_key(original_column)] = (original_column, internal_column)
+        lookup[_column_lookup_key(internal_column)] = (original_column, internal_column)
+    return lookup
+
+
+def _resolve_dataset_column(
+    dataset: CsvUploadedDataset,
+    column_name: str,
+    lookup: dict[str, tuple[str, str]] | None = None,
+) -> tuple[str, str]:
+    resolved = (lookup or _column_lookup(dataset)).get(_column_lookup_key(column_name))
+    if resolved is None:
+        raise error_response(
+            status_code=400,
+            detail=f"{column_name} was not found in {dataset.name}",
+        )
+    return resolved
+
+
+def _find_default_join_column_mapping(source_datasets: list[CsvUploadedDataset]) -> dict[str, str] | None:
+    if len(source_datasets) != 2:
+        raise error_response(
+            status_code=400,
+            detail="Smart joins support exactly two uploaded datasets",
+        )
+
+    left_dataset, right_dataset = source_datasets
+    right_lookup = _column_lookup(right_dataset)
+    fallback_mapping = None
+
+    for left_original, left_internal in zip(left_dataset.columns, left_dataset.internal_columns):
+        normalized_name = _column_lookup_key(left_original)
+        right_match = right_lookup.get(normalized_name)
+        if right_match is None:
+            right_match = right_lookup.get(_column_lookup_key(left_internal))
+        if right_match is None:
+            continue
+
+        right_original, _ = right_match
+        mapping = {
+            "left_column": left_original,
+            "right_column": right_original,
+        }
+        if normalized_name in PREFERRED_JOIN_COLUMN_NAMES:
+            return mapping
+        if fallback_mapping is None:
+            fallback_mapping = mapping
+
+    return fallback_mapping
+
+
+def _build_join_output_columns(
+    left_dataset: CsvUploadedDataset,
+    right_dataset: CsvUploadedDataset,
+    right_join_internal_columns: set[str],
+) -> tuple[list[str], list[str], dict[str, str], dict[str, str]]:
+    output_columns = list(left_dataset.columns)
+    output_internal_columns = list(left_dataset.internal_columns)
+    left_output_mapping = dict(zip(left_dataset.internal_columns, left_dataset.internal_columns))
+    right_output_mapping = {}
+    used_internal_columns = set(output_internal_columns)
+    used_display_columns = set(output_columns)
+
+    for original_column, internal_column in zip(right_dataset.columns, right_dataset.internal_columns):
+        if internal_column in right_join_internal_columns:
+            continue
+
+        display_column = original_column
+        if display_column in used_display_columns:
+            display_column = f"{original_column} ({right_dataset.name})"
+
+        output_internal_column = internal_column
+        if output_internal_column in used_internal_columns:
+            base_column = f"{internal_column}_{right_dataset.id}"
+            output_internal_column = base_column
+            counter = 2
+            while output_internal_column in used_internal_columns:
+                output_internal_column = f"{base_column}_{counter}"
+                counter += 1
+
+        used_display_columns.add(display_column)
+        used_internal_columns.add(output_internal_column)
+        output_columns.append(display_column)
+        output_internal_columns.append(output_internal_column)
+        right_output_mapping[internal_column] = output_internal_column
+
+    return output_columns, output_internal_columns, left_output_mapping, right_output_mapping
+
+
+def _build_temporary_column_names(prefix: str, count: int, used_columns: set[str]) -> list[str]:
+    columns = []
+    next_index = 0
+    while len(columns) < count:
+        column = f"{prefix}_{next_index}"
+        next_index += 1
+        if column in used_columns:
+            continue
+        used_columns.add(column)
+        columns.append(column)
+    return columns
+
+
+def _build_joined_rows_with_pandas(
+    *,
+    left_rows: list[dict],
+    right_rows: list[dict],
+    left_columns: list[str],
+    left_join_columns: list[str],
+    right_join_columns: list[str],
+    left_output_mapping: dict[str, str],
+    right_output_mapping: dict[str, str],
+    merge_type: str,
+) -> list[dict]:
+    right_columns = list(right_join_columns) + list(right_output_mapping.keys())
+    right_renames = {
+        source_column: output_column
+        for source_column, output_column in right_output_mapping.items()
+        if source_column != output_column
+    }
+    right_output_columns = [
+        right_renames.get(column, column)
+        for column in right_output_mapping
+    ]
+
+    left_df = pd.DataFrame(left_rows, columns=left_columns).rename(columns=left_output_mapping)
+    right_df = pd.DataFrame(right_rows, columns=right_columns).rename(columns=right_renames)
+    used_columns = set(left_df.columns).union(right_df.columns)
+    left_merge_columns = _build_temporary_column_names("__left_join", len(left_join_columns), used_columns)
+    right_merge_columns = _build_temporary_column_names("__right_join", len(right_join_columns), used_columns)
+    for source_column, merge_column in zip(left_join_columns, left_merge_columns):
+        left_df[merge_column] = left_df[left_output_mapping[source_column]]
+    for source_column, merge_column in zip(right_join_columns, right_merge_columns):
+        right_df[merge_column] = right_df[right_renames.get(source_column, source_column)]
+    right_df = right_df.drop(
+        columns=[
+            right_renames.get(column, column)
+            for column in right_join_columns
+        ],
+        errors="ignore",
+    )
+
+    pandas_merge_type = "outer" if merge_type == "full" else merge_type
+
+    merged_df = pd.merge(
+        left_df,
+        right_df,
+        how=pandas_merge_type,
+        left_on=left_merge_columns,
+        right_on=right_merge_columns,
+    )
+
+    for left_column, right_column in zip(
+        [left_output_mapping[column] for column in left_join_columns],
+        right_merge_columns,
+    ):
+        if left_column != right_column and right_column in merged_df.columns:
+            merged_df[left_column] = merged_df[left_column].combine_first(merged_df[right_column])
+
+    output_columns = [
+        left_output_mapping[column]
+        for column in left_columns
+    ] + right_output_columns
+    merged_df = merged_df.reindex(columns=output_columns)
+    merged_df = merged_df.astype(object).where(pd.notna(merged_df), None)
+    return merged_df.to_dict(orient="records")
+
+
+def _build_merged_dataset_record(
+    *,
+    merged_name: str,
+    table_name: str,
+    storage_key: str,
+    file_url: str,
+    file_size: int,
+    user_id: int,
+    source_datasets: list[CsvUploadedDataset],
+    columns: list[str],
+    internal_columns: list[str],
+    total_rows: int,
+) -> CsvMergedDataset:
+    return CsvMergedDataset(
+        name=_normalize_dataset_name(merged_name),
+        table_name=table_name,
+        storage_key=storage_key,
+        file_url=file_url,
+        file_size=file_size,
+        created_by_user_id=user_id,
+        source_datasets_metadata=[
+            {"id": dataset.id, "file_name": dataset.file_name}
+            for dataset in source_datasets
+        ],
+        columns=columns,
+        internal_columns=internal_columns,
+        total_rows=total_rows,
+    )
+
+
 def create_uploaded_dataset(
     db: Session,
     *,
@@ -425,7 +639,19 @@ def merge_uploaded_datasets(
     merged_name: str,
     source_datasets: list[CsvUploadedDataset],
     user_id: int,
+    merge_type: str | None = None,
+    join_columns: list[dict] | None = None,
 ) -> CsvMergedDataset:
+    if merge_type is not None:
+        return _join_uploaded_datasets(
+            db,
+            merged_name=merged_name,
+            source_datasets=source_datasets,
+            user_id=user_id,
+            merge_type=merge_type,
+            join_columns=join_columns,
+        )
+
     ordered_columns, column_mappings = _build_merge_column_mappings(source_datasets)
     table_name = _generate_table_name(db, "merged", merged_name)
 
@@ -451,19 +677,110 @@ def merge_uploaded_datasets(
         rows=merged_rows,
     )
 
-    merged_dataset = CsvMergedDataset(
-        name=_normalize_dataset_name(merged_name),
+    merged_dataset = _build_merged_dataset_record(
+        merged_name=merged_name,
         table_name=table_name,
         storage_key=storage_key,
         file_url=file_url,
         file_size=file_size,
-        created_by_user_id=user_id,
-        source_datasets_metadata=[
-            {"id": dataset.id, "file_name": dataset.file_name}
-            for dataset in source_datasets
-        ],
+        user_id=user_id,
+        source_datasets=source_datasets,
         columns=list(source_datasets[0].columns),
         internal_columns=ordered_columns,
+        total_rows=len(merged_rows),
+    )
+    db.add(merged_dataset)
+
+    return merged_dataset
+
+
+def _join_uploaded_datasets(
+    db: Session,
+    *,
+    merged_name: str,
+    source_datasets: list[CsvUploadedDataset],
+    user_id: int,
+    merge_type: str,
+    join_columns: list[dict] | None,
+) -> CsvMergedDataset:
+    if merge_type not in MERGE_TYPE_INFO:
+        raise error_response(
+            status_code=400,
+            detail="Merge type must be one of: inner, left, right, full",
+        )
+    if len(source_datasets) != 2:
+        raise error_response(
+            status_code=400,
+            detail="Smart joins support exactly two uploaded datasets",
+        )
+
+    if not join_columns:
+        default_mapping = _find_default_join_column_mapping(source_datasets)
+        if default_mapping is None:
+            raise error_response(
+                status_code=400,
+                detail="No common columns were found. Please select join columns manually.",
+            )
+        join_columns = [default_mapping]
+
+    left_dataset, right_dataset = source_datasets
+    left_lookup = _column_lookup(left_dataset)
+    right_lookup = _column_lookup(right_dataset)
+    left_join_columns = []
+    right_join_columns = []
+    for mapping in join_columns:
+        left_column = mapping["left_column"] if isinstance(mapping, dict) else mapping.left_column
+        right_column = mapping["right_column"] if isinstance(mapping, dict) else mapping.right_column
+        _, left_internal_column = _resolve_dataset_column(left_dataset, left_column, left_lookup)
+        _, right_internal_column = _resolve_dataset_column(right_dataset, right_column, right_lookup)
+        left_join_columns.append(left_internal_column)
+        right_join_columns.append(right_internal_column)
+
+    left_rows = _fetch_dataset_rows(
+        table_name=left_dataset.table_name,
+        columns=left_dataset.internal_columns,
+        storage_key=left_dataset.storage_key,
+    )
+    right_rows = _fetch_dataset_rows(
+        table_name=right_dataset.table_name,
+        columns=right_dataset.internal_columns,
+        storage_key=right_dataset.storage_key,
+    )
+
+    (
+        output_columns,
+        output_internal_columns,
+        left_output_mapping,
+        right_output_mapping,
+    ) = _build_join_output_columns(left_dataset, right_dataset, set(right_join_columns))
+    merged_rows = _build_joined_rows_with_pandas(
+        left_rows=left_rows,
+        right_rows=right_rows,
+        left_columns=left_dataset.internal_columns,
+        left_join_columns=left_join_columns,
+        right_join_columns=right_join_columns,
+        left_output_mapping=left_output_mapping,
+        right_output_mapping=right_output_mapping,
+        merge_type=merge_type,
+    )
+
+    table_name = _generate_table_name(db, "merged", merged_name)
+    storage_key, file_url, file_size = _upload_rows_to_object_storage(
+        table_name=table_name,
+        columns=output_internal_columns,
+        rows=merged_rows,
+    )
+
+    merged_dataset = _build_merged_dataset_record(
+        merged_name=merged_name,
+        table_name=table_name,
+        storage_key=storage_key,
+        file_url=file_url,
+        file_size=file_size,
+        user_id=user_id,
+        source_datasets=source_datasets,
+        columns=output_columns,
+        internal_columns=output_internal_columns,
         total_rows=len(merged_rows),
     )
     db.add(merged_dataset)

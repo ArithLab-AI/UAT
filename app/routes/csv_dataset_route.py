@@ -109,6 +109,32 @@ def _serialize_merged_dataset(merged_dataset, source_dataset_map=None):
     }
 
 
+def _get_ordered_uploaded_datasets(
+    db: Session,
+    *,
+    source_ids: list[int],
+    user_id: int,
+) -> list[CsvUploadedDataset]:
+    source_ids = list(dict.fromkeys(source_ids))
+    fetched_datasets = (
+        db.query(CsvUploadedDataset)
+        .filter(
+            CsvUploadedDataset.created_by_user_id == user_id,
+            CsvUploadedDataset.id.in_(source_ids),
+        )
+        .all()
+    )
+
+    if len(fetched_datasets) != len(source_ids):
+        raise error_response(
+            status_code=404,
+            detail="One or more source dataset IDs were not found",
+        )
+
+    source_dataset_map = {dataset.id: dataset for dataset in fetched_datasets}
+    return [source_dataset_map[source_id] for source_id in source_ids]
+
+
 @router.post(
     "/upload-multiple",
     response_model=CsvUploadedDatasetListSuccessResponse,
@@ -235,29 +261,20 @@ def merge_csv_datasets(
             ),
         )
 
-    fetched_datasets = (
-        db.query(CsvUploadedDataset)
-        .filter(
-            CsvUploadedDataset.created_by_user_id == current_user.id,
-            CsvUploadedDataset.id.in_(source_ids),
-        )
-        .all()
+    source_datasets = _get_ordered_uploaded_datasets(
+        db,
+        source_ids=source_ids,
+        user_id=current_user.id,
     )
-
-    if len(fetched_datasets) != len(source_ids):
-        raise error_response(
-            status_code=404,
-            detail="One or more source dataset IDs were not found",
-        )
-
-    source_dataset_map = {dataset.id: dataset for dataset in fetched_datasets}
-    source_datasets = [source_dataset_map[source_id] for source_id in source_ids]
+    source_dataset_map = {dataset.id: dataset for dataset in source_datasets}
 
     merged_dataset = merge_uploaded_datasets(
         db,
         merged_name=payload.merged_name,
         source_datasets=source_datasets,
         user_id=current_user.id,
+        merge_type=payload.merge_type,
+        join_columns=payload.join_columns,
     )
     db.commit()
     db.refresh(merged_dataset)
