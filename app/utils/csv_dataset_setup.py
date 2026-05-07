@@ -37,6 +37,9 @@ def ensure_csv_dataset_schema(engine) -> None:
                         "ADD COLUMN file_size INTEGER NOT NULL DEFAULT 0"
                     )
                 )
+        if "sheet_name" not in uploaded_columns:
+            with engine.begin() as connection:
+                connection.execute(text("ALTER TABLE csv_uploaded_datasets ADD COLUMN sheet_name VARCHAR"))
         if "storage_key" not in uploaded_columns:
             with engine.begin() as connection:
                 connection.execute(text("ALTER TABLE csv_uploaded_datasets ADD COLUMN storage_key VARCHAR"))

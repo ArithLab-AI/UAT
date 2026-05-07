@@ -4,6 +4,7 @@ import re
 import os
 import tempfile
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 from datetime import date, datetime, time
 from pathlib import Path, PureWindowsPath
@@ -18,6 +19,26 @@ from app.models.csv_dataset_models import (
 )
 from app.utils.object_storage import get_object_storage_service
 from app.utils.responses import error_response
+
+
+@dataclass(frozen=True)
+class ParsedUpload:
+    file_name: str
+    file_size: int
+    columns: list[str]
+    internal_columns: list[str]
+    rows: list[dict]
+    sheet_name: str | None = None
+
+
+@dataclass(frozen=True)
+class PendingSheetSelection:
+    requires_sheet_selection: bool
+    file_token: str
+    file_name: str
+    available_sheets: list[str]
+    sheet_count: int
+    preview_row_count: int | None = None
 
 
 def _normalize_dataset_name(name: str) -> str:
@@ -272,7 +293,19 @@ def _parse_xls_content(file_name: str, content: bytes) -> tuple[list[str], list[
     return original_columns, internal_columns, rows
 
 
-async def parse_csv_upload(file: UploadFile) -> tuple[str, int, list[str], list[str], list[dict]]:
+@contextmanager
+def _temporary_upload_file(file_name: str, content: bytes):
+    suffix = Path(file_name).suffix.lower()
+    temp_file = tempfile.NamedTemporaryFile(prefix="csv_upload_", suffix=suffix, delete=False)
+    try:
+        temp_file.write(content)
+        temp_file.close()
+        yield Path(temp_file.name)
+    finally:
+        Path(temp_file.name).unlink(missing_ok=True)
+
+
+async def parse_csv_upload(file: UploadFile, *, user_id: int) -> ParsedUpload | PendingSheetSelection:
     if not file.filename:
         raise error_response(status_code=400, detail="Uploaded file must have a name")
 
@@ -293,12 +326,56 @@ async def parse_csv_upload(file: UploadFile) -> tuple[str, int, list[str], list[
 
         if suffix == ".csv":
             original_columns, internal_columns, rows = _parse_csv_content(file_name, content)
-        elif suffix == ".xlsx":
-            original_columns, internal_columns, rows = _parse_xlsx_content(file_name, content)
-        else:
-            original_columns, internal_columns, rows = _parse_xls_content(file_name, content)
+            return ParsedUpload(
+                file_name=file_name,
+                file_size=file_size,
+                columns=original_columns,
+                internal_columns=internal_columns,
+                rows=rows,
+            )
+        from app.services.excel_sheet_service import extract_sheet_names, process_selected_sheet
 
-        return file_name, file_size, original_columns, internal_columns, rows
+        sheet_names = extract_sheet_names(content)
+        if len(sheet_names) > 1:
+            from app.services.temporary_upload_service import store_temporary_upload
+
+            temporary_upload = store_temporary_upload(
+                content=content,
+                original_file_name=file_name,
+                available_sheets=sheet_names,
+                user_id=user_id,
+            )
+            return PendingSheetSelection(
+                requires_sheet_selection=True,
+                file_token=temporary_upload.token,
+                file_name=file_name,
+                available_sheets=sheet_names,
+                sheet_count=len(sheet_names),
+                preview_row_count=None,
+            )
+
+        with _temporary_upload_file(file_name, content) as temp_path:
+            (
+                parsed_file_name,
+                parsed_file_size,
+                original_columns,
+                internal_columns,
+                rows,
+                sheet_name,
+            ) = process_selected_sheet(
+                file_path=str(temp_path),
+                file_name=file_name,
+                sheet_name=sheet_names[0],
+                available_sheets=sheet_names,
+            )
+            return ParsedUpload(
+                file_name=parsed_file_name,
+                file_size=parsed_file_size,
+                columns=original_columns,
+                internal_columns=internal_columns,
+                rows=rows,
+                sheet_name=sheet_name,
+            )
     finally:
         await file.close()
 
@@ -380,6 +457,13 @@ MERGE_TYPE_INFO = {
     "left": "Includes all rows from the first dataset and matching rows from the second dataset.",
     "right": "Includes all rows from the second dataset and matching rows from the first dataset.",
     "full": "Includes all rows from both datasets, whether matching records exist or not.",
+}
+
+PANDAS_MERGE_TYPE_MAP = {
+    "inner": "inner",
+    "left": "left",
+    "right": "right",
+    "full": "outer",
 }
 
 PREFERRED_JOIN_COLUMN_NAMES = {
@@ -541,12 +625,10 @@ def _build_joined_rows_with_pandas(
         errors="ignore",
     )
 
-    pandas_merge_type = "outer" if merge_type == "full" else merge_type
-
     merged_df = pd.merge(
         left_df,
         right_df,
-        how=pandas_merge_type,
+        how=PANDAS_MERGE_TYPE_MAP[merge_type],
         left_on=left_merge_columns,
         right_on=right_merge_columns,
     )
@@ -588,7 +670,22 @@ def _build_merged_dataset_record(
         file_size=file_size,
         created_by_user_id=user_id,
         source_datasets_metadata=[
-            {"id": dataset.id, "file_name": dataset.file_name}
+            {
+                "id": dataset.id,
+                "name": dataset.name,
+                "file_name": dataset.file_name,
+                "sheet_name": dataset.sheet_name,
+                "table_name": dataset.table_name,
+                "columns": dataset.columns,
+                "internal_columns": dataset.internal_columns,
+                "total_rows": dataset.total_rows,
+                "metadata": {
+                    "file_size": dataset.file_size,
+                    "storage_key": dataset.storage_key,
+                    "file_url": dataset.file_url,
+                    "created_at": dataset.created_at.isoformat() if dataset.created_at else None,
+                },
+            }
             for dataset in source_datasets
         ],
         columns=columns,
@@ -602,6 +699,7 @@ def create_uploaded_dataset(
     *,
     dataset_name: str,
     file_name: str,
+    sheet_name: str | None = None,
     file_size: int,
     columns: list[str],
     internal_columns: list[str],
@@ -618,6 +716,7 @@ def create_uploaded_dataset(
     dataset = CsvUploadedDataset(
         name=dataset_name,
         file_name=file_name,
+        sheet_name=sheet_name,
         file_size=file_size,
         table_name=table_name,
         storage_key=storage_key,

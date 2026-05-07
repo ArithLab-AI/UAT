@@ -9,6 +9,7 @@ class CsvUploadedDataset(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False, index=True)
     file_name = Column(String, nullable=False)
+    sheet_name = Column(String, nullable=True)
     file_size = Column(Integer, nullable=False, default=0)
     table_name = Column(String, nullable=False, unique=True, index=True)
     storage_key = Column(String, nullable=False, unique=True)
