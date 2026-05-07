@@ -4,7 +4,6 @@ from app.routes.auth_route import router as auth_router
 from app.routes.csv_dataset_route import router as csv_dataset_router
 from app.routes.subscription_route import router as subscription_router
 from app.routes.health_route import router as health_router
-from app.routes.upload_file_route import router as upload_file_router
 from app.routes.cleaning import router as cleaning_router
 from app.db.database import engine, Base, SessionLocal
 from app.config.config import settings
@@ -26,7 +25,6 @@ app.include_router(health_router)
 app.include_router(auth_router)
 app.include_router(subscription_router)
 app.include_router(csv_dataset_router)
-app.include_router(upload_file_router)
 app.include_router(cleaning_router)
 
 @app.exception_handler(RequestValidationError)
