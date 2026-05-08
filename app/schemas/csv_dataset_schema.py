@@ -82,30 +82,32 @@ class MergeSourceDatasetsRequest(BaseModel):
         }
 
 
+class MergeDatasetColumnResponse(BaseModel):
+    name: str
+    isSuggested: bool
+    confidence: Literal["high", "medium", "low"] | None = None
+
+
 class MergeDatasetInfoResponse(BaseModel):
     id: int
     name: str
     file_name: str
     sheet_name: str | None = None
     table_name: str
-    columns: list[str]
-    internal_columns: list[str]
+    columns: list[MergeDatasetColumnResponse]
     total_rows: int
     metadata: dict
 
 
-class SuggestedJoinColumnResponse(BaseModel):
-    left_column: str
-    right_column: str
-    confidence: Literal["high", "medium", "low"]
+class SupportedMergeTypeResponse(BaseModel):
+    type: Literal["inner", "left", "right", "full"]
+    description: str
 
 
 class MergeSuggestionsResponse(BaseModel):
     left_dataset: MergeDatasetInfoResponse
     right_dataset: MergeDatasetInfoResponse
-    suggested_join_columns: list[SuggestedJoinColumnResponse]
-    supported_merge_types: list[Literal["inner", "left", "right", "full"]]
-    merge_type_info: dict[str, str]
+    supported_merge_types: list[SupportedMergeTypeResponse]
 
 
 class PreviewMergeRequest(MergeSourceDatasetsRequest):
