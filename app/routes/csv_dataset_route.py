@@ -1,7 +1,7 @@
 import logging
 import os
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Body, Depends, Request
 from sqlalchemy.orm import Session
 
 from app.config.deps import get_current_user
@@ -11,7 +11,6 @@ from app.models.csv_dataset_models import CsvMergedDataset, CsvUploadedDataset
 from app.schemas.csv_dataset_schema import (
     CsvDatasetListSuccessResponse,
     CsvMergedDatasetSuccessResponse,
-    CsvUploadedDatasetSuccessResponse,
     CsvUploadedDatasetListSuccessResponse,
     MergeCsvDatasetsRequest,
     MergeSourceDatasetsRequest,
@@ -255,18 +254,41 @@ async def upload_multiple_csv_datasets(
 
 @router.post(
     "/upload/select-sheet",
-    response_model=CsvUploadedDatasetSuccessResponse,
+    response_model=CsvUploadedDatasetListSuccessResponse,
     status_code=201,
 )
 def select_excel_sheet_for_upload(
-    payload: SelectExcelSheetRequest,
+    payload: list[SelectExcelSheetRequest] = Body(
+        ...,
+        examples=[
+            [
+                {
+                    "file_token": "lgNA820xPWbtX9EWXsxdTSjywBDQC93BmkJOgKWAFdU",
+                    "sheet_name": "Sheet1",
+                },
+                {
+                    "file_token": "4DIlvNYnvXolrdFcgoFnTk0H0d_k3Pcp3u9dcUjM9yQ",
+                    "sheet_name": "Sheet2",
+                },
+            ]
+        ],
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    if not payload:
+        raise error_response(
+            status_code=400,
+            detail="At least one sheet selection is required",
+        )
+
     plan_capabilities = get_user_plan_capabilities(db, current_user)
     active_dataset_count = count_user_active_datasets(db, current_user.id)
     max_active_datasets = plan_capabilities["max_active_datasets"]
-    if max_active_datasets is not None and active_dataset_count + 1 > max_active_datasets:
+    if (
+        max_active_datasets is not None
+        and active_dataset_count + len(payload) > max_active_datasets
+    ):
         raise error_response(
             status_code=400,
             detail=(
@@ -275,45 +297,53 @@ def select_excel_sheet_for_upload(
             ),
         )
 
-    temporary_upload = validate_temporary_upload(
-        token=payload.file_token,
-        user_id=current_user.id,
-    )
-    (
-        file_name,
-        file_size,
-        columns,
-        internal_columns,
-        rows,
-        sheet_name,
-    ) = process_temporary_upload_selection(
-        upload=temporary_upload,
-        sheet_name=payload.sheet_name,
-    )
-    dataset = create_uploaded_dataset(
-        db,
-        dataset_name=build_dataset_name(None, file_name),
-        file_name=file_name,
-        sheet_name=sheet_name,
-        file_size=file_size,
-        columns=columns,
-        internal_columns=internal_columns,
-        rows=rows,
-        user_id=current_user.id,
-    )
-    set_dataset_retention_expiry(
-        db=db,
-        dataset=dataset,
-        user_id=current_user.id,
-    )
+    created_datasets = []
+    for selection in payload:
+        temporary_upload = validate_temporary_upload(
+            token=selection.file_token,
+            user_id=current_user.id,
+        )
+        (
+            file_name,
+            file_size,
+            columns,
+            internal_columns,
+            rows,
+            sheet_name,
+        ) = process_temporary_upload_selection(
+            upload=temporary_upload,
+            sheet_name=selection.sheet_name,
+        )
+        dataset = create_uploaded_dataset(
+            db,
+            dataset_name=build_dataset_name(None, file_name),
+            file_name=file_name,
+            sheet_name=sheet_name,
+            file_size=file_size,
+            columns=columns,
+            internal_columns=internal_columns,
+            rows=rows,
+            user_id=current_user.id,
+        )
+        set_dataset_retention_expiry(
+            db=db,
+            dataset=dataset,
+            user_id=current_user.id,
+        )
+        created_datasets.append(dataset)
+
     db.commit()
-    db.refresh(dataset)
-    delete_temporary_upload(payload.file_token)
+
+    for dataset in created_datasets:
+        db.refresh(dataset)
+
+    for selection in payload:
+        delete_temporary_upload(selection.file_token)
 
     return success_response(
-        "Uploaded dataset created successfully",
+        "Uploaded datasets created successfully",
         status_code=201,
-        data=dataset,
+        data=created_datasets,
     )
 
 
