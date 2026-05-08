@@ -51,8 +51,8 @@ class SelectExcelSheetRequest(BaseModel):
     class Config:
         json_schema_extra = {
             "example": {
-                "file_token": "temporary_upload_token",
-                "sheet_name": "Orders",
+                "file_token": "lgNA820xPWbtX9EWXsxdTSjywBDQC93BmkJOgKWAFdU",
+                "sheet_name": "Sheet1",
             }
         }
 
