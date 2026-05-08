@@ -235,8 +235,6 @@ async def upload_multiple_csv_datasets(
             "pending_files": pending_files,
             "uploaded_datasets": created_datasets,
         }
-        if len(files) == 1 and not created_datasets:
-            response_data = pending_files[0]
 
         return success_response(
             "Sheet selection is required before upload can continue",

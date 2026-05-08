@@ -34,6 +34,23 @@ def _compact_key(column_name: str) -> str:
 COMPACT_JOIN_COLUMN_ALIASES = {_compact_key(alias) for alias in JOIN_COLUMN_ALIASES}
 
 
+def _dataset_info_with_suggestions(
+    dataset: CsvUploadedDataset,
+    suggested_columns: dict[str, str],
+) -> dict:
+    data = dataset_info(dataset)
+    data.pop("internal_columns", None)
+    data["columns"] = [
+        {
+            "name": column,
+            "isSuggested": _case_key(column) in suggested_columns,
+            "confidence": suggested_columns.get(_case_key(column)),
+        }
+        for column in dataset.columns
+    ]
+    return data
+
+
 def _confidence(left_column: str, right_column: str) -> str:
     left_key = _case_key(left_column)
     right_key = _case_key(right_column)
@@ -93,11 +110,29 @@ def suggest_join_columns(
             item["left_column"].lower(),
         )
     )
+    left_suggested_columns = {
+        _case_key(item["left_column"]): item["confidence"]
+        for item in suggestions
+    }
+    right_suggested_columns = {
+        _case_key(item["right_column"]): item["confidence"]
+        for item in suggestions
+    }
 
     return {
-        "left_dataset": dataset_info(left_dataset),
-        "right_dataset": dataset_info(right_dataset),
-        "suggested_join_columns": suggestions,
-        "supported_merge_types": list(MERGE_TYPE_INFO.keys()),
-        "merge_type_info": MERGE_TYPE_INFO,
+        "left_dataset": _dataset_info_with_suggestions(
+            left_dataset,
+            left_suggested_columns,
+        ),
+        "right_dataset": _dataset_info_with_suggestions(
+            right_dataset,
+            right_suggested_columns,
+        ),
+        "supported_merge_types": [
+            {
+                "type": merge_type,
+                "description": description,
+            }
+            for merge_type, description in MERGE_TYPE_INFO.items()
+        ],
     }
