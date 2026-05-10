@@ -53,15 +53,26 @@ def _build_table_slug(name: str) -> str:
     return slug or "dataset"
 
 
+def _pending_dataset_table_names(db: Session) -> set[str]:
+    return {
+        dataset.table_name
+        for dataset in db.new
+        if isinstance(dataset, (CsvUploadedDataset, CsvMergedDataset)) and dataset.table_name
+    }
+
+
 def _generate_table_name(db: Session, prefix: str, dataset_name: str) -> str:
     base_slug = _build_table_slug(dataset_name)
     candidate = f"{prefix}_{base_slug}"[:55].rstrip("_")
     table_name = candidate
     counter = 1
 
-    while db.query(CsvUploadedDataset.id).filter(CsvUploadedDataset.table_name == table_name).first() or db.query(
-        CsvMergedDataset.id
-    ).filter(CsvMergedDataset.table_name == table_name).first():
+    pending_table_names = _pending_dataset_table_names(db)
+    while (
+        table_name in pending_table_names
+        or db.query(CsvUploadedDataset.id).filter(CsvUploadedDataset.table_name == table_name).first()
+        or db.query(CsvMergedDataset.id).filter(CsvMergedDataset.table_name == table_name).first()
+    ):
         suffix = f"_{counter}"
         table_name = f"{candidate[: 63 - len(suffix)]}{suffix}"
         counter += 1
