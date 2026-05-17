@@ -94,7 +94,7 @@ def login(payload: auth_schema.Login, db: Session = Depends(get_db)):
     if not user.is_verified:
         logger.warning("Login blocked for email=%s: account not verified", payload.email)
         raise error_response(
-            status_code=403,
+            status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Account not verified"
         )
 
