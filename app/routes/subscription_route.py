@@ -1,30 +1,65 @@
 import logging
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
-
 from app.db.database import get_db
 from app.models.subscription_models import SubscriptionPlan, UserSubscription
 from app.models.auth_models import User
-from app.schemas.subscription_schema import (
-    PlanResponse,
-    SubscribeRequest,
-    SubscriptionResponse
-)
+from app.schemas import subscription_schema
+from app.schemas.common_schema import MessageSuccessResponse
+from app.schemas.subscription_schema import SubscribeRequest
 from app.config.deps import get_current_user
+from app.services.file_retention_service import sync_user_dataset_retention_expiries
+from app.services.subscription_service import get_user_storage_summary, normalize_plan_tier
+from app.utils.responses import error_response, success_response
 
 router = APIRouter(prefix="/subscriptions", tags=["Subscriptions"])
 logger = logging.getLogger(__name__)
 
-@router.get("/plans", response_model=list[PlanResponse])
-def get_plans(db: Session = Depends(get_db)):
+PLAN_SORT_ORDER = {
+    "free": 0,
+    "lite": 1,
+    "pro": 2,
+    "enterprise": 3,
+}
+
+
+def _serialize_subscription_with_storage(db: Session, subscription: UserSubscription) -> dict:
+    storage_summary = get_user_storage_summary(
+        db,
+        subscription.user_id,
+        subscription.plan.name if subscription.plan else None,
+    )
+    plan = subscription.plan
+    return {
+        "id": plan.id,
+        "name": plan.name,
+        "user_role": plan.user_role,
+        "price": plan.price,
+        "duration_days": plan.duration_days,
+        "start_date": subscription.start_date,
+        "end_date": subscription.end_date,
+        "status": subscription.status,
+        **storage_summary,
+    }
+
+@router.get("/plans", response_model=subscription_schema.PlanListSuccessResponse)
+def get_plans(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     plans = db.query(SubscriptionPlan).filter(
         SubscriptionPlan.is_active == True
     ).all()
-    logger.info("Fetched %s active subscription plans", len(plans))
-    return plans
+    plans.sort(key=lambda plan: (PLAN_SORT_ORDER.get(normalize_plan_tier(plan.name), 99), plan.id))
+    logger.info(
+        "Fetched %s active subscription plans for user_id=%s",
+        len(plans),
+        current_user.id,
+    )
+    return success_response("Plans fetched successfully", data=plans)
 
-@router.post("/subscribe", response_model=SubscriptionResponse)
+@router.post("/subscribe", response_model=subscription_schema.SubscriptionSuccessResponse)
 def subscribe(
     payload: SubscribeRequest,
     db: Session = Depends(get_db),
@@ -42,17 +77,22 @@ def subscribe(
             current_user.id,
             payload.plan_id,
         )
-        raise HTTPException(status_code=404, detail="Plan not found")
+        raise error_response(status_code=404, detail="Plan not found")
 
     # Expire old subscription if exists
-    old_subscription = db.query(UserSubscription).filter(
+    old_subscriptions = db.query(UserSubscription).filter(
         UserSubscription.user_id == current_user.id,
         UserSubscription.status == "active"
-    ).first()
+    ).all()
 
-    if old_subscription:
-        old_subscription.status = "expired"
-        logger.info("Expired previous subscription id=%s for user_id=%s", old_subscription.id, current_user.id)
+    if old_subscriptions:
+        for old_subscription in old_subscriptions:
+            old_subscription.status = "expired"
+            logger.info(
+                "Expired previous subscription id=%s for user_id=%s",
+                old_subscription.id,
+                current_user.id,
+            )
 
     start_date = datetime.utcnow()
     end_date = start_date + timedelta(days=plan.duration_days)
@@ -66,15 +106,19 @@ def subscribe(
     )
 
     db.add(new_subscription)
+    db.flush()
+    sync_user_dataset_retention_expiries(db, current_user.id)
     db.commit()
     db.refresh(new_subscription)
     logger.info("Subscription created id=%s for user_id=%s", new_subscription.id, current_user.id)
 
-    return new_subscription
+    return success_response(
+        "Subscription created successfully",
+        data=_serialize_subscription_with_storage(db, new_subscription),
+    )
 
 
-# 🔹 3. My Subscription
-@router.get("/my-subscription", response_model=SubscriptionResponse)
+@router.get("/my-subscription", response_model=subscription_schema.SubscriptionSuccessResponse)
 def my_subscription(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -83,25 +127,26 @@ def my_subscription(
     subscription = db.query(UserSubscription).filter(
         UserSubscription.user_id == current_user.id,
         UserSubscription.status == "active"
-    ).first()
+    ).order_by(UserSubscription.id.desc()).first()
 
     if not subscription:
         logger.warning("No active subscription for user_id=%s", current_user.id)
-        raise HTTPException(status_code=404, detail="No active subscription")
+        raise error_response(status_code=404, detail="No active subscription")
 
     # Auto-expire if past date
     if subscription.end_date < datetime.utcnow():
         subscription.status = "expired"
         db.commit()
         logger.warning("Subscription id=%s auto-expired for user_id=%s", subscription.id, current_user.id)
-        raise HTTPException(status_code=400, detail="Subscription expired")
+        raise error_response(status_code=400, detail="Subscription expired")
 
     logger.info("Active subscription id=%s returned for user_id=%s", subscription.id, current_user.id)
-    return subscription
+    return success_response(
+        "Subscription fetched successfully",
+        data=_serialize_subscription_with_storage(db, subscription),
+    )
 
-
-# 🔹 4. Cancel Subscription
-@router.post("/cancel")
+@router.post("/cancel", response_model=MessageSuccessResponse)
 def cancel_subscription(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -110,14 +155,14 @@ def cancel_subscription(
     subscription = db.query(UserSubscription).filter(
         UserSubscription.user_id == current_user.id,
         UserSubscription.status == "active"
-    ).first()
+    ).order_by(UserSubscription.id.desc()).first()
 
     if not subscription:
         logger.warning("Cancel subscription failed: no active subscription for user_id=%s", current_user.id)
-        raise HTTPException(status_code=404, detail="No active subscription")
+        raise error_response(status_code=404, detail="No active subscription")
 
     subscription.status = "canceled"
     db.commit()
     logger.info("Subscription id=%s canceled for user_id=%s", subscription.id, current_user.id)
 
-    return {"message": "Subscription canceled successfully"}
+    return success_response("Subscription canceled successfully", data=None)

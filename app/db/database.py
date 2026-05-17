@@ -2,7 +2,6 @@ import logging
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 from app.config.config import settings
-
 logger = logging.getLogger(__name__)
 
 DATABASE_URL = (
@@ -23,7 +22,6 @@ except Exception:
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-
 def get_db():
     db = SessionLocal()
     try:
@@ -34,3 +32,6 @@ def get_db():
         raise
     finally:
         db.close()
+
+def init_db():
+    Base.metadata.create_all(bind=engine)
