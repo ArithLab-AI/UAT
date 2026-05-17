@@ -6,7 +6,6 @@ Uses project's existing:
   - app.utils.file_io (read/write any file)
 """
 import os
-import shutil
 import time
 import threading
 from pathlib import Path
@@ -58,21 +57,25 @@ ALL_STEPS = [
 ]
 
 
-def start_cleaning_job(file, job_id: str, db: Session) -> CleaningJob:
-    """Save file locally, create DB record, launch background thread."""
-    original_name = file.filename
-    ext = Path(original_name).suffix.lower().lstrip(".")
+def start_cleaning_job(storage_key: str, file_name: str, job_id: str, db: Session) -> CleaningJob:
+    """Download file from object storage by storage_key, create DB record, launch background thread."""
+    ext = Path(file_name).suffix.lower().lstrip(".")
+    if not ext:
+        ext = "csv"
     if ext not in SUPPORTED_EXTENSIONS:
         raise ValueError(f"Unsupported: '.{ext}'. Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
 
     temp_path = os.path.join(TEMP_DIR, f"{job_id}.{ext}")
-    with open(temp_path, "wb") as buf:
-        shutil.copyfileobj(file.file, buf)
+    storage = get_object_storage_service()
+    success = storage.download_file(storage_key, temp_path)
+    if not success:
+        raise ValueError(f"Could not download file from storage (key: {storage_key})")
+
     file_size = os.path.getsize(temp_path)
 
     job = CleaningJob(
         id=job_id,
-        original_filename=original_name,
+        original_filename=file_name,
         file_type=ext,
         file_size_bytes=file_size,
         status="pending",
@@ -84,7 +87,7 @@ def start_cleaning_job(file, job_id: str, db: Session) -> CleaningJob:
 
     thread = threading.Thread(
         target=_background_clean,
-        args=(job_id, temp_path, ext, original_name),
+        args=(job_id, temp_path, ext, file_name),
         daemon=True,
     )
     thread.start()
