@@ -17,7 +17,7 @@ from app.services.file_retention_service import get_user_retention_summary
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from app.utils.responses import error_response, success_response
 
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 logger = logging.getLogger(__name__)
 
@@ -367,9 +367,15 @@ def protected_route(
 
 @router.post("/logout", response_model=MessageSuccessResponse)
 def logout(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
     db: Session = Depends(get_db)
 ):
+    if not credentials:
+        raise error_response(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authorization credentials not provided",
+        )
+
     token = credentials.credentials
     blacklisted_token = auth_models.TokenBlacklist(token=token)
 

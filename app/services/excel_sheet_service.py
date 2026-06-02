@@ -2,9 +2,12 @@ import io
 from pathlib import Path
 from typing import Any
 
+import openpyxl
 import pandas as pd
+from fastapi import HTTPException
 
 from app.services.csv_service import (
+    _build_row_from_values,
     _clean_upload_file_name,
     _normalize_columns,
     _normalize_scalar_value,
@@ -21,6 +24,26 @@ def _is_excel_file(file_name: str) -> bool:
 
 
 def extract_sheet_names(file_content: bytes | str) -> list[str]:
+    workbook = None
+    try:
+        workbook = openpyxl.load_workbook(
+            filename=file_content if isinstance(file_content, str) else io.BytesIO(file_content),
+            read_only=True,
+            data_only=True,
+        )
+        sheet_names = list(workbook.sheetnames)
+    except Exception:
+        sheet_names = []
+    finally:
+        if workbook is not None:
+            workbook.close()
+
+    if sheet_names:
+        return sheet_names
+    if workbook is not None:
+        if not sheet_names:
+            raise error_response(status_code=400, detail="Excel file does not contain any sheets")
+
     try:
         excel_file = pd.ExcelFile(file_content if isinstance(file_content, str) else io.BytesIO(file_content))
         sheet_names = excel_file.sheet_names
@@ -65,6 +88,49 @@ def _dataframe_to_rows(
     return original_columns, internal_columns, rows
 
 
+def _process_xlsx_selected_sheet(
+    *,
+    file_path: str,
+    file_name: str,
+    sheet_name: str,
+) -> tuple[list[str], list[str], list[dict]]:
+    workbook = None
+    try:
+        workbook = openpyxl.load_workbook(
+            filename=file_path,
+            read_only=True,
+            data_only=True,
+        )
+        sheet = workbook[sheet_name]
+        row_iterator = sheet.iter_rows(values_only=True)
+        header_row = next(row_iterator, None)
+        columns, internal_columns = _normalize_columns(
+            file_name,
+            list(header_row) if header_row is not None else [],
+        )
+
+        rows = []
+        for row_count, row in enumerate(row_iterator, start=1):
+            if row_count > MAX_EXCEL_SHEET_ROWS:
+                raise error_response(
+                    status_code=400,
+                    detail=f"{sheet_name} exceeds the maximum supported row count of {MAX_EXCEL_SHEET_ROWS}",
+                )
+            rows.append(_build_row_from_values(internal_columns, list(row or [])))
+    except Exception as exc:
+        if isinstance(exc, HTTPException):
+            raise
+        raise error_response(status_code=400, detail=f"{sheet_name} could not be read") from exc
+    finally:
+        if workbook is not None:
+            workbook.close()
+
+    if not rows:
+        raise error_response(status_code=400, detail=f"{file_name} selected sheet does not contain data rows")
+
+    return columns, internal_columns, rows
+
+
 def process_selected_sheet(
     *,
     file_path: str,
@@ -79,25 +145,34 @@ def process_selected_sheet(
         available_sheets = extract_sheet_names(file_path)
     validate_sheet_selection(sheet_name=sheet_name, available_sheets=available_sheets)
 
-    try:
-        dataframe = pd.read_excel(
-            file_path,
+    display_file_name = f"{clean_file_name} ({sheet_name})"
+    if Path(clean_file_name).suffix.lower() == ".xlsx":
+        columns, internal_columns, rows = _process_xlsx_selected_sheet(
+            file_path=file_path,
+            file_name=display_file_name,
             sheet_name=sheet_name,
-            nrows=MAX_EXCEL_SHEET_ROWS + 1,
         )
-    except Exception as exc:
-        raise error_response(status_code=400, detail=f"{sheet_name} could not be read") from exc
+    else:
+        try:
+            dataframe = pd.read_excel(
+                file_path,
+                sheet_name=sheet_name,
+                nrows=MAX_EXCEL_SHEET_ROWS + 1,
+            )
+        except Exception as exc:
+            raise error_response(status_code=400, detail=f"{sheet_name} could not be read") from exc
 
-    if len(dataframe.index) > MAX_EXCEL_SHEET_ROWS:
-        raise error_response(
-            status_code=400,
-            detail=f"{sheet_name} exceeds the maximum supported row count of {MAX_EXCEL_SHEET_ROWS}",
+        if len(dataframe.index) > MAX_EXCEL_SHEET_ROWS:
+            raise error_response(
+                status_code=400,
+                detail=f"{sheet_name} exceeds the maximum supported row count of {MAX_EXCEL_SHEET_ROWS}",
+            )
+
+        columns, internal_columns, rows = _dataframe_to_rows(
+            file_name=display_file_name,
+            dataframe=dataframe,
         )
 
-    columns, internal_columns, rows = _dataframe_to_rows(
-        file_name=f"{clean_file_name} ({sheet_name})",
-        dataframe=dataframe,
-    )
     file_size = Path(file_path).stat().st_size
     return clean_file_name, file_size, columns, internal_columns, rows, sheet_name
 

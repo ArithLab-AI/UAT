@@ -189,7 +189,7 @@ def retention_dataset_for_user(
 
     if tier not in {"lite", "pro"}:
         raise error_response(
-            status_code=403,
+            status_code=400,
             detail="File retention is available only for Lite and Pro plans.",
         )
 
