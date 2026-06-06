@@ -933,6 +933,21 @@ def remove_constant_columns(df: pd.DataFrame, **kw):
     return df, {"removed": const}
 
 
+@register_step("remove_empty_rows", "structure", "Remove rows where all values are empty/null", "critical")
+def remove_empty_rows(df: pd.DataFrame, **kw):
+    before = len(df)
+    df = df.dropna(how="all").reset_index(drop=True)
+    return df, {"rows_removed": before - len(df)}
+
+
+@register_step("remove_duplicate_columns", "structure", "Remove duplicate column names keeping first occurrence", "medium")
+def remove_duplicate_columns(df: pd.DataFrame, **kw):
+    before_cols = df.columns.tolist()
+    df = df.loc[:, ~df.columns.duplicated()]
+    removed = [c for c in before_cols if c not in df.columns.tolist()]
+    return df, {"removed": removed}
+
+
 @register_step("feature_engineering_dates", "advanced", "Extract date parts (year/month/day/weekday)", "medium")
 def feature_engineering_dates(df: pd.DataFrame, columns: Optional[list[str]] = None, **kw):
     targets = columns or df.select_dtypes(include=["datetime64", "datetime64[ns]"]).columns.tolist()
