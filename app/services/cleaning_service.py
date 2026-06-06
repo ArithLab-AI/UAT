@@ -29,14 +29,16 @@ ALL_STEPS = [
     {"step": "use_first_row_as_header"},
     {"step": "standardize_headers"},
     {"step": "remove_duplicates"},
+    {"step": "remove_duplicate_columns"},
     {"step": "remove_constant_columns"},
     {"step": "strip_whitespace"},
     {"step": "fix_encoding"},
     {"step": "clean_null_strings"},
+    {"step": "remove_empty_rows"},
     {"step": "clean_currency"},
     {"step": "standardize_dates"},
     {"step": "fix_data_types"},
-    {"step": "normalize_text_case", "strategy": "lower"},
+    {"step": "normalize_text_case", "strategy": "title"},
     {"step": "standardize_booleans"},
     {"step": "standardize_categories"},
     {"step": "replace_value"},
@@ -59,7 +61,9 @@ ALL_STEPS = [
 
 def start_cleaning_job(storage_key: str, file_name: str, job_id: str, db: Session) -> CleaningJob:
     """Download file from object storage by storage_key, create DB record, launch background thread."""
-    ext = Path(file_name).suffix.lower().lstrip(".")
+    ext = Path(storage_key).suffix.lower().lstrip(".")
+    if not ext:
+        ext = Path(file_name).suffix.lower().lstrip(".")
     if not ext:
         ext = "csv"
     if ext not in SUPPORTED_EXTENSIONS:
