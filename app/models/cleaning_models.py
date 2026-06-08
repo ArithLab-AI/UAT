@@ -1,6 +1,8 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Column, String, Integer, Float, DateTime, Text, JSON
+
+from sqlalchemy import Boolean, Column, DateTime, Float, Integer, JSON, String, Text
+
 from app.db.database import Base
 
 
@@ -30,6 +32,8 @@ class CleaningJob(Base):
     rows_after = Column(Integer, nullable=True)
     columns_before = Column(Integer, nullable=True)
     columns_after = Column(Integer, nullable=True)
+    source_dataset_id = Column(Integer, nullable=True, index=True)
+    ai_cleaning_type = Column(Boolean, nullable=False, default=False)
     steps_applied = Column(JSON, nullable=True)
     cleaning_summary = Column(JSON, nullable=True)
     duration_seconds = Column(Float, nullable=True)
