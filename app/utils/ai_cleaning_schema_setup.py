@@ -38,3 +38,10 @@ def ensure_ai_cleaning_schema(engine) -> None:
                         "ADD COLUMN source_suggestion_id VARCHAR(36)"
                     )
                 )
+            if "source_suggestion_priority" not in ai_cleaning_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE ai_cleaning_job_details "
+                        "ADD COLUMN source_suggestion_priority VARCHAR(20)"
+                    )
+                )

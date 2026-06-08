@@ -15,6 +15,12 @@ from app.models.auth_models import User
 from app.models.analysis_models import AnalysisSuggestion, DatasetAnalysis
 from app.models.cleaning_models import CleaningJob
 from app.models.csv_dataset_models import CsvMergedDataset, CsvUploadedDataset
+from app.services.analysis_actionable_suggestion_service import filter_actionable_suggestions
+from app.services.ai_cleaning_quality_service import (
+    cap_quality_score_by_suggestions,
+    coalesce_priority_clean_quality_score,
+)
+from app.services.analysis_suggestion_match_service import split_matching_suggestions
 from app.services.analysis_llm_service import generate_llm_suggestions
 from app.services.analysis_profile_service import (
     DataSuggestion,
@@ -36,8 +42,10 @@ class DatasetSource:
     is_clean: bool
     dataset_name: str
     file_name: str
+    raw_file_name: str
     table_name: str
     storage_key: str
+    ai_cleaning_job_id: str | None = None
 
 
 @lru_cache(maxsize=1)
@@ -56,15 +64,19 @@ def _analysis_chunksize() -> int:
         return 5000
 
 
-def _parse_csv_iter(path: str, chunksize: int) -> Iterable[pd.DataFrame]:
+def _parse_csv_iter(path: str, chunksize: int, *, preserve_placeholders: bool = False) -> Iterable[pd.DataFrame]:
+    read_kwargs = {"dtype": object, "chunksize": chunksize}
+    if preserve_placeholders:
+        read_kwargs["keep_default_na"] = False
+
     for encoding in ("utf-8-sig", "utf-8", "latin-1"):
         try:
-            yield from pd.read_csv(path, dtype=object, chunksize=chunksize, encoding=encoding)
+            yield from pd.read_csv(path, encoding=encoding, **read_kwargs)
             return
         except UnicodeDecodeError:
             continue
 
-    yield from pd.read_csv(path, dtype=object, chunksize=chunksize)
+    yield from pd.read_csv(path, **read_kwargs)
 
 
 def _to_suggestion_dict(suggestion: DataSuggestion, *, suggestion_id: str | None = None) -> dict:
@@ -114,6 +126,7 @@ def _resolve_dataset_source(db: Session, current_user: User, dataset_type: str, 
             is_clean=False,
             dataset_name=dataset.name,
             file_name=dataset.file_name,
+            raw_file_name=dataset.file_name,
             table_name=dataset.table_name,
             storage_key=dataset.storage_key,
         )
@@ -134,6 +147,7 @@ def _resolve_dataset_source(db: Session, current_user: User, dataset_type: str, 
         is_clean=False,
         dataset_name=dataset.name,
         file_name=f"{dataset.name}.csv",
+        raw_file_name=f"{dataset.name}.csv",
         table_name=dataset.table_name,
         storage_key=dataset.storage_key,
     )
@@ -173,8 +187,10 @@ def _resolve_clean_dataset_source(
         is_clean=True,
         dataset_name=raw_source.dataset_name,
         file_name=cleaned_file_name,
+        raw_file_name=raw_source.file_name,
         table_name=f"{raw_source.table_name}_clean",
         storage_key=detail.cleaned_storage_key,
+        ai_cleaning_job_id=detail.job_id,
     )
 
 
@@ -194,8 +210,84 @@ def _resolve_analysis_source(
 def _build_profile_for_dataset(source: DatasetSource) -> dict:
     chunksize = _analysis_chunksize()
     with _download_dataset_file(source.storage_key, source.table_name) as file_path:
-        chunks = _parse_csv_iter(file_path, chunksize=chunksize)
+        chunks = _parse_csv_iter(file_path, chunksize=chunksize, preserve_placeholders=source.is_clean)
         return build_dataset_profile_from_chunks(chunks)
+
+
+def _get_latest_raw_analysis_score(db: Session, current_user: User, source: DatasetSource) -> int | None:
+    record = (
+        db.query(DatasetAnalysis.quality_score)
+        .filter(
+            DatasetAnalysis.created_by_user_id == current_user.id,
+            DatasetAnalysis.source_dataset_id == source.dataset_id,
+            DatasetAnalysis.source_type == source.dataset_type,
+            DatasetAnalysis.file_name == source.raw_file_name,
+        )
+        .order_by(DatasetAnalysis.updated_at.desc(), DatasetAnalysis.created_at.desc())
+        .first()
+    )
+    return int(record[0]) if record is not None and record[0] is not None else None
+
+
+def _resolve_ai_cleaning_detail_priority(
+    db: Session,
+    current_user: User,
+    detail: AICleaningJobDetail,
+) -> str | None:
+    if detail.source_suggestion_priority:
+        return detail.source_suggestion_priority
+
+    if not detail.source_suggestion_id:
+        return None
+
+    suggestion = (
+        db.query(AnalysisSuggestion.priority)
+        .filter(
+            AnalysisSuggestion.id == detail.source_suggestion_id,
+            AnalysisSuggestion.created_by_user_id == current_user.id,
+        )
+        .first()
+    )
+    if suggestion is not None and suggestion[0]:
+        return str(suggestion[0])
+
+    for item in ((detail.analysis or {}).get("suggestions") or []):
+        if not isinstance(item, dict) or item.get("id") != detail.source_suggestion_id:
+            continue
+        priority = str(item.get("priority") or "").strip()
+        if priority:
+            return priority
+
+    return None
+
+
+def _resolve_ai_cleaning_detail_prompt_metadata(
+    db: Session,
+    current_user: User,
+    detail: AICleaningJobDetail,
+) -> tuple[str | None, list[str]]:
+    if detail.source_suggestion_id:
+        suggestion = (
+            db.query(AnalysisSuggestion.cleaning_prompt_type, AnalysisSuggestion.target_columns)
+            .filter(
+                AnalysisSuggestion.id == detail.source_suggestion_id,
+                AnalysisSuggestion.created_by_user_id == current_user.id,
+            )
+            .first()
+        )
+        if suggestion is not None:
+            prompt_type = str(suggestion[0]).strip() if suggestion[0] else None
+            target_columns = list(suggestion[1] or [])
+            return prompt_type, [str(column).strip() for column in target_columns if str(column).strip()]
+
+    for item in ((detail.analysis or {}).get("suggestions") or []):
+        if not isinstance(item, dict) or item.get("id") != detail.source_suggestion_id:
+            continue
+        prompt_type = str(item.get("cleaning_prompt_type") or "").strip() or None
+        target_columns = item.get("target_columns") if isinstance(item.get("target_columns"), list) else []
+        return prompt_type, [str(column).strip() for column in target_columns if str(column).strip()]
+
+    return None, list(detail.target_columns or [])
 
 
 def _persist_analysis_result(
@@ -274,14 +366,78 @@ def run_dataset_analysis(
         is_clean=is_clean,
     )
     dataset_profile = _build_profile_for_dataset(source)
-    quality_score = compute_quality_score(dataset_profile)
-    enriched_profile = {**dataset_profile, "quality_score": quality_score}
+    base_quality_score = compute_quality_score(dataset_profile)
+    quality_score = base_quality_score
+    clean_detail: AICleaningJobDetail | None = None
+    raw_quality_score: int | None = None
+    verification_rule_suggestions: list[DataSuggestion] | None = None
+    if source.is_clean and source.ai_cleaning_job_id:
+        clean_detail = (
+            db.query(AICleaningJobDetail)
+            .filter(
+                AICleaningJobDetail.job_id == source.ai_cleaning_job_id,
+                AICleaningJobDetail.created_by_user_id == current_user.id,
+            )
+            .first()
+        )
+        if clean_detail is not None:
+            raw_quality_score = _get_latest_raw_analysis_score(db, current_user, source)
+    enriched_profile = {**dataset_profile, "quality_score": base_quality_score}
+    if source.is_clean:
+        verification_rule_suggestions = generate_rule_based_suggestions(enriched_profile)
 
     suggestions: list[DataSuggestion]
     llm_used = False
     suggestion_source = "rule_based"
     resolved_provider: str | None = None
     resolved_model: str | None = None
+
+    def _finalize_quality_score(current_suggestions: list[DataSuggestion]) -> int:
+        suggestion_aligned_score = cap_quality_score_by_suggestions(
+            base_quality_score,
+            suggestions=current_suggestions,
+        )
+        if source.is_clean and clean_detail is not None:
+            return coalesce_priority_clean_quality_score(
+                suggestion_aligned_score,
+                raw_score=raw_quality_score,
+                previous_clean_score=clean_detail.quality_score,
+                changes_detected=bool(clean_detail.changes_detected),
+                suggestion_priority=_resolve_ai_cleaning_detail_priority(db, current_user, clean_detail),
+            )
+        return suggestion_aligned_score
+
+    def _build_clean_verification(current_suggestions: list[DataSuggestion]) -> tuple[str | None, bool | None, int | None, int | None]:
+        source_suggestion_id = clean_detail.source_suggestion_id if clean_detail is not None else None
+        source_suggestion_resolved: bool | None = None
+        source_suggestion_match_count: int | None = None
+        if source.is_clean and clean_detail is not None and clean_detail.prompt:
+            source_prompt_type, source_target_columns = _resolve_ai_cleaning_detail_prompt_metadata(
+                db,
+                current_user,
+                clean_detail,
+            )
+            verification_suggestions = verification_rule_suggestions or current_suggestions
+            matching_suggestions, _ = split_matching_suggestions(
+                cleaned_prompt=clean_detail.prompt,
+                cleaned_prompt_type=source_prompt_type,
+                cleaned_target_columns=source_target_columns,
+                suggestions=verification_suggestions,
+            )
+            source_suggestion_match_count = len(matching_suggestions)
+            source_suggestion_resolved = source_suggestion_match_count == 0
+
+        quality_score_delta = (
+            quality_score - raw_quality_score
+            if source.is_clean and raw_quality_score is not None
+            else None
+        )
+        return (
+            source_suggestion_id,
+            source_suggestion_resolved,
+            source_suggestion_match_count,
+            quality_score_delta,
+        )
 
     if use_llm:
         try:
@@ -294,6 +450,12 @@ def run_dataset_analysis(
             suggestion_source = "llm"
             resolved_provider = llm_config.provider
             resolved_model = llm_config.model
+            filtered_suggestions = filter_actionable_suggestions(dataset_profile, suggestions)
+            if filtered_suggestions:
+                suggestions = filtered_suggestions
+            else:
+                suggestions = generate_rule_based_suggestions(enriched_profile)
+                suggestion_source = "rule_based"
         except Exception as exc:
             failure_detail = format_openai_exception(exc)
             logger.exception(
@@ -315,6 +477,27 @@ def run_dataset_analysis(
                 "LLM suggestion generation failed in run_dataset_analysis/generate_llm_suggestions "
                 f"and rule-based suggestions were used instead: {failure_detail}"
             )
+            (
+                source_suggestion_id,
+                source_suggestion_resolved,
+                source_suggestion_match_count,
+                quality_score_delta,
+            ) = _build_clean_verification(suggestions)
+            quality_score = _finalize_quality_score(suggestions)
+            quality_score_delta = (
+                quality_score - raw_quality_score
+                if source.is_clean and raw_quality_score is not None
+                else None
+            )
+            if clean_detail is not None:
+                clean_detail.quality_score = quality_score
+            if source.is_clean and source_suggestion_resolved is not None:
+                verification_note = (
+                    "Selected cleaned suggestion is no longer detected in cleaned analysis."
+                    if source_suggestion_resolved
+                    else f"Selected cleaned suggestion still has {source_suggestion_match_count} matching issue(s) in cleaned analysis."
+                )
+                message = f"{message} {verification_note}"
             analysis, suggestion_rows = _persist_analysis_result(
                 db,
                 current_user=current_user,
@@ -341,6 +524,10 @@ def run_dataset_analysis(
                 "llm_provider": resolved_provider,
                 "llm_model": resolved_model,
                 "message": message,
+                "source_suggestion_id": source_suggestion_id,
+                "source_suggestion_resolved": source_suggestion_resolved,
+                "source_suggestion_match_count": source_suggestion_match_count,
+                "quality_score_delta": quality_score_delta,
                 "suggestions": [
                     _to_suggestion_dict(suggestion, suggestion_id=suggestion_row.id)
                     for suggestion, suggestion_row in zip(suggestions, suggestion_rows)
@@ -350,11 +537,46 @@ def run_dataset_analysis(
     else:
         suggestions = generate_rule_based_suggestions(enriched_profile)
 
+    suggestions = filter_actionable_suggestions(dataset_profile, suggestions)
+
+    (
+        source_suggestion_id,
+        source_suggestion_resolved,
+        source_suggestion_match_count,
+        quality_score_delta,
+    ) = _build_clean_verification(suggestions)
+    if source.is_clean and source_suggestion_resolved:
+        source_prompt_type, source_target_columns = _resolve_ai_cleaning_detail_prompt_metadata(
+            db,
+            current_user,
+            clean_detail,
+        )
+        _, suggestions = split_matching_suggestions(
+            cleaned_prompt=clean_detail.prompt if clean_detail is not None else None,
+            cleaned_prompt_type=source_prompt_type,
+            cleaned_target_columns=source_target_columns,
+            suggestions=suggestions,
+        )
+    quality_score = _finalize_quality_score(suggestions)
+    quality_score_delta = (
+        quality_score - raw_quality_score
+        if source.is_clean and raw_quality_score is not None
+        else None
+    )
+    if clean_detail is not None:
+        clean_detail.quality_score = quality_score
     message = (
         "Analysis completed successfully."
         if llm_used
         else "Analysis completed successfully using rule-based suggestions."
     )
+    if source.is_clean and source_suggestion_resolved is not None:
+        verification_note = (
+            "Selected cleaned suggestion is no longer detected in cleaned analysis."
+            if source_suggestion_resolved
+            else f"Selected cleaned suggestion still has {source_suggestion_match_count} matching issue(s) in cleaned analysis."
+        )
+        message = f"{message} {verification_note}"
     analysis, suggestion_rows = _persist_analysis_result(
         db,
         current_user=current_user,
@@ -381,6 +603,10 @@ def run_dataset_analysis(
         "llm_provider": resolved_provider,
         "llm_model": resolved_model,
         "message": message,
+        "source_suggestion_id": source_suggestion_id,
+        "source_suggestion_resolved": source_suggestion_resolved,
+        "source_suggestion_match_count": source_suggestion_match_count,
+        "quality_score_delta": quality_score_delta,
         "suggestions": [
             _to_suggestion_dict(suggestion, suggestion_id=suggestion_row.id)
             for suggestion, suggestion_row in zip(suggestions, suggestion_rows)

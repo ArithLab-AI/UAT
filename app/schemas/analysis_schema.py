@@ -74,6 +74,10 @@ class DatasetAnalysisResponse(BaseModel):
     llm_provider: str | None = None
     llm_model: str | None = None
     message: str | None = None
+    source_suggestion_id: str | None = None
+    source_suggestion_resolved: bool | None = None
+    source_suggestion_match_count: int | None = None
+    quality_score_delta: int | None = None
     suggestions: list[DataSuggestionResponse] = Field(default_factory=list)
     dataset_profile: dict | None = None
 

@@ -24,6 +24,7 @@ class AICleaningJobDetail(Base):
     source_storage_key = Column(String(255), nullable=True)
     source_file_url = Column(Text, nullable=True)
     source_suggestion_id = Column(String(36), nullable=True, index=True)
+    source_suggestion_priority = Column(String(20), nullable=True)
     source_ai_job_id = Column(String(36), nullable=True, index=True)
     source_type = Column(String(20), nullable=True, default="raw")
     prompt = Column(Text, nullable=True)

@@ -11,15 +11,17 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import pandas as pd
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.config.config import settings
 from app.db.database import Base, engine
 from app.models.ai_cleaning_models import AICleaningJobDetail
-from app.models.analysis_models import AnalysisSuggestion
+from app.models.analysis_models import AnalysisSuggestion, DatasetAnalysis
 from app.models.auth_models import User
 from app.models.cleaning_models import CleaningJob
 from app.models.csv_dataset_models import CsvMergedDataset, CsvUploadedDataset
+from app.services.analysis_actionable_suggestion_service import filter_actionable_suggestions
 from app.services.ai_cleaning_prompt_service import (
     AICleaningPlan,
     build_cleaning_chain,
@@ -29,6 +31,10 @@ from app.services.ai_cleaning_prompt_service import (
     prompt_has_deterministic_cleaning_steps,
     prompt_removes_exact_duplicates,
 )
+from app.services.ai_cleaning_quality_service import (
+    cap_quality_score_by_suggestions,
+    coalesce_priority_clean_quality_score,
+)
 from app.services.analysis_llm_service import generate_llm_suggestions
 from app.services.analysis_profile_service import (
     DataSuggestion,
@@ -36,6 +42,7 @@ from app.services.analysis_profile_service import (
     compute_quality_score,
     generate_rule_based_suggestions,
 )
+from app.services.analysis_suggestion_match_service import split_matching_suggestions
 from app.utils.object_storage import get_object_storage_service
 from app.utils.responses import error_response
 
@@ -99,25 +106,29 @@ def _read_csv(file_path: str, encoding: str, delimiter: str, **kwargs):
     return pd.read_csv(file_path, sep=delimiter, **kwargs)
 
 
-def _parse_csv_iter(path: str, chunksize: int) -> Iterable[pd.DataFrame]:
+def _parse_csv_iter(path: str, chunksize: int, *, preserve_placeholders: bool = False) -> Iterable[pd.DataFrame]:
     csv_options = _detect_csv_options(path)
+    read_kwargs = {"dtype": object, "chunksize": chunksize}
+    if preserve_placeholders:
+        read_kwargs["keep_default_na"] = False
     yield from _read_csv(
         path,
         csv_options["encoding"],
         csv_options["delimiter"],
-        dtype=object,
-        chunksize=chunksize,
+        **read_kwargs,
     )
 
 
-def _read_csv_sample(path: str, *, nrows: int) -> pd.DataFrame:
+def _read_csv_sample(path: str, *, nrows: int, preserve_placeholders: bool = False) -> pd.DataFrame:
     csv_options = _detect_csv_options(path)
+    read_kwargs = {"dtype": object, "nrows": nrows}
+    if preserve_placeholders:
+        read_kwargs["keep_default_na"] = False
     return _read_csv(
         path,
         csv_options["encoding"],
         csv_options["delimiter"],
-        dtype=object,
-        nrows=nrows,
+        **read_kwargs,
     )
 
 
@@ -280,7 +291,7 @@ def _resolve_ai_cleaning_prompt(
     dataset_type: str,
     suggestion_id: str,
     source_job_detail: AICleaningJobDetail | None,
-) -> tuple[str, str]:
+) -> tuple[str, str, str | None, str | None, list[str]]:
     suggestion = (
         db.query(AnalysisSuggestion)
         .filter(
@@ -295,7 +306,13 @@ def _resolve_ai_cleaning_prompt(
                 status_code=400,
                 detail="suggestion_id does not belong to the provided dataset_id and dataset_type",
             )
-        return suggestion.resolution_prompt, suggestion.id
+        return (
+            suggestion.resolution_prompt,
+            suggestion.id,
+            suggestion.priority,
+            suggestion.cleaning_prompt_type,
+            list(suggestion.target_columns or []),
+        )
 
     if source_job_detail is not None:
         if source_job_detail.source_dataset_id != dataset_id or source_job_detail.source_dataset_type != dataset_type:
@@ -308,9 +325,101 @@ def _resolve_ai_cleaning_prompt(
                 continue
             resolution_prompt = str(item.get("resolution_prompt") or "").strip()
             if resolution_prompt:
-                return resolution_prompt, suggestion_id
+                priority = str(item.get("priority") or "").strip() or None
+                cleaning_prompt_type = str(item.get("cleaning_prompt_type") or "").strip() or None
+                target_columns = item.get("target_columns") if isinstance(item.get("target_columns"), list) else []
+                return resolution_prompt, suggestion_id, priority, cleaning_prompt_type, [
+                    str(column).strip() for column in target_columns if str(column).strip()
+                ]
 
     raise error_response(status_code=404, detail="Analysis suggestion not found")
+
+
+def _get_latest_raw_analysis_score(
+    db: Session,
+    current_user: User,
+    *,
+    dataset_id: int,
+    dataset_type: str,
+) -> int | None:
+    try:
+        raw_source = _resolve_raw_source(db, current_user, dataset_id, dataset_type)
+    except HTTPException:
+        return None
+
+    record = (
+        db.query(DatasetAnalysis.quality_score)
+        .filter(
+            DatasetAnalysis.created_by_user_id == current_user.id,
+            DatasetAnalysis.source_dataset_id == dataset_id,
+            DatasetAnalysis.source_type == dataset_type,
+            DatasetAnalysis.file_name == raw_source.file_name,
+        )
+        .order_by(DatasetAnalysis.updated_at.desc(), DatasetAnalysis.created_at.desc())
+        .first()
+    )
+    return int(record[0]) if record is not None and record[0] is not None else None
+
+
+def _resolve_source_suggestion_priority(
+    db: Session,
+    current_user: User,
+    detail: AICleaningJobDetail,
+) -> str | None:
+    if detail.source_suggestion_priority:
+        return detail.source_suggestion_priority
+
+    if not detail.source_suggestion_id:
+        return None
+
+    suggestion = (
+        db.query(AnalysisSuggestion.priority)
+        .filter(
+            AnalysisSuggestion.id == detail.source_suggestion_id,
+            AnalysisSuggestion.created_by_user_id == current_user.id,
+        )
+        .first()
+    )
+    if suggestion is not None and suggestion[0]:
+        return str(suggestion[0])
+
+    for item in ((detail.analysis or {}).get("suggestions") or []):
+        if not isinstance(item, dict) or item.get("id") != detail.source_suggestion_id:
+            continue
+        priority = str(item.get("priority") or "").strip()
+        if priority:
+            return priority
+
+    return None
+
+
+def _resolve_source_suggestion_prompt_metadata(
+    db: Session,
+    current_user: User,
+    detail: AICleaningJobDetail,
+) -> tuple[str | None, list[str]]:
+    if detail.source_suggestion_id:
+        suggestion = (
+            db.query(AnalysisSuggestion.cleaning_prompt_type, AnalysisSuggestion.target_columns)
+            .filter(
+                AnalysisSuggestion.id == detail.source_suggestion_id,
+                AnalysisSuggestion.created_by_user_id == current_user.id,
+            )
+            .first()
+        )
+        if suggestion is not None:
+            prompt_type = str(suggestion[0]).strip() if suggestion[0] else None
+            target_columns = list(suggestion[1] or [])
+            return prompt_type, [str(column).strip() for column in target_columns if str(column).strip()]
+
+    for item in ((detail.analysis or {}).get("suggestions") or []):
+        if not isinstance(item, dict) or item.get("id") != detail.source_suggestion_id:
+            continue
+        prompt_type = str(item.get("cleaning_prompt_type") or "").strip() or None
+        target_columns = item.get("target_columns") if isinstance(item.get("target_columns"), list) else []
+        return prompt_type, [str(column).strip() for column in target_columns if str(column).strip()]
+
+    return None, list(detail.target_columns or [])
 
 
 def _sanitize_json_value(value: Any) -> Any:
@@ -374,6 +483,8 @@ def _build_cleaning_result(
     prompt: str,
     source_type: str,
     source_file_name: str,
+    prompt_type_hint: str | None = None,
+    target_columns_hint: list[str] | None = None,
 ) -> dict[str, Any]:
     preview_rows: list[dict[str, Any]] = []
     input_total_rows = 0
@@ -384,14 +495,26 @@ def _build_cleaning_result(
     rows_after = 0
     columns_before = 0
     columns_after = 0
+    preserve_placeholders = source_type == "clean"
 
     sample_rows = max(1, int(settings.UAT_AI_PLANNER_SAMPLE_ROWS))
-    planner_sample_df = _read_csv_sample(source_path, nrows=sample_rows)
-    cleaning_plan = plan_ai_cleaning(planner_sample_df, prompt)
+    planner_sample_df = _read_csv_sample(source_path, nrows=sample_rows, preserve_placeholders=preserve_placeholders)
+    cleaning_plan = plan_ai_cleaning(
+        planner_sample_df,
+        prompt,
+        prompt_type_hint=prompt_type_hint,
+        target_columns_hint=target_columns_hint,
+    )
     if cleaning_plan.strategy == "row_level_ai":
         row_limit = settings.UAT_AI_ROW_LEVEL_LARGE_DATASET_THRESHOLD + 1
         total_rows_hint = _count_csv_rows(source_path, limit=row_limit)
-        cleaning_plan = plan_ai_cleaning(planner_sample_df, prompt, total_rows=total_rows_hint)
+        cleaning_plan = plan_ai_cleaning(
+            planner_sample_df,
+            prompt,
+            total_rows=total_rows_hint,
+            prompt_type_hint=prompt_type_hint,
+            target_columns_hint=target_columns_hint,
+        )
         if cleaning_plan.strategy == "unsupported_large_ai":
             raise error_response(status_code=400, detail=cleaning_plan.reason or "Unsupported large-dataset AI cleaning prompt.")
     if cleaning_plan.strategy == "privacy_blocked":
@@ -416,7 +539,11 @@ def _build_cleaning_result(
 
     try:
         with open(output_path, "w", encoding="utf-8", newline="") as output_file:
-            for chunk_df in _parse_csv_iter(source_path, chunksize=effective_chunksize):
+            for chunk_df in _parse_csv_iter(
+                source_path,
+                chunksize=effective_chunksize,
+                preserve_placeholders=preserve_placeholders,
+            ):
                 if input_total_rows == 0:
                     columns_before = len(chunk_df.columns)
                 input_total_rows += len(chunk_df)
@@ -425,6 +552,8 @@ def _build_cleaning_result(
                     prompt,
                     chain=chain,
                     plan=cleaning_plan,
+                    prompt_type_hint=prompt_type_hint,
+                    target_columns_hint=target_columns_hint,
                     seen_row_hashes=seen_row_hashes,
                     ai_row_cache=ai_row_cache,
                 )
@@ -446,10 +575,12 @@ def _build_cleaning_result(
 
             if not wrote_header:
                 empty_df = clean_dataframe_chunk(
-                    _read_csv_sample(source_path, nrows=0),
+                    _read_csv_sample(source_path, nrows=0, preserve_placeholders=preserve_placeholders),
                     prompt,
                     chain=chain,
                     plan=cleaning_plan,
+                    prompt_type_hint=prompt_type_hint,
+                    target_columns_hint=target_columns_hint,
                     seen_row_hashes=seen_row_hashes,
                     ai_row_cache=ai_row_cache,
                 )
@@ -571,7 +702,13 @@ def run_ai_cleaning(
         dataset_type=dataset_type,
         source_ai_job_id=reusable_detail.job_id if reusable_detail is not None else source_ai_job_id,
     )
-    resolved_prompt, resolved_suggestion_id = _resolve_ai_cleaning_prompt(
+    (
+        resolved_prompt,
+        resolved_suggestion_id,
+        resolved_suggestion_priority,
+        resolved_cleaning_prompt_type,
+        resolved_target_columns,
+    ) = _resolve_ai_cleaning_prompt(
         db,
         current_user,
         dataset_id=dataset_id,
@@ -610,6 +747,7 @@ def run_ai_cleaning(
                 source_storage_key=source.storage_key,
                 source_file_url=source.file_url,
                 source_suggestion_id=resolved_suggestion_id,
+                source_suggestion_priority=resolved_suggestion_priority,
                 source_ai_job_id=source.source_ai_job_id,
                 source_type=source.source_type,
                 prompt=resolved_prompt,
@@ -642,6 +780,7 @@ def run_ai_cleaning(
             detail.source_storage_key = source.storage_key
             detail.source_file_url = source.file_url
             detail.source_suggestion_id = resolved_suggestion_id
+            detail.source_suggestion_priority = resolved_suggestion_priority
             detail.source_ai_job_id = source.source_ai_job_id
             detail.source_type = source.source_type
             detail.prompt = resolved_prompt
@@ -672,6 +811,8 @@ def run_ai_cleaning(
                 prompt=resolved_prompt,
                 source_type=source.source_type,
                 source_file_name=source.file_name,
+                prompt_type_hint=resolved_cleaning_prompt_type,
+                target_columns_hint=resolved_target_columns,
             )
 
             previous_steps = list(job.steps_applied or [])
@@ -800,7 +941,11 @@ def _to_suggestion_dict(suggestion: DataSuggestion, *, suggestion_id: str | None
 def _build_profile_for_storage_key(storage_key: str) -> dict[str, Any]:
     with _download_storage_key(storage_key, prefix="ai_analysis") as file_path:
         return build_dataset_profile_from_chunks(
-            _parse_csv_iter(file_path, chunksize=max(_cleaning_chunksize(), 5000))
+            _parse_csv_iter(
+                file_path,
+                chunksize=max(_cleaning_chunksize(), 5000),
+                preserve_placeholders=True,
+            )
         )
 
 
@@ -828,14 +973,53 @@ def analyze_ai_cleaning_output(
         raise error_response(status_code=409, detail="AI cleaned output is not available for analysis")
 
     dataset_profile = _build_profile_for_storage_key(detail.cleaned_storage_key)
-    quality_score = compute_quality_score(dataset_profile)
-    enriched_profile = {**dataset_profile, "quality_score": quality_score}
+    base_quality_score = compute_quality_score(dataset_profile)
+    raw_quality_score = _get_latest_raw_analysis_score(
+        db,
+        current_user,
+        dataset_id=detail.source_dataset_id,
+        dataset_type=detail.source_dataset_type,
+    )
+    enriched_profile = {**dataset_profile, "quality_score": base_quality_score}
+    verification_rule_suggestions = generate_rule_based_suggestions(enriched_profile)
 
     suggestions: list[DataSuggestion]
     llm_used = False
     suggestion_source = "rule_based"
     resolved_provider: str | None = None
     resolved_model: str | None = None
+
+    def _finalize_quality_score(current_suggestions: list[DataSuggestion]) -> int:
+        suggestion_aligned_score = cap_quality_score_by_suggestions(
+            base_quality_score,
+            suggestions=current_suggestions,
+        )
+        return coalesce_priority_clean_quality_score(
+            suggestion_aligned_score,
+            raw_score=raw_quality_score,
+            previous_clean_score=detail.quality_score,
+            changes_detected=bool(detail.changes_detected),
+            suggestion_priority=_resolve_source_suggestion_priority(db, current_user, detail),
+        )
+
+    def _build_clean_verification(current_suggestions: list[DataSuggestion]) -> tuple[bool | None, int | None, int | None]:
+        if not detail.prompt:
+            return None, None, None
+
+        source_prompt_type, source_target_columns = _resolve_source_suggestion_prompt_metadata(
+            db,
+            current_user,
+            detail,
+        )
+        matching_suggestions, _ = split_matching_suggestions(
+            cleaned_prompt=detail.prompt,
+            cleaned_prompt_type=source_prompt_type,
+            cleaned_target_columns=source_target_columns,
+            suggestions=verification_rule_suggestions or current_suggestions,
+        )
+        source_suggestion_match_count = len(matching_suggestions)
+        source_suggestion_resolved = source_suggestion_match_count == 0
+        return source_suggestion_resolved, source_suggestion_match_count, None
 
     if use_llm:
         try:
@@ -848,6 +1032,12 @@ def analyze_ai_cleaning_output(
             suggestion_source = "llm"
             resolved_provider = llm_config.provider
             resolved_model = llm_config.model
+            filtered_suggestions = filter_actionable_suggestions(dataset_profile, suggestions)
+            if filtered_suggestions:
+                suggestions = filtered_suggestions
+            else:
+                suggestions = generate_rule_based_suggestions(enriched_profile)
+                suggestion_source = "rule_based"
             message = "AI-cleaned dataset analysis completed successfully."
         except Exception as exc:
             suggestions = generate_rule_based_suggestions(enriched_profile)
@@ -860,6 +1050,35 @@ def analyze_ai_cleaning_output(
         suggestions = generate_rule_based_suggestions(enriched_profile)
         message = "AI-cleaned dataset analysis completed successfully using rule-based suggestions."
 
+    suggestions = filter_actionable_suggestions(dataset_profile, suggestions)
+
+    (
+        source_suggestion_resolved,
+        source_suggestion_match_count,
+        quality_score_delta,
+    ) = _build_clean_verification(suggestions)
+    if source_suggestion_resolved:
+        source_prompt_type, source_target_columns = _resolve_source_suggestion_prompt_metadata(
+            db,
+            current_user,
+            detail,
+        )
+        _, suggestions = split_matching_suggestions(
+            cleaned_prompt=detail.prompt,
+            cleaned_prompt_type=source_prompt_type,
+            cleaned_target_columns=source_target_columns,
+            suggestions=suggestions,
+        )
+    quality_score = _finalize_quality_score(suggestions)
+    quality_score_delta = quality_score - raw_quality_score if raw_quality_score is not None else None
+    if source_suggestion_resolved is not None:
+        verification_note = (
+            "Selected cleaned suggestion is no longer detected in cleaned analysis."
+            if source_suggestion_resolved
+            else f"Selected cleaned suggestion still has {source_suggestion_match_count} matching issue(s) in cleaned analysis."
+        )
+        message = f"{message} {verification_note}"
+
     payload = {
         "job_id": job_id,
         "source_dataset_id": detail.source_dataset_id,
@@ -871,6 +1090,10 @@ def analyze_ai_cleaning_output(
         "llm_provider": resolved_provider,
         "llm_model": resolved_model,
         "message": message,
+        "source_suggestion_id": detail.source_suggestion_id,
+        "source_suggestion_resolved": source_suggestion_resolved,
+        "source_suggestion_match_count": source_suggestion_match_count,
+        "quality_score_delta": quality_score_delta,
         "suggestions": [
             _to_suggestion_dict(suggestion, suggestion_id=str(uuid.uuid4()))
             for suggestion in suggestions

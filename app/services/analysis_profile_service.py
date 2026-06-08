@@ -14,6 +14,11 @@ DATE_OUTPUT_FORMAT = os.getenv("UAT_ANALYSIS_DATE_OUTPUT_FORMAT", "%Y-%m-%d")
 MAX_PROFILE_COLUMNS = 12
 MAX_BAD_EXAMPLES = 3
 MAX_SAMPLE_ROWS = 5
+ACCEPTED_PLACEHOLDER_TOKENS = {
+    token.strip().lower()
+    for token in {NULL_OUTPUT_TOKEN}
+    if isinstance(token, str) and token.strip()
+}
 
 EMAIL_COLUMN_HINTS = ("email", "e-mail", "mail")
 PHONE_COLUMN_HINTS = ("phone", "mobile", "cell", "contact", "whatsapp", "tel")
@@ -432,8 +437,9 @@ def _update_column_stats(stats: dict[str, Any], series: pd.Series) -> None:
     string_series = _series_to_string(series)
     stripped_series = string_series.str.strip()
     blank_mask = stripped_series.eq("")
+    accepted_placeholder_mask = stripped_series.str.lower().isin(ACCEPTED_PLACEHOLDER_TOKENS)
     null_mask = series.isna() | blank_mask
-    non_null_mask = ~null_mask
+    non_null_mask = ~(null_mask | accepted_placeholder_mask)
     non_null_count = int(non_null_mask.sum())
 
     stats["null_count"] += int(null_mask.sum())
