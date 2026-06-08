@@ -57,7 +57,14 @@ ALL_STEPS = [
 ]
 
 
-def start_cleaning_job(storage_key: str, file_name: str, job_id: str, db: Session) -> CleaningJob:
+def start_cleaning_job(
+    storage_key: str,
+    file_name: str,
+    job_id: str,
+    db: Session,
+    *,
+    source_dataset_id: int | None = None,
+) -> CleaningJob:
     """Download file from object storage by storage_key, create DB record, launch background thread."""
     ext = Path(file_name).suffix.lower().lstrip(".")
     if not ext:
@@ -78,6 +85,7 @@ def start_cleaning_job(storage_key: str, file_name: str, job_id: str, db: Sessio
         original_filename=file_name,
         file_type=ext,
         file_size_bytes=file_size,
+        source_dataset_id=source_dataset_id,
         status="pending",
         total_steps=len(ALL_STEPS),
     )

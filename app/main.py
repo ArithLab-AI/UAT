@@ -5,6 +5,10 @@ from app.routes.csv_dataset_route import router as csv_dataset_router
 from app.routes.subscription_route import router as subscription_router
 from app.routes.health_route import router as health_router
 from app.routes.cleaning import router as cleaning_router
+from app.routes.ai_cleaning_route import router as ai_cleaning_router
+from app.routes.analysis_route import router as analysis_router
+from app.routes.analysis_suggestion_route import router as analysis_suggestion_router
+from app.routes.test_llm_route import router as test_llm_router
 from app.db.database import engine, Base, SessionLocal
 from app.config.config import settings
 from app.utils.auth_schema_setup import ensure_auth_schema
@@ -13,6 +17,7 @@ from app.utils.file_upload_schema_setup import ensure_file_upload_schema
 from app.utils.object_storage import get_object_storage_service
 from app.utils.responses import http_exception_response, validation_error_response
 from app.utils.subs_plan_seed import seed_subscription_plans
+from app.utils.ai_cleaning_schema_setup import ensure_ai_cleaning_schema
 from app.utils.subscription_schema_setup import ensure_subscription_schema
 from app.services.file_retention_service import (
     start_file_retention_scheduler,
@@ -26,6 +31,10 @@ app.include_router(auth_router)
 app.include_router(subscription_router)
 app.include_router(csv_dataset_router)
 app.include_router(cleaning_router)
+app.include_router(ai_cleaning_router)
+app.include_router(analysis_router)
+app.include_router(analysis_suggestion_router)
+app.include_router(test_llm_router)
 
 @app.exception_handler(RequestValidationError)
 async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -54,6 +63,7 @@ def startup_event():
     ensure_subscription_schema(engine)
     ensure_csv_dataset_schema(engine)
     ensure_file_upload_schema(engine)
+    ensure_ai_cleaning_schema(engine)
     get_object_storage_service().ensure_bucket()
     db = SessionLocal()
     try:
