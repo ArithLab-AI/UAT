@@ -13,6 +13,7 @@ from app.schemas.csv_dataset_schema import (
     CsvMergedDatasetSuccessResponse,
     CsvUploadedDatasetListSuccessResponse,
     MergeCsvDatasetsRequest,
+    MergeSuggestionsRequest,
     MergeSourceDatasetsRequest,
     MergeSuggestionsSuccessResponse,
     PreviewMergeRequest,
@@ -41,7 +42,11 @@ from app.services.file_retention_service import (
     retention_dataset_for_user,
     set_dataset_retention_expiry,
 )
-from app.services.subscription_service import get_user_plan_capabilities
+from app.services.subscription_service import (
+    ensure_upload_storage_available,
+    get_user_plan_capabilities,
+    record_upload_storage_usage,
+)
 from app.services.temporary_upload_service import (
     delete_temporary_upload,
     validate_temporary_upload,
@@ -90,6 +95,13 @@ def _format_file_size_limit(limit_bytes: int | None) -> str:
     if limit_bytes is None:
         return "unlimited"
     return f"{limit_bytes // (1024 * 1024)} MB"
+
+
+def _build_uploaded_dataset_name(file_name: str, sheet_name: str | None = None) -> str:
+    dataset_name = build_dataset_name(None, file_name)
+    if sheet_name:
+        return f"{dataset_name} ({sheet_name})"
+    return dataset_name
 
 
 def _serialize_merged_dataset(merged_dataset, source_dataset_map=None):
@@ -192,8 +204,15 @@ async def upload_multiple_csv_datasets(
         parsed_uploads.append(parsed_upload)
 
     created_datasets = []
+    total_upload_size = sum(parsed_upload.file_size for parsed_upload in parsed_uploads)
+    ensure_upload_storage_available(
+        db,
+        user_id=current_user.id,
+        plan_capabilities=plan_capabilities,
+        upload_size_bytes=total_upload_size,
+    )
     for parsed_upload in parsed_uploads:
-        dataset_name = build_dataset_name(None, parsed_upload.file_name)
+        dataset_name = _build_uploaded_dataset_name(parsed_upload.file_name, parsed_upload.sheet_name)
         dataset = create_uploaded_dataset(
             db,
             dataset_name=dataset_name,
@@ -211,6 +230,10 @@ async def upload_multiple_csv_datasets(
             user_id=current_user.id,
         )
         created_datasets.append(dataset)
+
+    db.flush()
+    for dataset in created_datasets:
+        record_upload_storage_usage(db, dataset=dataset, user_id=current_user.id)
 
     db.commit()
 
@@ -264,7 +287,7 @@ def select_excel_sheet_for_upload(
             [
                 {
                     "file_token": "lgNA820xPWbtX9EWXsxdTSjywBDQC93BmkJOgKWAFdU",
-                    "sheet_name": "Sheet1",
+                    "sheet_names": ["Sheet1", "Sheet2"],
                 },
                 {
                     "file_token": "4DIlvNYnvXolrdFcgoFnTk0H0d_k3Pcp3u9dcUjM9yQ",
@@ -282,12 +305,13 @@ def select_excel_sheet_for_upload(
             detail="At least one sheet selection is required",
         )
 
+    selected_sheet_count = sum(len(selection.selected_sheet_names()) for selection in payload)
     plan_capabilities = get_user_plan_capabilities(db, current_user)
     active_dataset_count = count_user_active_datasets(db, current_user.id)
     max_active_datasets = plan_capabilities["max_active_datasets"]
     if (
         max_active_datasets is not None
-        and active_dataset_count + len(payload) > max_active_datasets
+        and active_dataset_count + selected_sheet_count > max_active_datasets
     ):
         raise error_response(
             status_code=400,
@@ -297,32 +321,57 @@ def select_excel_sheet_for_upload(
             ),
         )
 
-    created_datasets = []
+    selected_uploads = []
+    total_selected_upload_size = 0
     for selection in payload:
         temporary_upload = validate_temporary_upload(
             token=selection.file_token,
             user_id=current_user.id,
         )
-        (
-            file_name,
-            file_size,
-            columns,
-            internal_columns,
-            rows,
-            sheet_name,
-        ) = process_temporary_upload_selection(
-            upload=temporary_upload,
-            sheet_name=selection.sheet_name,
-        )
+        for selected_sheet_name in selection.selected_sheet_names():
+            (
+                file_name,
+                file_size,
+                columns,
+                internal_columns,
+                rows,
+                sheet_name,
+            ) = process_temporary_upload_selection(
+                upload=temporary_upload,
+                sheet_name=selected_sheet_name,
+            )
+            total_selected_upload_size += file_size
+            ensure_upload_storage_available(
+                db,
+                user_id=current_user.id,
+                plan_capabilities=plan_capabilities,
+                upload_size_bytes=total_selected_upload_size,
+            )
+            selected_uploads.append(
+                {
+                    "file_name": file_name,
+                    "file_size": file_size,
+                    "columns": columns,
+                    "internal_columns": internal_columns,
+                    "rows": rows,
+                    "sheet_name": sheet_name,
+                }
+            )
+
+    created_datasets = []
+    for selected_upload in selected_uploads:
         dataset = create_uploaded_dataset(
             db,
-            dataset_name=build_dataset_name(None, file_name),
-            file_name=file_name,
-            sheet_name=sheet_name,
-            file_size=file_size,
-            columns=columns,
-            internal_columns=internal_columns,
-            rows=rows,
+            dataset_name=_build_uploaded_dataset_name(
+                selected_upload["file_name"],
+                selected_upload["sheet_name"],
+            ),
+            file_name=selected_upload["file_name"],
+            sheet_name=selected_upload["sheet_name"],
+            file_size=selected_upload["file_size"],
+            columns=selected_upload["columns"],
+            internal_columns=selected_upload["internal_columns"],
+            rows=selected_upload["rows"],
             user_id=current_user.id,
         )
         set_dataset_retention_expiry(
@@ -332,13 +381,17 @@ def select_excel_sheet_for_upload(
         )
         created_datasets.append(dataset)
 
+    db.flush()
+    for dataset in created_datasets:
+        record_upload_storage_usage(db, dataset=dataset, user_id=current_user.id)
+
     db.commit()
 
     for dataset in created_datasets:
         db.refresh(dataset)
 
-    for selection in payload:
-        delete_temporary_upload(selection.file_token)
+    for file_token in {selection.file_token for selection in payload}:
+        delete_temporary_upload(file_token)
 
     return success_response(
         "Uploaded datasets created successfully",
@@ -349,7 +402,7 @@ def select_excel_sheet_for_upload(
 
 @router.post("/merge/suggestions", response_model=MergeSuggestionsSuccessResponse)
 def suggest_csv_dataset_merge(
-    payload: MergeSourceDatasetsRequest,
+    payload: MergeSuggestionsRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -572,6 +625,7 @@ def delete_csv_uploaded_dataset(
     if not dataset:
         raise error_response(status_code=404, detail="Uploaded dataset not found")
 
+    record_upload_storage_usage(db, dataset=dataset, user_id=current_user.id)
     delete_uploaded_dataset(dataset=dataset)
     db.commit()
 
