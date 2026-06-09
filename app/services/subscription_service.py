@@ -4,7 +4,8 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.models.auth_models import User
 from app.models.csv_dataset_models import CsvUploadedDataset
-from app.models.subscription_models import SubscriptionPlan, UserSubscription
+from app.models.subscription_models import SubscriptionPlan, UserSubscription, UserUploadStorageUsage
+from app.utils.responses import error_response
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,14 @@ PLAN_CAPABILITIES = {
 }
 
 
+def _format_bytes(size_bytes: int) -> str:
+    if size_bytes >= 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.2f} MB"
+    if size_bytes >= 1024:
+        return f"{size_bytes / 1024:.2f} KB"
+    return f"{size_bytes} bytes"
+
+
 def normalize_plan_tier(plan_name: str | None) -> str:
     normalized_name = (plan_name or "").strip().lower()
 
@@ -54,11 +63,12 @@ def get_plan_capabilities(plan_name: str | None) -> dict:
 
 
 def get_user_storage_summary(db: Session, user_id: int, plan_name: str | None) -> dict:
+    sync_user_upload_storage_usage(db, user_id)
     plan_capabilities = get_plan_capabilities(plan_name)
     total_file_size_bytes = plan_capabilities["max_file_size_bytes"]
     used_file_size_bytes = (
-        db.query(func.coalesce(func.sum(CsvUploadedDataset.file_size), 0))
-        .filter(CsvUploadedDataset.created_by_user_id == user_id)
+        db.query(func.coalesce(func.sum(UserUploadStorageUsage.file_size_bytes), 0))
+        .filter(UserUploadStorageUsage.user_id == user_id)
         .scalar()
     ) or 0
 
@@ -71,6 +81,76 @@ def get_user_storage_summary(db: Session, user_id: int, plan_name: str | None) -
         "used_file_size_bytes": used_file_size_bytes,
         "remaining_file_size_bytes": remaining_file_size_bytes
     }
+
+
+def get_used_upload_storage_bytes(db: Session, user_id: int) -> int:
+    sync_user_upload_storage_usage(db, user_id)
+    return (
+        db.query(func.coalesce(func.sum(UserUploadStorageUsage.file_size_bytes), 0))
+        .filter(UserUploadStorageUsage.user_id == user_id)
+        .scalar()
+    ) or 0
+
+
+def ensure_upload_storage_available(
+    db: Session,
+    *,
+    user_id: int,
+    plan_capabilities: dict,
+    upload_size_bytes: int,
+) -> None:
+    total_file_size_bytes = plan_capabilities["max_file_size_bytes"]
+    if total_file_size_bytes is None:
+        return
+
+    used_file_size_bytes = get_used_upload_storage_bytes(db, user_id)
+    remaining_file_size_bytes = max(total_file_size_bytes - used_file_size_bytes, 0)
+    if upload_size_bytes > remaining_file_size_bytes:
+        raise error_response(
+            status_code=400,
+            detail=(
+                f"Your current plan has {_format_bytes(remaining_file_size_bytes)} upload storage remaining. "
+                "Please upgrade your plan."
+            ),
+        )
+
+
+def record_upload_storage_usage(
+    db: Session,
+    *,
+    dataset: CsvUploadedDataset,
+    user_id: int,
+) -> UserUploadStorageUsage:
+    existing_usage = (
+        db.query(UserUploadStorageUsage)
+        .filter(
+            UserUploadStorageUsage.user_id == user_id,
+            UserUploadStorageUsage.uploaded_dataset_id == dataset.id,
+        )
+        .first()
+    )
+    if existing_usage:
+        return existing_usage
+
+    usage = UserUploadStorageUsage(
+        user_id=user_id,
+        uploaded_dataset_id=dataset.id,
+        file_size_bytes=dataset.file_size,
+        file_name=dataset.file_name,
+        sheet_name=dataset.sheet_name,
+    )
+    db.add(usage)
+    return usage
+
+
+def sync_user_upload_storage_usage(db: Session, user_id: int) -> None:
+    active_datasets = (
+        db.query(CsvUploadedDataset)
+        .filter(CsvUploadedDataset.created_by_user_id == user_id)
+        .all()
+    )
+    for dataset in active_datasets:
+        record_upload_storage_usage(db, dataset=dataset, user_id=user_id)
 
 
 def get_active_subscription(db: Session, user_id: int) -> UserSubscription | None:

@@ -74,60 +74,73 @@ def suggest_join_columns(
     *,
     source_datasets: list[CsvUploadedDataset],
 ) -> dict:
-    if len(source_datasets) != 2:
+    if len(source_datasets) < 1:
         raise error_response(
             status_code=400,
-            detail="Merge suggestions support exactly two uploaded datasets",
+            detail="At least one uploaded dataset is required for merge suggestions",
         )
 
-    left_dataset, right_dataset = source_datasets
     suggestions = []
     seen_pairs = set()
 
-    for left_column in left_dataset.columns:
-        for right_column in right_dataset.columns:
-            columns_match = (
-                _case_key(left_column) == _case_key(right_column)
-                or _compact_key(left_column) == _compact_key(right_column)
-            )
-            if columns_match:
-                pair_key = (_case_key(left_column), _case_key(right_column))
-                if pair_key in seen_pairs:
-                    continue
-                seen_pairs.add(pair_key)
-                suggestions.append(
-                    {
-                        "left_column": left_column,
-                        "right_column": right_column,
-                        "confidence": _confidence(left_column, right_column),
-                    }
-                )
+    for left_index, left_dataset in enumerate(source_datasets):
+        for right_dataset in source_datasets[left_index + 1:]:
+            for left_column in left_dataset.columns:
+                for right_column in right_dataset.columns:
+                    columns_match = (
+                        _case_key(left_column) == _case_key(right_column)
+                        or _compact_key(left_column) == _compact_key(right_column)
+                    )
+                    if columns_match:
+                        pair_key = (
+                            left_dataset.id,
+                            right_dataset.id,
+                            _case_key(left_column),
+                            _case_key(right_column),
+                        )
+                        if pair_key in seen_pairs:
+                            continue
+                        seen_pairs.add(pair_key)
+                        suggestions.append(
+                            {
+                                "left_dataset_id": left_dataset.id,
+                                "right_dataset_id": right_dataset.id,
+                                "left_column": left_column,
+                                "right_column": right_column,
+                                "confidence": _confidence(left_column, right_column),
+                            }
+                        )
 
     suggestions.sort(
         key=lambda item: (
             {"high": 0, "medium": 1, "low": 2}[item["confidence"]],
             _case_key(item["left_column"]) not in COMMON_JOIN_COLUMNS,
             item["left_column"].lower(),
+            item["left_dataset_id"],
+            item["right_dataset_id"],
         )
     )
-    left_suggested_columns = {
-        _case_key(item["left_column"]): item["confidence"]
-        for item in suggestions
+    suggested_columns_by_dataset: dict[int, dict[str, str]] = {
+        dataset.id: {}
+        for dataset in source_datasets
     }
-    right_suggested_columns = {
-        _case_key(item["right_column"]): item["confidence"]
-        for item in suggestions
-    }
+    for item in suggestions:
+        suggested_columns_by_dataset[item["left_dataset_id"]][_case_key(item["left_column"])] = item["confidence"]
+        suggested_columns_by_dataset[item["right_dataset_id"]][_case_key(item["right_column"])] = item["confidence"]
+
+    source_dataset_infos = [
+        _dataset_info_with_suggestions(
+            dataset,
+            suggested_columns_by_dataset[dataset.id],
+        )
+        for dataset in source_datasets
+    ]
 
     return {
-        "left_dataset": _dataset_info_with_suggestions(
-            left_dataset,
-            left_suggested_columns,
-        ),
-        "right_dataset": _dataset_info_with_suggestions(
-            right_dataset,
-            right_suggested_columns,
-        ),
+        "left_dataset": source_dataset_infos[0],
+        "right_dataset": source_dataset_infos[1] if len(source_dataset_infos) > 1 else None,
+        "source_datasets": source_dataset_infos,
+        "join_suggestions": suggestions,
         "supported_merge_types": [
             {
                 "type": merge_type,

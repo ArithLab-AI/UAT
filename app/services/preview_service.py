@@ -9,8 +9,8 @@ PREVIEW_ROW_LIMIT = 10
 def preview_uploaded_dataset_merge(
     *,
     source_datasets: list[CsvUploadedDataset],
-    merge_type: str,
-    join_columns: list[Any],
+    merge_type: str | None,
+    join_columns: list[Any] | None,
 ) -> dict:
     output_columns, output_internal_columns, merged_rows = build_merged_rows(
         source_datasets=source_datasets,

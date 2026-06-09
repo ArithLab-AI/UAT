@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -16,11 +17,22 @@ from app.services.csv_service import (
 )
 from app.utils.responses import error_response
 
+
+@dataclass(frozen=True)
+class MergeDatasetContext:
+    id: int
+    name: str
+    table_name: str
+    storage_key: str | None
+    columns: list[str]
+    internal_columns: list[str]
+
+
 def validate_source_dataset_ids(source_dataset_ids: list[int]) -> None:
-    if len(source_dataset_ids) != 2:
+    if len(source_dataset_ids) < 1:
         raise error_response(
             status_code=400,
-            detail="Exactly two source dataset IDs are required",
+            detail="At least one source dataset ID is required",
         )
     if len(set(source_dataset_ids)) != len(source_dataset_ids):
         raise error_response(
@@ -153,41 +165,70 @@ def resolve_join_columns(
 def build_merged_rows(
     *,
     source_datasets: list[CsvUploadedDataset],
-    merge_type: str,
-    join_columns: list[Any],
+    merge_type: str | None,
+    join_columns: list[Any] | None,
 ) -> tuple[list[str], list[str], list[dict]]:
+    if not source_datasets:
+        raise error_response(status_code=400, detail="At least one uploaded dataset is required to merge")
+
+    accumulated_dataset = MergeDatasetContext(
+        id=source_datasets[0].id,
+        name=source_datasets[0].name,
+        table_name=source_datasets[0].table_name,
+        storage_key=source_datasets[0].storage_key,
+        columns=list(source_datasets[0].columns),
+        internal_columns=list(source_datasets[0].internal_columns),
+    )
+    accumulated_rows = _fetch_dataset_rows(
+        table_name=accumulated_dataset.table_name,
+        columns=accumulated_dataset.internal_columns,
+        storage_key=accumulated_dataset.storage_key,
+    )
+
+    if len(source_datasets) == 1:
+        return accumulated_dataset.columns, accumulated_dataset.internal_columns, accumulated_rows
+
+    if merge_type is None:
+        raise error_response(status_code=400, detail="Merge type is required")
     validate_merge_type(merge_type)
-    left_join_columns, right_join_columns = resolve_join_columns(source_datasets, join_columns)
-    left_dataset, right_dataset = source_datasets
 
-    left_rows = _fetch_dataset_rows(
-        table_name=left_dataset.table_name,
-        columns=left_dataset.internal_columns,
-        storage_key=left_dataset.storage_key,
-    )
-    right_rows = _fetch_dataset_rows(
-        table_name=right_dataset.table_name,
-        columns=right_dataset.internal_columns,
-        storage_key=right_dataset.storage_key,
-    )
+    for right_dataset in source_datasets[1:]:
+        left_join_columns, right_join_columns = resolve_join_columns(
+            [accumulated_dataset, right_dataset],
+            join_columns,
+        )
+        right_rows = _fetch_dataset_rows(
+            table_name=right_dataset.table_name,
+            columns=right_dataset.internal_columns,
+            storage_key=right_dataset.storage_key,
+        )
 
-    (
-        output_columns,
-        output_internal_columns,
-        left_output_mapping,
-        right_output_mapping,
-    ) = _build_join_output_columns(left_dataset, right_dataset, set(right_join_columns))
-    merged_rows = _build_joined_rows_with_pandas(
-        left_rows=left_rows,
-        right_rows=right_rows,
-        left_columns=left_dataset.internal_columns,
-        left_join_columns=left_join_columns,
-        right_join_columns=right_join_columns,
-        left_output_mapping=left_output_mapping,
-        right_output_mapping=right_output_mapping,
-        merge_type=merge_type,
-    )
-    return output_columns, output_internal_columns, merged_rows
+        (
+            output_columns,
+            output_internal_columns,
+            left_output_mapping,
+            right_output_mapping,
+        ) = _build_join_output_columns(accumulated_dataset, right_dataset, set(right_join_columns))
+        accumulated_rows = _build_joined_rows_with_pandas(
+            left_rows=accumulated_rows,
+            right_rows=right_rows,
+            left_columns=accumulated_dataset.internal_columns,
+            left_join_columns=left_join_columns,
+            right_join_columns=right_join_columns,
+            left_output_mapping=left_output_mapping,
+            right_output_mapping=right_output_mapping,
+            merge_type=merge_type,
+        )
+        accumulated_dataset = MergeDatasetContext(
+            id=accumulated_dataset.id,
+            name=accumulated_dataset.name,
+            table_name=accumulated_dataset.table_name,
+            storage_key=accumulated_dataset.storage_key,
+            columns=output_columns,
+            internal_columns=output_internal_columns,
+        )
+
+    return accumulated_dataset.columns, accumulated_dataset.internal_columns, accumulated_rows
 
 
 def rows_with_display_columns(
@@ -211,8 +252,8 @@ def merge_uploaded_datasets(
     merged_name: str,
     source_datasets: list[CsvUploadedDataset],
     user_id: int,
-    merge_type: str,
-    join_columns: list[Any],
+    merge_type: str | None,
+    join_columns: list[Any] | None,
 ) -> CsvMergedDataset:
     output_columns, output_internal_columns, merged_rows = build_merged_rows(
         source_datasets=source_datasets,

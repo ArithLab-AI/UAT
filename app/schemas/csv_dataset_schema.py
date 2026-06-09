@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from app.schemas.common_schema import SuccessResponse
 
 class CsvDatasetSummaryResponse(BaseModel):
@@ -46,13 +46,34 @@ class MultiSheetUploadPendingResponse(BaseModel):
 
 class SelectExcelSheetRequest(BaseModel):
     file_token: str = Field(..., min_length=1)
-    sheet_name: str = Field(..., min_length=1)
+    sheet_name: str | None = Field(default=None, min_length=1)
+    sheet_names: list[str] | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def require_sheet_selection(self):
+        selected_sheet_names = self.selected_sheet_names()
+        if not selected_sheet_names:
+            raise ValueError("Either sheet_name or sheet_names is required")
+        normalized_sheet_names = [sheet_name.strip() for sheet_name in selected_sheet_names]
+        if any(not sheet_name for sheet_name in normalized_sheet_names):
+            raise ValueError("Sheet names cannot be empty")
+        if len(set(normalized_sheet_names)) != len(normalized_sheet_names):
+            raise ValueError("Sheet names must be unique for each file token")
+        return self
+
+    def selected_sheet_names(self) -> list[str]:
+        sheet_names = []
+        if self.sheet_name is not None:
+            sheet_names.append(self.sheet_name)
+        if self.sheet_names:
+            sheet_names.extend(self.sheet_names)
+        return sheet_names
 
     class Config:
         json_schema_extra = {
             "example": {
                 "file_token": "lgNA820xPWbtX9EWXsxdTSjywBDQC93BmkJOgKWAFdU",
-                "sheet_name": "Sheet1",
+                "sheet_names": ["Sheet1", "Sheet2"],
             }
         }
 
@@ -71,6 +92,21 @@ class MergeJoinColumnMapping(BaseModel):
     right_column: str = Field(..., min_length=1)
 
 
+class MultiSourceJoinRequest(BaseModel):
+    source_dataset_ids: list[int] = Field(..., min_length=1)
+    merge_type: Literal["inner", "left", "right", "full"] | None = None
+    join_columns: list[MergeJoinColumnMapping] | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def require_join_details_for_multiple_sources(self):
+        if len(self.source_dataset_ids) > 1:
+            if self.merge_type is None:
+                raise ValueError("Merge type is required when merging multiple source datasets")
+            if not self.join_columns:
+                raise ValueError("At least one join column is required when merging multiple source datasets")
+        return self
+
+
 class MergeSourceDatasetsRequest(BaseModel):
     source_dataset_ids: list[int] = Field(..., min_length=2, max_length=2)
 
@@ -78,6 +114,17 @@ class MergeSourceDatasetsRequest(BaseModel):
         json_schema_extra = {
             "example": {
                 "source_dataset_ids": [1, 2],
+            }
+        }
+
+
+class MergeSuggestionsRequest(BaseModel):
+    source_dataset_ids: list[int] = Field(..., min_length=1)
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "source_dataset_ids": [1, 2, 3],
             }
         }
 
@@ -104,20 +151,27 @@ class SupportedMergeTypeResponse(BaseModel):
     description: str
 
 
+class MergeJoinSuggestionResponse(BaseModel):
+    left_dataset_id: int
+    right_dataset_id: int
+    left_column: str
+    right_column: str
+    confidence: Literal["high", "medium", "low"]
+
+
 class MergeSuggestionsResponse(BaseModel):
-    left_dataset: MergeDatasetInfoResponse
-    right_dataset: MergeDatasetInfoResponse
+    left_dataset: MergeDatasetInfoResponse | None = None
+    right_dataset: MergeDatasetInfoResponse | None = None
+    source_datasets: list[MergeDatasetInfoResponse]
+    join_suggestions: list[MergeJoinSuggestionResponse]
     supported_merge_types: list[SupportedMergeTypeResponse]
 
 
-class PreviewMergeRequest(MergeSourceDatasetsRequest):
-    merge_type: Literal["inner", "left", "right", "full"]
-    join_columns: list[MergeJoinColumnMapping] = Field(..., min_length=1)
-
+class PreviewMergeRequest(MultiSourceJoinRequest):
     class Config:
         json_schema_extra = {
             "example": {
-                "source_dataset_ids": [1, 2],
+                "source_dataset_ids": [1, 2, 3],
                 "merge_type": "left",
                 "join_columns": [
                     {
@@ -135,11 +189,8 @@ class PreviewMergeResponse(BaseModel):
     preview_row_count: int
 
 
-class MergeCsvDatasetsRequest(BaseModel):
+class MergeCsvDatasetsRequest(MultiSourceJoinRequest):
     merged_name: str = Field(..., min_length=1, max_length=255)
-    source_dataset_ids: list[int] = Field(..., min_length=2, max_length=2)
-    merge_type: Literal["inner", "left", "right", "full"]
-    join_columns: list[MergeJoinColumnMapping] = Field(..., min_length=1)
 
     class Config:
         json_schema_extra = {
