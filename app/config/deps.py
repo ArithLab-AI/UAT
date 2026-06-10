@@ -10,7 +10,7 @@ from app.utils.email_utils import missing_smtp_settings, send_plain_email
 from app.utils.mail_body import mail_body
 from app.utils.responses import error_response
 
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 logger = logging.getLogger(__name__)
 
 
@@ -23,7 +23,7 @@ def _validate_smtp_settings() -> None:
             detail="SMTP is not configured correctly"
         )
 
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security),
+def get_current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security),
         db: Session = Depends(get_db)) -> User:
     if not credentials:
         logger.warning("Authorization credentials not provided")

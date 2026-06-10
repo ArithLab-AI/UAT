@@ -13,6 +13,8 @@ dist/
 *.egg-info/
 .eggs/
 
+
+docker-compose.yml
 # Test / coverage
 .pytest_cache/
 .coverage

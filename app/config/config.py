@@ -27,6 +27,25 @@ class Settings(BaseSettings):
     S3_REGION: str = "us-east-1"
     CHUNK_SIZE: int = 1000
 
+    OPENAI_API_KEY: Optional[str] = None
+    OPENAI_BASE_URL: Optional[str] = None
+
+    UAT_ANALYSIS_LLM_PROVIDER: str = "openai"
+    UAT_ANALYSIS_LLM_MODEL: Optional[str] = "gpt-4o-mini"
+    UAT_ANALYSIS_LLM_TEMPERATURE: float = 0
+    UAT_ANALYSIS_LLM_MAX_TOKENS: int = 1200
+    UAT_AI_CLEANING_MODEL: Optional[str] = None
+    UAT_AI_CLEANING_TEMPERATURE: float = 0
+    UAT_AI_CLEANING_MAX_TOKENS: int = 3000
+    UAT_AI_BATCH_SIZE: int = 50
+    UAT_AI_VALUE_BATCH_SIZE: int = 200
+    UAT_AI_VALUE_BATCH_PARALLELISM: int = 2
+    UAT_AI_VALUE_CLEAN_MAX_UNIQUE_VALUES: int = 5000
+    UAT_AI_VALUE_CLEAN_MAX_COLUMNS: int = 5
+    UAT_AI_ROW_LEVEL_LARGE_DATASET_THRESHOLD: int = 50000
+    UAT_AI_PLANNER_SAMPLE_ROWS: int = 100
+    UAT_AI_CLEAN_PREVIEW_ROWS: int = 25
+
     class Config:
         env_file = ".env"
 

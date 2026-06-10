@@ -63,7 +63,13 @@ async def clean_endpoint(
 
     job_id = str(uuid.uuid4())
     try:
-        job = start_cleaning_job(storage_key=storage_key, file_name=file_name, job_id=job_id, db=db)
+        job = start_cleaning_job(
+            storage_key=storage_key,
+            file_name=file_name,
+            job_id=job_id,
+            db=db,
+            source_dataset_id=payload.dataset_id,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
