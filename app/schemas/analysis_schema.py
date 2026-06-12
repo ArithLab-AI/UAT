@@ -82,5 +82,21 @@ class DatasetAnalysisResponse(BaseModel):
     dataset_profile: dict | None = None
 
 
+class DatasetAnalysisSuggestionsResponse(BaseModel):
+    analysis_id: str
+    dataset_id: int
+    dataset_type: Literal["uploaded", "merged"]
+    dataset_name: str
+    file_name: str
+    quality_score: int = Field(ge=0, le=100)
+    llm_used: bool = False
+    suggestion_source: Literal["llm", "rule_based"]
+    llm_provider: str | None = None
+    llm_model: str | None = None
+    message: str | None = None
+    suggestions: list[DataSuggestionResponse] = Field(default_factory=list)
+
+
 DatasetAnalysisRunSuccessResponse = SuccessResponse[DatasetAnalysisResponse]
+DatasetAnalysisSuggestionsSuccessResponse = SuccessResponse[DatasetAnalysisSuggestionsResponse]
 LLMTestSuccessResponse = SuccessResponse[LLMTestResponse]

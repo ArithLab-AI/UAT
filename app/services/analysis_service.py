@@ -613,3 +613,92 @@ def run_dataset_analysis(
         ],
         "dataset_profile": dataset_profile,
     }
+
+
+def get_dataset_analysis_suggestions(
+    db: Session,
+    *,
+    current_user: User,
+    analysis_id: str,
+) -> dict:
+    analysis = (
+        db.query(DatasetAnalysis)
+        .filter(
+            DatasetAnalysis.id == analysis_id,
+            DatasetAnalysis.created_by_user_id == current_user.id,
+        )
+        .first()
+    )
+    if analysis is None:
+        raise error_response(status_code=404, detail="Dataset analysis not found")
+
+    suggestion_rows = (
+        db.query(AnalysisSuggestion)
+        .filter(
+            AnalysisSuggestion.analysis_id == analysis.id,
+            AnalysisSuggestion.created_by_user_id == current_user.id,
+        )
+        .order_by(AnalysisSuggestion.created_at.asc(), AnalysisSuggestion.id.asc())
+        .all()
+    )
+
+    return {
+        "analysis_id": analysis.id,
+        "dataset_id": analysis.source_dataset_id,
+        "dataset_type": analysis.source_type,
+        "dataset_name": analysis.dataset_name,
+        "file_name": analysis.file_name,
+        "quality_score": analysis.quality_score,
+        "llm_used": analysis.llm_used,
+        "suggestion_source": analysis.suggestion_source,
+        "llm_provider": analysis.llm_provider,
+        "llm_model": analysis.llm_model,
+        "message": analysis.message,
+        "suggestions": [
+            {
+                "id": suggestion.id,
+                "issue_description": suggestion.issue_description,
+                "priority": suggestion.priority,
+                "resolution_prompt": suggestion.resolution_prompt,
+                "cleaning_prompt_type": suggestion.cleaning_prompt_type,
+                "target_columns": suggestion.target_columns or [],
+            }
+            for suggestion in suggestion_rows
+        ],
+    }
+
+
+def get_latest_dataset_analysis_suggestions(
+    db: Session,
+    *,
+    current_user: User,
+    dataset_id: int,
+    dataset_type: str,
+    is_clean: bool,
+) -> dict:
+    source = _resolve_analysis_source(
+        db,
+        current_user,
+        dataset_type=dataset_type,
+        dataset_id=dataset_id,
+        is_clean=is_clean,
+    )
+    analysis = (
+        db.query(DatasetAnalysis)
+        .filter(
+            DatasetAnalysis.created_by_user_id == current_user.id,
+            DatasetAnalysis.source_dataset_id == source.dataset_id,
+            DatasetAnalysis.source_type == source.dataset_type,
+            DatasetAnalysis.file_name == source.file_name,
+        )
+        .order_by(DatasetAnalysis.updated_at.desc(), DatasetAnalysis.created_at.desc())
+        .first()
+    )
+    if analysis is None:
+        raise error_response(status_code=404, detail="Dataset analysis not found for the provided dataset")
+
+    return get_dataset_analysis_suggestions(
+        db,
+        current_user=current_user,
+        analysis_id=analysis.id,
+    )
