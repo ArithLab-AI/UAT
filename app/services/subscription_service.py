@@ -63,12 +63,15 @@ def get_plan_capabilities(plan_name: str | None) -> dict:
 
 
 def get_user_storage_summary(db: Session, user_id: int, plan_name: str | None) -> dict:
-    sync_user_upload_storage_usage(db, user_id)
     plan_capabilities = get_plan_capabilities(plan_name)
     total_file_size_bytes = plan_capabilities["max_file_size_bytes"]
+    active_subscription = get_active_subscription(db, user_id)
     used_file_size_bytes = (
         db.query(func.coalesce(func.sum(UserUploadStorageUsage.file_size_bytes), 0))
-        .filter(UserUploadStorageUsage.user_id == user_id)
+        .filter(
+            UserUploadStorageUsage.user_id == user_id,
+            UserUploadStorageUsage.subscription_id == active_subscription.id,
+        )
         .scalar()
     ) or 0
 
@@ -84,12 +87,16 @@ def get_user_storage_summary(db: Session, user_id: int, plan_name: str | None) -
 
 
 def get_used_upload_storage_bytes(db: Session, user_id: int) -> int:
-    sync_user_upload_storage_usage(db, user_id)
-    return (
+    active_subscription = get_active_subscription(db, user_id)
+    used_file_size_bytes = (
         db.query(func.coalesce(func.sum(UserUploadStorageUsage.file_size_bytes), 0))
-        .filter(UserUploadStorageUsage.user_id == user_id)
+        .filter(
+            UserUploadStorageUsage.user_id == user_id,
+            UserUploadStorageUsage.subscription_id == active_subscription.id,
+        )
         .scalar()
     ) or 0
+    return used_file_size_bytes
 
 
 def ensure_upload_storage_available(
@@ -114,13 +121,15 @@ def ensure_upload_storage_available(
             ),
         )
 
-
 def record_upload_storage_usage(
     db: Session,
     *,
     dataset: CsvUploadedDataset,
     user_id: int,
 ) -> UserUploadStorageUsage:
+
+    active_subscription = get_active_subscription(db, user_id)
+
     existing_usage = (
         db.query(UserUploadStorageUsage)
         .filter(
@@ -129,29 +138,21 @@ def record_upload_storage_usage(
         )
         .first()
     )
+
     if existing_usage:
         return existing_usage
 
     usage = UserUploadStorageUsage(
         user_id=user_id,
+        subscription_id=active_subscription.id,
         uploaded_dataset_id=dataset.id,
         file_size_bytes=dataset.file_size,
         file_name=dataset.file_name,
         sheet_name=dataset.sheet_name,
     )
+
     db.add(usage)
     return usage
-
-
-def sync_user_upload_storage_usage(db: Session, user_id: int) -> None:
-    active_datasets = (
-        db.query(CsvUploadedDataset)
-        .filter(CsvUploadedDataset.created_by_user_id == user_id)
-        .all()
-    )
-    for dataset in active_datasets:
-        record_upload_storage_usage(db, dataset=dataset, user_id=user_id)
-
 
 def get_active_subscription(db: Session, user_id: int) -> UserSubscription | None:
     active_subscriptions = (
