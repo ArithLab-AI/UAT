@@ -45,6 +45,7 @@ class LLMTestResponse(BaseModel):
 
 class DataSuggestionResponse(BaseModel):
     id: str | None = None
+    title: str
     issue_description: str
     priority: str
     resolution_prompt: str

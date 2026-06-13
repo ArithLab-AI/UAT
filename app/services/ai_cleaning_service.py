@@ -43,6 +43,7 @@ from app.services.analysis_profile_service import (
     generate_rule_based_suggestions,
 )
 from app.services.analysis_suggestion_match_service import split_matching_suggestions
+from app.services.analysis_suggestion_title_service import build_suggestion_title
 from app.utils.object_storage import get_object_storage_service
 from app.utils.responses import error_response
 
@@ -930,6 +931,10 @@ def get_ai_cleaned_download_payload(
 def _to_suggestion_dict(suggestion: DataSuggestion, *, suggestion_id: str | None = None) -> dict[str, Any]:
     return {
         "id": suggestion_id,
+        "title": build_suggestion_title(
+            cleaning_prompt_type=suggestion.cleaning_prompt_type,
+            issue_description=suggestion.issue_description,
+        ),
         "issue_description": suggestion.issue_description,
         "priority": suggestion.priority,
         "resolution_prompt": suggestion.resolution_prompt,

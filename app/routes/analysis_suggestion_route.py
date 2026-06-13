@@ -6,6 +6,7 @@ from app.db.database import get_db
 from app.models.analysis_models import AnalysisSuggestion
 from app.models.auth_models import User
 from app.schemas.analysis_suggestion_schema import AnalysisSuggestionDetailSuccessResponse
+from app.services.analysis_suggestion_title_service import build_suggestion_title
 from app.utils.responses import error_response, success_response
 
 router = APIRouter(prefix="/analysis/suggestions", tags=["Dataset Analysis"])
@@ -40,6 +41,10 @@ def get_analysis_suggestion_detail(
             "source_dataset_id": suggestion.source_dataset_id,
             "source_type": suggestion.source_type,
             "created_by_user_id": suggestion.created_by_user_id,
+            "title": build_suggestion_title(
+                cleaning_prompt_type=suggestion.cleaning_prompt_type,
+                issue_description=suggestion.issue_description,
+            ),
             "issue_description": suggestion.issue_description,
             "priority": suggestion.priority,
             "resolution_prompt": suggestion.resolution_prompt,
