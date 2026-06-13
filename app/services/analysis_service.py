@@ -21,6 +21,7 @@ from app.services.ai_cleaning_quality_service import (
     coalesce_priority_clean_quality_score,
 )
 from app.services.analysis_suggestion_match_service import split_matching_suggestions
+from app.services.analysis_suggestion_title_service import build_suggestion_title
 from app.services.analysis_llm_service import generate_llm_suggestions
 from app.services.analysis_profile_service import (
     DataSuggestion,
@@ -82,6 +83,10 @@ def _parse_csv_iter(path: str, chunksize: int, *, preserve_placeholders: bool = 
 def _to_suggestion_dict(suggestion: DataSuggestion, *, suggestion_id: str | None = None) -> dict:
     return {
         "id": suggestion_id,
+        "title": build_suggestion_title(
+            cleaning_prompt_type=suggestion.cleaning_prompt_type,
+            issue_description=suggestion.issue_description,
+        ),
         "issue_description": suggestion.issue_description,
         "priority": suggestion.priority,
         "resolution_prompt": suggestion.resolution_prompt,
@@ -657,6 +662,10 @@ def get_dataset_analysis_suggestions(
         "suggestions": [
             {
                 "id": suggestion.id,
+                "title": build_suggestion_title(
+                    cleaning_prompt_type=suggestion.cleaning_prompt_type,
+                    issue_description=suggestion.issue_description,
+                ),
                 "issue_description": suggestion.issue_description,
                 "priority": suggestion.priority,
                 "resolution_prompt": suggestion.resolution_prompt,

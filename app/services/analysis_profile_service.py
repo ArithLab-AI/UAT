@@ -8,6 +8,8 @@ from typing import Any, Iterable
 
 import pandas as pd
 
+from app.services.analysis_suggestion_title_service import build_suggestion_title
+
 
 NULL_OUTPUT_TOKEN = os.getenv("UAT_ANALYSIS_NULL_OUTPUT_TOKEN", "N/A")
 DATE_OUTPUT_FORMAT = os.getenv("UAT_ANALYSIS_DATE_OUTPUT_FORMAT", "%Y-%m-%d")
@@ -98,6 +100,10 @@ class DataSuggestion:
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
+            "title": build_suggestion_title(
+                cleaning_prompt_type=self.cleaning_prompt_type,
+                issue_description=self.issue_description,
+            ),
             "issue_description": self.issue_description,
             "priority": self.priority,
             "resolution_prompt": self.resolution_prompt,
