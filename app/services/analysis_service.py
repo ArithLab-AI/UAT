@@ -20,7 +20,10 @@ from app.services.ai_cleaning_quality_service import (
     cap_quality_score_by_suggestions,
     coalesce_priority_clean_quality_score,
 )
-from app.services.analysis_suggestion_match_service import split_matching_suggestions
+from app.services.analysis_suggestion_match_service import (
+    normalize_cleaning_prompt_type,
+    split_matching_suggestions,
+)
 from app.services.analysis_suggestion_title_service import build_suggestion_title
 from app.services.analysis_llm_service import generate_llm_suggestions
 from app.services.analysis_profile_service import (
@@ -273,7 +276,12 @@ def _resolve_ai_cleaning_detail_prompt_metadata(
 ) -> tuple[str | None, list[str]]:
     if detail.source_suggestion_id:
         suggestion = (
-            db.query(AnalysisSuggestion.cleaning_prompt_type, AnalysisSuggestion.target_columns)
+            db.query(
+                AnalysisSuggestion.cleaning_prompt_type,
+                AnalysisSuggestion.target_columns,
+                AnalysisSuggestion.resolution_prompt,
+                AnalysisSuggestion.issue_description,
+            )
             .filter(
                 AnalysisSuggestion.id == detail.source_suggestion_id,
                 AnalysisSuggestion.created_by_user_id == current_user.id,
@@ -281,14 +289,22 @@ def _resolve_ai_cleaning_detail_prompt_metadata(
             .first()
         )
         if suggestion is not None:
-            prompt_type = str(suggestion[0]).strip() if suggestion[0] else None
+            prompt_type = normalize_cleaning_prompt_type(
+                suggestion[0],
+                resolution_prompt=str(suggestion[2]).strip() if suggestion[2] else None,
+                issue_description=str(suggestion[3]).strip() if suggestion[3] else None,
+            )
             target_columns = list(suggestion[1] or [])
             return prompt_type, [str(column).strip() for column in target_columns if str(column).strip()]
 
     for item in ((detail.analysis or {}).get("suggestions") or []):
         if not isinstance(item, dict) or item.get("id") != detail.source_suggestion_id:
             continue
-        prompt_type = str(item.get("cleaning_prompt_type") or "").strip() or None
+        prompt_type = normalize_cleaning_prompt_type(
+            item.get("cleaning_prompt_type"),
+            resolution_prompt=str(item.get("resolution_prompt") or "").strip() or None,
+            issue_description=str(item.get("issue_description") or "").strip() or None,
+        )
         target_columns = item.get("target_columns") if isinstance(item.get("target_columns"), list) else []
         return prompt_type, [str(column).strip() for column in target_columns if str(column).strip()]
 

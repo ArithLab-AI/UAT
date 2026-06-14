@@ -745,6 +745,7 @@ def _apply_schema_type_validation(
     df: pd.DataFrame,
     *,
     target_columns: set[str] | None = None,
+    forced_type: str | None = None,
 ) -> pd.DataFrame:
     validated_df = df.copy()
     scoped_columns = set(target_columns or set())
@@ -754,7 +755,7 @@ def _apply_schema_type_validation(
             continue
 
         series = validated_df[column]
-        expected_type = _infer_expected_validation_type_for_cleaning(column_name, series)
+        expected_type = forced_type or _infer_expected_validation_type_for_cleaning(column_name, series)
         if expected_type == "string":
             string_series = series.astype("string")
             non_null_mask = series.notna()
@@ -1501,8 +1502,8 @@ def _resolve_cleaning_mode_from_hint(
         "phone_normalization": "phone",
         "age_normalization": "age",
         "integer_validation": "integer_validation",
-        "float_validation": "type_validation",
-        "boolean_validation": "type_validation",
+        "float_validation": "float_validation",
+        "boolean_validation": "boolean_validation",
         "numeric_normalization": "numeric",
         "text_normalization": "text",
         "duplicate_removal": "duplicate",
@@ -1784,8 +1785,17 @@ def clean_dataframe_chunk(
             target_columns=target_columns,
         )
 
-    if hinted_mode == "type_validation" or hinted_mode == "integer_validation" or _is_type_validation_only_prompt(user_prompt):
-        cleaned_df = _apply_schema_type_validation(cleaned_df, target_columns=target_columns)
+    forced_validation_type = {
+        "integer_validation": "integer",
+        "float_validation": "float",
+        "boolean_validation": "boolean",
+    }.get(hinted_mode)
+    if hinted_mode in {"type_validation", "integer_validation", "float_validation", "boolean_validation"} or _is_type_validation_only_prompt(user_prompt):
+        cleaned_df = _apply_schema_type_validation(
+            cleaned_df,
+            target_columns=target_columns,
+            forced_type=forced_validation_type,
+        )
     if hinted_mode == "header_type" or _is_header_type_only_prompt(user_prompt):
         cleaned_df = _normalize_header_type_columns(cleaned_df, target_columns=target_columns)
     if _should_normalize_headers(user_prompt):
