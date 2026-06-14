@@ -880,7 +880,38 @@ def run_ai_cleaning(
             raise
 
 
-def get_ai_cleaning_detail(db: Session, *, current_user: User, job_id: str) -> dict[str, Any]:
+def get_ai_cleaning_detail(
+    db: Session,
+    *,
+    current_user: User,
+    dataset_id: int,
+    dataset_type: str | None = None,
+) -> dict[str, Any]:
+    query = (
+        db.query(CleaningJob, AICleaningJobDetail)
+        .join(AICleaningJobDetail, AICleaningJobDetail.job_id == CleaningJob.id)
+        .filter(
+            CleaningJob.ai_cleaning_type.is_(True),
+            AICleaningJobDetail.created_by_user_id == current_user.id,
+            AICleaningJobDetail.source_dataset_id == dataset_id,
+        )
+    )
+    if dataset_type:
+        query = query.filter(AICleaningJobDetail.source_dataset_type == dataset_type)
+
+    record = (
+        query
+        .order_by(AICleaningJobDetail.updated_at.desc(), AICleaningJobDetail.created_at.desc())
+        .first()
+    )
+    if record is None:
+        raise error_response(status_code=404, detail="AI cleaning data not found for the provided dataset")
+
+    job, detail = record
+    return _serialize_ai_cleaning_detail(job, detail)
+
+
+def get_ai_cleaning_detail_by_job_id(db: Session, *, current_user: User, job_id: str) -> dict[str, Any]:
     detail = (
         db.query(AICleaningJobDetail)
         .filter(

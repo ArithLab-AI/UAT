@@ -1,12 +1,16 @@
 import logging
 import os
+from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import APIRouter, Body, Depends, Request
 from sqlalchemy.orm import Session
 
 from app.config.deps import get_current_user
 from app.db.database import get_db
+from app.models.ai_cleaning_models import AICleaningJobDetail
 from app.models.auth_models import User
+from app.models.cleaning_models import CleaningJob
 from app.models.csv_dataset_models import CsvMergedDataset, CsvUploadedDataset
 from app.schemas.csv_dataset_schema import (
     CsvDatasetListSuccessResponse,
@@ -104,9 +108,40 @@ def _build_uploaded_dataset_name(file_name: str, sheet_name: str | None = None) 
     return dataset_name
 
 
-def _serialize_merged_dataset(merged_dataset, source_dataset_map=None):
+def _normalize_sort_timestamp(value: datetime | None) -> float:
+    if value is None:
+        return float("-inf")
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.timestamp()
+
+
+def _serialize_uploaded_dataset(uploaded_dataset, clean_state=None):
+    clean_state = clean_state or {}
+    return {
+        "id": uploaded_dataset.id,
+        "name": uploaded_dataset.name,
+        "file_name": uploaded_dataset.file_name,
+        "sheet_name": uploaded_dataset.sheet_name,
+        "table_name": uploaded_dataset.table_name,
+        "storage_key": uploaded_dataset.storage_key,
+        "file_url": uploaded_dataset.file_url,
+        "is_clean": bool(clean_state.get("is_clean", False)),
+        "clean_file_url": clean_state.get("clean_file_url"),
+        "file_size": uploaded_dataset.file_size,
+        "total_rows": uploaded_dataset.total_rows,
+        "columns": uploaded_dataset.columns,
+        "is_retention": uploaded_dataset.is_retention,
+        "retention_until": uploaded_dataset.retention_until,
+        "retention_at": uploaded_dataset.retention_at,
+        "created_at": uploaded_dataset.created_at,
+    }
+
+
+def _serialize_merged_dataset(merged_dataset, source_dataset_map=None, clean_state=None):
     metadata = merged_dataset.source_datasets_metadata or []
     source_dataset_map = source_dataset_map or {}
+    clean_state = clean_state or {}
     seen_source_ids = set()
 
     source_datasets = []
@@ -131,12 +166,131 @@ def _serialize_merged_dataset(merged_dataset, source_dataset_map=None):
         "table_name": merged_dataset.table_name,
         "storage_key": merged_dataset.storage_key,
         "file_url": merged_dataset.file_url,
+        "is_clean": bool(clean_state.get("is_clean", False)),
+        "clean_file_url": clean_state.get("clean_file_url"),
         "file_size": merged_dataset.file_size,
         "total_rows": merged_dataset.total_rows,
         "columns": merged_dataset.columns,
         "created_at": merged_dataset.created_at,
         "source_datasets": source_datasets,
     }
+
+
+def _update_dataset_clean_state(
+    clean_state_map: dict[tuple[str, int], dict[str, Any]],
+    dataset_key: tuple[str, int],
+    *,
+    clean_file_url: str | None,
+    cleaned_at: datetime | None,
+):
+    if not clean_file_url or dataset_key not in clean_state_map:
+        return
+
+    candidate_sort_key = _normalize_sort_timestamp(cleaned_at)
+    current_state = clean_state_map[dataset_key]
+    if candidate_sort_key < current_state["_sort_key"]:
+        return
+
+    current_state["is_clean"] = True
+    current_state["clean_file_url"] = clean_file_url
+    current_state["_sort_key"] = candidate_sort_key
+
+
+def _build_dataset_clean_state_map(
+    db: Session,
+    *,
+    current_user: User,
+    uploaded_datasets: list[CsvUploadedDataset],
+    merged_datasets: list[CsvMergedDataset],
+) -> dict[tuple[str, int], dict[str, Any]]:
+    clean_state_map: dict[tuple[str, int], dict[str, Any]] = {
+        ("uploaded", dataset.id): {
+            "is_clean": False,
+            "clean_file_url": None,
+            "_sort_key": float("-inf"),
+        }
+        for dataset in uploaded_datasets
+    }
+    clean_state_map.update(
+        {
+            ("merged", dataset.id): {
+                "is_clean": False,
+                "clean_file_url": None,
+                "_sort_key": float("-inf"),
+            }
+            for dataset in merged_datasets
+        }
+    )
+
+    dataset_ids = sorted(
+        {dataset.id for dataset in uploaded_datasets}
+        | {dataset.id for dataset in merged_datasets}
+    )
+    if not dataset_ids:
+        return clean_state_map
+
+    uploaded_name_map = {
+        (dataset.id, dataset.file_name): ("uploaded", dataset.id)
+        for dataset in uploaded_datasets
+    }
+    merged_name_map = {
+        (dataset.id, f"{dataset.name}.csv"): ("merged", dataset.id)
+        for dataset in merged_datasets
+    }
+
+    ai_records = (
+        db.query(CleaningJob, AICleaningJobDetail)
+        .join(AICleaningJobDetail, AICleaningJobDetail.job_id == CleaningJob.id)
+        .filter(
+            CleaningJob.ai_cleaning_type.is_(True),
+            CleaningJob.status == "completed",
+            AICleaningJobDetail.created_by_user_id == current_user.id,
+            AICleaningJobDetail.source_dataset_id.in_(dataset_ids),
+            AICleaningJobDetail.cleaned_file_path.isnot(None),
+        )
+        .order_by(AICleaningJobDetail.updated_at.desc(), AICleaningJobDetail.created_at.desc())
+        .all()
+    )
+    for job, detail in ai_records:
+        dataset_type = (detail.source_dataset_type or "").strip()
+        dataset_key = (dataset_type, detail.source_dataset_id)
+        _update_dataset_clean_state(
+            clean_state_map,
+            dataset_key,
+            clean_file_url=detail.cleaned_file_path,
+            cleaned_at=detail.updated_at or detail.created_at or job.completed_at or job.created_at,
+        )
+
+    manual_records = (
+        db.query(CleaningJob)
+        .filter(
+            CleaningJob.ai_cleaning_type.is_not(True),
+            CleaningJob.status == "completed",
+            CleaningJob.source_dataset_id.in_(dataset_ids),
+            CleaningJob.s3_cleaned_url.isnot(None),
+        )
+        .order_by(CleaningJob.completed_at.desc(), CleaningJob.created_at.desc())
+        .all()
+    )
+    for job in manual_records:
+        candidate_dataset_keys = []
+        uploaded_key = uploaded_name_map.get((job.source_dataset_id, job.original_filename))
+        if uploaded_key is not None:
+            candidate_dataset_keys.append(uploaded_key)
+
+        merged_key = merged_name_map.get((job.source_dataset_id, job.original_filename))
+        if merged_key is not None:
+            candidate_dataset_keys.append(merged_key)
+
+        for dataset_key in candidate_dataset_keys:
+            _update_dataset_clean_state(
+                clean_state_map,
+                dataset_key,
+                clean_file_url=job.s3_cleaned_url,
+                cleaned_at=job.completed_at or job.created_at,
+            )
+
+    return clean_state_map
 
 
 @router.post(
@@ -255,7 +409,10 @@ async def upload_multiple_csv_datasets(
         response_data = {
             "requires_sheet_selection": True,
             "pending_files": pending_files,
-            "uploaded_datasets": created_datasets,
+            "uploaded_datasets": [
+                _serialize_uploaded_dataset(dataset)
+                for dataset in created_datasets
+            ],
         }
 
         return success_response(
@@ -271,7 +428,10 @@ async def upload_multiple_csv_datasets(
     return success_response(
         "Uploaded datasets created successfully",
         status_code=201,
-        data=created_datasets,
+        data=[
+            _serialize_uploaded_dataset(dataset)
+            for dataset in created_datasets
+        ],
     )
 
 
@@ -396,7 +556,10 @@ def select_excel_sheet_for_upload(
     return success_response(
         "Uploaded datasets created successfully",
         status_code=201,
-        data=created_datasets,
+        data=[
+            _serialize_uploaded_dataset(dataset)
+            for dataset in created_datasets
+        ],
     )
 
 
@@ -551,13 +714,29 @@ def list_csv_datasets(
         else []
     )
     source_dataset_map = {dataset.id: dataset for dataset in source_datasets}
+    clean_state_map = _build_dataset_clean_state_map(
+        db,
+        current_user=current_user,
+        uploaded_datasets=uploaded_datasets,
+        merged_datasets=merged_datasets,
+    )
 
     return success_response(
         "Datasets fetched successfully",
         data={
-            "uploaded_datasets": uploaded_datasets,
+            "uploaded_datasets": [
+                _serialize_uploaded_dataset(
+                    uploaded_dataset,
+                    clean_state_map.get(("uploaded", uploaded_dataset.id)),
+                )
+                for uploaded_dataset in uploaded_datasets
+            ],
             "merged_datasets": [
-                _serialize_merged_dataset(merged_dataset, source_dataset_map)
+                _serialize_merged_dataset(
+                    merged_dataset,
+                    source_dataset_map,
+                    clean_state_map.get(("merged", merged_dataset.id)),
+                )
                 for merged_dataset in merged_datasets
             ],
         },

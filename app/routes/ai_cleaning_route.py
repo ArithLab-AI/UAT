@@ -1,6 +1,7 @@
 import os
+from typing import Literal
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from starlette.background import BackgroundTask
@@ -19,6 +20,7 @@ from app.services.ai_cleaning_service import (
     analyze_ai_cleaning_output,
     get_ai_cleaned_download_payload,
     get_ai_cleaning_detail,
+    get_ai_cleaning_detail_by_job_id,
     run_ai_cleaning,
 )
 from app.utils.responses import success_response
@@ -53,18 +55,44 @@ def create_ai_cleaning_job(
 
 
 @router.get(
-    "/{job_id}",
+    "/{dataset_id:int}",
     response_model=AICleaningDetailSuccessResponse,
     response_model_exclude_none=True,
 )
 def get_ai_cleaning_job(
+    dataset_id: int,
+    dataset_type: Literal["uploaded", "merged"] | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return success_response(
+        "AI cleaning data fetched successfully",
+        data=get_ai_cleaning_detail(
+            db,
+            current_user=current_user,
+            dataset_id=dataset_id,
+            dataset_type=dataset_type,
+        ),
+    )
+
+
+@router.get(
+    "/job/{job_id}",
+    response_model=AICleaningDetailSuccessResponse,
+    response_model_exclude_none=True,
+)
+def get_ai_cleaning_job_by_job_id(
     job_id: str,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     return success_response(
         "AI cleaning job fetched successfully",
-        data=get_ai_cleaning_detail(db, current_user=current_user, job_id=job_id),
+        data=get_ai_cleaning_detail_by_job_id(
+            db,
+            current_user=current_user,
+            job_id=job_id,
+        ),
     )
 
 
