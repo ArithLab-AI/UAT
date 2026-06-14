@@ -12,6 +12,10 @@ from app.services.analysis_profile_service import (
     NULL_OUTPUT_TOKEN,
     DataSuggestion,
 )
+from app.services.analysis_suggestion_match_service import (
+    SUPPORTED_CLEANING_PROMPT_TYPES,
+    normalize_cleaning_prompt_type,
+)
 from app.utils.openai_utils import get_openai_client
 
 logger = logging.getLogger(__name__)
@@ -21,6 +25,7 @@ LARGE_ANALYSIS_SUGGESTION_LIMIT = 15
 VERY_LARGE_ANALYSIS_SUGGESTION_LIMIT = 20
 LARGE_ANALYSIS_ROW_THRESHOLD = 25_000
 VERY_LARGE_ANALYSIS_ROW_THRESHOLD = 100_000
+SUPPORTED_CLEANING_PROMPT_TYPE_LIST = ", ".join(sorted(SUPPORTED_CLEANING_PROMPT_TYPES))
 
 ANALYSIS_SYSTEM_PROMPT_TEMPLATE = (
     "You are a strict data quality issue summarizer. "
@@ -30,6 +35,7 @@ ANALYSIS_SYSTEM_PROMPT_TEMPLATE = (
     "Use only the provided deterministic profile metrics. "
     "Return at most {max_suggestions} unique suggestions. "
     "Each resolution_prompt must be directly reusable as a cleaning instruction. "
+    f"cleaning_prompt_type must be one of: {SUPPORTED_CLEANING_PROMPT_TYPE_LIST}. "
     "When the issue is localized, explicitly name the affected columns. "
     f"For date normalization prefer the format {DATE_OUTPUT_FORMAT}. "
     f"For missing-value normalization prefer the placeholder token '{NULL_OUTPUT_TOKEN}'."
@@ -107,9 +113,11 @@ def _normalize_suggestion(item: dict[str, Any]) -> DataSuggestion | None:
     if not isinstance(target_columns, list):
         target_columns = []
 
-    cleaning_prompt_type = item.get("cleaning_prompt_type")
-    if cleaning_prompt_type is not None:
-        cleaning_prompt_type = str(cleaning_prompt_type).strip() or None
+    cleaning_prompt_type = normalize_cleaning_prompt_type(
+        item.get("cleaning_prompt_type"),
+        resolution_prompt=resolution_prompt,
+        issue_description=issue_description,
+    )
 
     return DataSuggestion(
         issue_description=issue_description,
