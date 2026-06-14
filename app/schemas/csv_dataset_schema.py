@@ -9,6 +9,8 @@ class CsvDatasetSummaryResponse(BaseModel):
     table_name: str
     storage_key: str | None = None
     file_url: str | None = None
+    is_clean: bool = False
+    clean_file_url: str | None = None
     file_size: int
     total_rows: int
     columns: list[str]
