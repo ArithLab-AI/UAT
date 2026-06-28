@@ -980,6 +980,35 @@ def _extract_generic_replacement_token(user_prompt: str) -> str | None:
     return bare_match.group(1).strip() if bare_match else None
 
 
+def _resolve_invalid_value_replacement(
+    *,
+    user_prompt: str,
+    prompt_type_hint: str | None,
+    hinted_mode: str | None,
+) -> str | None:
+    explicit_replacement = _extract_generic_replacement_token(user_prompt)
+    if explicit_replacement:
+        return explicit_replacement
+
+    normalized_hint = _normalize_prompt_type_hint(prompt_type_hint)
+    normalized_prompt = user_prompt.strip().lower()
+    default_null_modes = {"date", "email", "numeric", "phone"}
+    default_null_hints = {
+        "date_normalization",
+        "email_normalization",
+        "numeric_normalization",
+        "phone_normalization",
+    }
+    if normalized_hint in default_null_hints:
+        return NULL_OUTPUT_TOKEN
+    if hinted_mode in default_null_modes and any(
+        term in normalized_prompt
+        for term in ("invalid", "keep valid", "only valid", "cannot be parsed")
+    ):
+        return NULL_OUTPUT_TOKEN
+    return None
+
+
 def _replace_missing_values(
     df: pd.DataFrame,
     *,
@@ -1056,10 +1085,15 @@ def _normalize_date_columns(
     *,
     user_prompt: str | None = None,
     target_columns: set[str] | None = None,
+    invalid_replacement: str | None = None,
 ) -> pd.DataFrame:
     normalized_df = df.copy()
     requested_format = _extract_requested_date_format(user_prompt or "") or DATE_OUTPUT_FORMAT
-    invalid_replacement = _extract_invalid_date_replacement(user_prompt or "") or _extract_generic_replacement_token(user_prompt or "")
+    invalid_replacement = (
+        invalid_replacement
+        or _extract_invalid_date_replacement(user_prompt or "")
+        or _extract_generic_replacement_token(user_prompt or "")
+    )
     scoped_columns = set(target_columns or set())
 
     for column in normalized_df.columns:
@@ -1207,6 +1241,7 @@ def _normalize_email_columns(
     df: pd.DataFrame,
     *,
     target_columns: set[str] | None = None,
+    invalid_replacement: str | None = None,
 ) -> pd.DataFrame:
     normalized_df = df.copy()
     scoped_columns = set(target_columns or set())
@@ -1223,10 +1258,15 @@ def _normalize_email_columns(
             or pd.api.types.is_numeric_dtype(series)
         ):
             continue
-        if not _is_email_candidate_column(column_name, series):
+        if not scoped_columns and not _is_email_candidate_column(column_name, series):
             continue
 
-        normalized_values = [_normalize_email_value(value) for value in series.tolist()]
+        normalized_values: list[Any] = []
+        for value in series.tolist():
+            normalized_value = _normalize_email_value(value)
+            if pd.isna(normalized_value) and invalid_replacement is not None and not _is_effectively_missing_value(value):
+                normalized_value = invalid_replacement
+            normalized_values.append(normalized_value)
         normalized_df[column] = pd.Series(normalized_values, index=series.index, dtype="object")
 
     return normalized_df
@@ -1290,7 +1330,7 @@ def _normalize_phone_columns(
             or pd.api.types.is_numeric_dtype(series)
         ):
             continue
-        if not _is_phone_candidate_column(column_name, series):
+        if not scoped_columns and not _is_phone_candidate_column(column_name, series):
             continue
 
         normalized_values: list[Any] = []
@@ -1333,13 +1373,21 @@ def _canonical_text_variant(values: pd.Series) -> str:
     return str(counts.index[0]) if not counts.empty else str(trimmed_values.iloc[0])
 
 
-def _normalize_text_columns(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_text_columns(
+    df: pd.DataFrame,
+    *,
+    target_columns: set[str] | None = None,
+) -> pd.DataFrame:
     normalized_df = _apply_text_cleaning(df, trim_whitespace=True)
+    scoped_columns = set(target_columns or set())
     for column in normalized_df.columns:
+        column_name = str(column)
+        if scoped_columns and column_name not in scoped_columns:
+            continue
         series = normalized_df[column]
         if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
             continue
-        if not _is_moderate_cardinality_text_column(series):
+        if not scoped_columns and not _is_moderate_cardinality_text_column(series):
             continue
 
         string_series = series.astype("string")
@@ -1384,9 +1432,18 @@ def _format_numeric_value(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else format(float(value), "f").rstrip("0").rstrip(".")
 
 
-def _normalize_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_numeric_columns(
+    df: pd.DataFrame,
+    *,
+    target_columns: set[str] | None = None,
+    invalid_replacement: str | None = None,
+) -> pd.DataFrame:
     normalized_df = df.copy()
+    scoped_columns = set(target_columns or set())
     for column in normalized_df.columns:
+        column_name = str(column)
+        if scoped_columns and column_name not in scoped_columns:
+            continue
         series = normalized_df[column]
         if not (
             pd.api.types.is_object_dtype(series)
@@ -1394,7 +1451,7 @@ def _normalize_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
             or pd.api.types.is_numeric_dtype(series)
         ):
             continue
-        if not _is_numeric_candidate_column(str(column), series):
+        if not scoped_columns and not _is_numeric_candidate_column(column_name, series):
             continue
 
         string_series = series.astype("string")
@@ -1409,6 +1466,9 @@ def _normalize_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
         updated_series = string_series.copy()
         valid_mask = non_empty_mask & parsed.notna()
         updated_series.loc[valid_mask] = formatted.loc[valid_mask]
+        if invalid_replacement is not None:
+            invalid_mask = non_empty_mask & parsed.isna()
+            updated_series.loc[invalid_mask] = invalid_replacement
         normalized_df[column] = updated_series
 
     return normalized_df
@@ -1762,7 +1822,6 @@ def clean_dataframe_chunk(
     active_prompt_type_hint = _normalize_prompt_type_hint(prompt_type_hint) or (
         plan.prompt_type_hint if plan is not None else None
     )
-    normalized_prompt = user_prompt.strip().lower()
     hinted_mode = _resolve_cleaning_mode_from_hint(
         df,
         prompt_type_hint=active_prompt_type_hint,
@@ -1770,7 +1829,12 @@ def clean_dataframe_chunk(
         user_prompt=user_prompt,
     )
     missing_replacement = _extract_missing_value_replacement(user_prompt)
-    generic_replacement = _extract_generic_replacement_token(user_prompt)
+    invalid_value_replacement = _resolve_invalid_value_replacement(
+        user_prompt=user_prompt,
+        prompt_type_hint=active_prompt_type_hint,
+        hinted_mode=hinted_mode,
+    )
+    explicit_generic_replacement = _extract_generic_replacement_token(user_prompt)
     cleaned_df = _apply_text_cleaning(
         df,
         normalize_missing=should_normalize_missing,
@@ -1801,9 +1865,18 @@ def clean_dataframe_chunk(
     if _should_normalize_headers(user_prompt):
         cleaned_df = _normalize_headers(cleaned_df)
     if hinted_mode == "date" or _is_date_only_prompt(user_prompt):
-        cleaned_df = _normalize_date_columns(cleaned_df, user_prompt=user_prompt, target_columns=target_columns)
+        cleaned_df = _normalize_date_columns(
+            cleaned_df,
+            user_prompt=user_prompt,
+            target_columns=target_columns,
+            invalid_replacement=invalid_value_replacement,
+        )
     if hinted_mode == "email" or _is_email_only_prompt(user_prompt):
-        cleaned_df = _normalize_email_columns(cleaned_df, target_columns=target_columns)
+        cleaned_df = _normalize_email_columns(
+            cleaned_df,
+            target_columns=target_columns,
+            invalid_replacement=invalid_value_replacement,
+        )
     if hinted_mode == "age" or _is_age_only_prompt(user_prompt):
         cleaned_df = _normalize_age_columns(cleaned_df, user_prompt=user_prompt, target_columns=target_columns)
     if hinted_mode == "integer_format" or _is_integer_format_only_prompt(user_prompt):
@@ -1813,13 +1886,17 @@ def clean_dataframe_chunk(
             cleaned_df,
             user_prompt=user_prompt,
             target_columns=target_columns,
-            invalid_replacement=generic_replacement if "invalid" in normalized_prompt else None,
+            invalid_replacement=invalid_value_replacement,
             keep_only_valid_rows=_should_keep_only_valid_phone_rows(user_prompt),
         )
     if hinted_mode == "text" or _is_text_normalization_only_prompt(user_prompt):
-        cleaned_df = _normalize_text_columns(cleaned_df)
+        cleaned_df = _normalize_text_columns(cleaned_df, target_columns=target_columns)
     if hinted_mode == "numeric" or _is_numeric_only_prompt(user_prompt):
-        cleaned_df = _normalize_numeric_columns(cleaned_df)
+        cleaned_df = _normalize_numeric_columns(
+            cleaned_df,
+            target_columns=target_columns,
+            invalid_replacement=invalid_value_replacement,
+        )
     if hinted_mode == "duplicate" or prompt_removes_exact_duplicates(user_prompt):
         cleaned_df = (
             _remove_exact_duplicate_rows(cleaned_df, target_columns=target_columns)
@@ -1830,11 +1907,11 @@ def clean_dataframe_chunk(
                 target_columns=target_columns,
             )
         )
-    if generic_replacement and not _is_missing_value_only_prompt(user_prompt):
+    if explicit_generic_replacement and not _is_missing_value_only_prompt(user_prompt):
         cleaned_df = _fill_generated_missing_tokens(
             df,
             cleaned_df,
-            replacement=generic_replacement,
+            replacement=explicit_generic_replacement,
             target_columns=target_columns,
         )
 

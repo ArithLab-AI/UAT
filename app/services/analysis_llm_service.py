@@ -14,6 +14,7 @@ from app.services.analysis_profile_service import (
 )
 from app.services.analysis_suggestion_match_service import (
     SUPPORTED_CLEANING_PROMPT_TYPES,
+    ensure_cleaning_resolution_prompt,
     normalize_cleaning_prompt_type,
 )
 from app.utils.openai_utils import get_openai_client
@@ -36,6 +37,7 @@ ANALYSIS_SYSTEM_PROMPT_TEMPLATE = (
     "Return at most {max_suggestions} unique suggestions. "
     "Each resolution_prompt must be directly reusable as a cleaning instruction. "
     f"cleaning_prompt_type must be one of: {SUPPORTED_CLEANING_PROMPT_TYPE_LIST}. "
+    f"When a suggestion involves invalid values, resolution_prompt must explicitly say how to handle them; prefer replacing unresolved invalid values with '{NULL_OUTPUT_TOKEN}'. "
     "When the issue is localized, explicitly name the affected columns. "
     f"For date normalization prefer the format {DATE_OUTPUT_FORMAT}. "
     f"For missing-value normalization prefer the placeholder token '{NULL_OUTPUT_TOKEN}'."
@@ -116,6 +118,11 @@ def _normalize_suggestion(item: dict[str, Any]) -> DataSuggestion | None:
     cleaning_prompt_type = normalize_cleaning_prompt_type(
         item.get("cleaning_prompt_type"),
         resolution_prompt=resolution_prompt,
+        issue_description=issue_description,
+    )
+    resolution_prompt = ensure_cleaning_resolution_prompt(
+        resolution_prompt,
+        cleaning_prompt_type=cleaning_prompt_type,
         issue_description=issue_description,
     )
 

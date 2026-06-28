@@ -1,6 +1,6 @@
 import re
 
-from app.services.analysis_profile_service import DataSuggestion
+from app.services.analysis_profile_service import NULL_OUTPUT_TOKEN, DataSuggestion
 
 
 SUPPORTED_CLEANING_PROMPT_TYPES = {
@@ -31,6 +31,56 @@ def _normalize_targets(values: list[str] | None) -> set[str]:
         for value in (values or [])
         if isinstance(value, str) and value.strip()
     }
+
+
+def _prompt_mentions_invalid_handling(value: str) -> bool:
+    normalized = _normalize_text(value)
+    if not normalized:
+        return False
+
+    patterns = [
+        r"\breplace\b.{0,80}\binvalid\b",
+        r"\breplace\b.{0,80}\bnot valid\b",
+        r"\breplace\b.{0,80}\bcannot be parsed\b",
+        r"\breplace\b.{0,80}\bevery other value\b",
+        r"\breplace\b.{0,80}\bnon-[a-z]+\b",
+        r"\bremove\b.{0,80}\binvalid\b",
+        r"\bdrop\b.{0,80}\binvalid\b",
+    ]
+    return any(re.search(pattern, normalized) for pattern in patterns)
+
+
+def ensure_cleaning_resolution_prompt(
+    resolution_prompt: str | None,
+    *,
+    cleaning_prompt_type: str | None,
+    issue_description: str | None = None,
+) -> str:
+    prompt = str(resolution_prompt or "").strip()
+    if not prompt:
+        return ""
+
+    normalized_type = normalize_cleaning_prompt_type(
+        cleaning_prompt_type,
+        resolution_prompt=prompt,
+        issue_description=issue_description,
+    )
+    if _prompt_mentions_invalid_handling(prompt):
+        return prompt
+
+    fallback_suffix_by_type = {
+        "phone_normalization": f" Replace invalid phone values with '{NULL_OUTPUT_TOKEN}'.",
+        "email_normalization": f" Replace invalid email values with '{NULL_OUTPUT_TOKEN}'.",
+        "numeric_normalization": (
+            f" Replace values that still cannot be parsed as numbers after removing formatting noise with '{NULL_OUTPUT_TOKEN}'."
+        ),
+        "date_normalization": f" Replace invalid dates with '{NULL_OUTPUT_TOKEN}'.",
+    }
+    fallback_suffix = fallback_suffix_by_type.get(normalized_type)
+    if not fallback_suffix:
+        return prompt
+
+    return f"{prompt.rstrip('.')}." + fallback_suffix
 
 
 def normalize_cleaning_prompt_type(

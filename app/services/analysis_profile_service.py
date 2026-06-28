@@ -18,7 +18,25 @@ MAX_BAD_EXAMPLES = 3
 MAX_SAMPLE_ROWS = 5
 ACCEPTED_PLACEHOLDER_TOKENS = {
     token.strip().lower()
-    for token in {NULL_OUTPUT_TOKEN}
+    for token in {
+        NULL_OUTPUT_TOKEN,
+        "n/a",
+        "na",
+        "null",
+        "none",
+        "-",
+        "--",
+        "",
+        "n.a.",
+        "nil",
+        "missing",
+        "not available",
+        "not provided",
+        "blank",
+        "#n/a",
+        "nan",
+        "tbd",
+    }
     if isinstance(token, str) and token.strip()
 }
 
@@ -125,6 +143,8 @@ def _sanitize_json_value(value: Any) -> Any:
         return [_sanitize_json_value(item) for item in value]
     if isinstance(value, (datetime, date)):
         return value.isoformat()
+    if isinstance(value, str) and value.strip().lower() in ACCEPTED_PLACEHOLDER_TOKENS:
+        return None
     if pd.isna(value):
         return None
     if hasattr(value, "item"):
@@ -150,7 +170,7 @@ def _append_examples(examples: list[str], values: Iterable[Any]) -> None:
         if pd.isna(value):
             continue
         text = str(value).strip()
-        if not text or text in examples:
+        if not text or text.lower() in ACCEPTED_PLACEHOLDER_TOKENS or text in examples:
             continue
         examples.append(text)
         if len(examples) >= MAX_BAD_EXAMPLES:
@@ -894,6 +914,21 @@ def generate_rule_based_suggestions(profile: dict[str, Any], *, max_suggestions:
             )
         )
 
+    email_issue_columns = _columns_with_metric(columns, "invalid_email_percent")
+    for email_targets in _group_column_targets(email_issue_columns):
+        suggestions.append(
+            DataSuggestion(
+                issue_description=f"Email-like column(s) {email_targets} contain invalid values or inconsistent formatting.",
+                priority="High",
+                resolution_prompt=(
+                    f"Only in column(s) {email_targets}, trim whitespace, lowercase valid email values, normalize obvious email formatting noise, "
+                    f"replace invalid email values with '{NULL_OUTPUT_TOKEN}', and leave unrelated columns untouched."
+                ),
+                cleaning_prompt_type="email_normalization",
+                target_columns=[column.strip("'") for column in re.findall(r"'([^']+)'", email_targets)],
+            )
+        )
+
     phone_issue_columns = list(
         dict.fromkeys(
             _columns_with_metric(columns, "invalid_phone_percent", threshold=5.0)
@@ -906,8 +941,8 @@ def generate_rule_based_suggestions(profile: dict[str, Any], *, max_suggestions:
                 issue_description=f"Phone-like column(s) {phone_targets} contain invalid values or inconsistent formatting.",
                 priority="High",
                 resolution_prompt=(
-                    f"Only in column(s) {phone_targets}, standardize phone values into one consistent phone format, "
-                    "remove punctuation noise, preserve country codes when present, keep valid phone-like values, "
+                    f"Only in column(s) {phone_targets}, standardize valid phone values into one consistent phone format, "
+                    f"remove punctuation noise, preserve country codes when present, replace invalid phone values with '{NULL_OUTPUT_TOKEN}', "
                     "and leave unrelated columns untouched."
                 ),
                 cleaning_prompt_type="phone_normalization",
@@ -1067,7 +1102,8 @@ def generate_rule_based_suggestions(profile: dict[str, Any], *, max_suggestions:
                 priority="Medium",
                 resolution_prompt=(
                     f"Only in column(s) {numeric_targets}, remove formatting noise such as currency symbols, spaces, commas, and separators "
-                    "when they are presentation-only, preserve valid numeric values, and leave unrelated non-numeric columns untouched."
+                    f"when they are presentation-only, preserve valid numeric values, replace values that still cannot be parsed as numbers with '{NULL_OUTPUT_TOKEN}', "
+                    "and leave unrelated non-numeric columns untouched."
                 ),
                 cleaning_prompt_type="numeric_normalization",
                 target_columns=[column.strip("'") for column in re.findall(r"'([^']+)'", numeric_targets)],
