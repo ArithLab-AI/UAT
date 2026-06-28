@@ -709,6 +709,7 @@ def run_ai_cleaning(
     dataset_type: str,
     suggestion_id: str,
     source_ai_job_id: str | None = None,
+    custom_prompt: str | None = None,
 ) -> dict[str, Any]:
     _ensure_ai_cleaning_tables()
     reusable_job_record = _get_reusable_ai_job(
@@ -741,6 +742,9 @@ def run_ai_cleaning(
         suggestion_id=suggestion_id,
         source_job_detail=reusable_detail,
     )
+
+    if custom_prompt:
+        resolved_prompt = custom_prompt
 
     with _download_storage_key(source.storage_key, prefix=f"{source.dataset_type}_{source.dataset_id}") as source_path:
         started_at = time.time()

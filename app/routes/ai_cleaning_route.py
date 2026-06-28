@@ -46,6 +46,7 @@ def create_ai_cleaning_job(
         dataset_type=payload.dataset_type,
         suggestion_id=payload.suggestion_id,
         source_ai_job_id=payload.source_ai_job_id,
+        custom_prompt=payload.custom_prompt,
     )
     return success_response(
         "AI cleaning completed successfully",
