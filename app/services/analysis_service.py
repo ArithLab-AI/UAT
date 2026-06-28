@@ -21,6 +21,7 @@ from app.services.ai_cleaning_quality_service import (
     coalesce_priority_clean_quality_score,
 )
 from app.services.analysis_suggestion_match_service import (
+    classify_issue_category,
     normalize_cleaning_prompt_type,
     split_matching_suggestions,
 )
@@ -96,6 +97,70 @@ def _to_suggestion_dict(suggestion: DataSuggestion, *, suggestion_id: str | None
         "cleaning_prompt_type": suggestion.cleaning_prompt_type,
         "target_columns": suggestion.target_columns or [],
     }
+
+
+def _optional_text(value: object) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _normalize_suggestion_category_key(value: str | None) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    category_aliases = {
+        "missing": "missing_values",
+        "duplicate": "duplicate",
+        "date": "date",
+        "email": "email",
+        "phone": "phone",
+        "age": "age",
+        "boolean": "boolean",
+        "integer": "integer",
+        "float": "float",
+        "numeric": "numeric",
+        "text": "text",
+        "schema_type": "schema_type",
+        "formatting": "formatting",
+        "header_type_normalization": "schema_type",
+        "missing_value_normalization": "missing_values",
+        "duplicate_removal": "duplicate",
+        "date_normalization": "date",
+        "phone_normalization": "phone",
+        "email_normalization": "email",
+        "age_normalization": "age",
+        "boolean_validation": "boolean",
+        "integer_validation": "integer",
+        "float_validation": "float",
+        "numeric_normalization": "numeric",
+        "text_normalization": "text",
+    }
+    return category_aliases.get(normalized, normalized or "other")
+
+
+def _resolve_suggestion_category_key(suggestion_payload: dict) -> str:
+    resolution_prompt = _optional_text(suggestion_payload.get("resolution_prompt"))
+    issue_description = _optional_text(suggestion_payload.get("issue_description"))
+    prompt_type = normalize_cleaning_prompt_type(
+        _optional_text(suggestion_payload.get("cleaning_prompt_type")),
+        resolution_prompt=resolution_prompt,
+        issue_description=issue_description,
+    )
+    category = (
+        classify_issue_category(resolution_prompt, prompt_type)
+        or classify_issue_category(issue_description, prompt_type)
+        or prompt_type
+        or "other"
+    )
+    return _normalize_suggestion_category_key(category)
+
+
+def _build_categorized_suggestions(suggestion_payloads: list[dict]) -> dict[str, list[dict]]:
+    categorized_suggestions: dict[str, list[dict]] = {}
+
+    for suggestion_payload in suggestion_payloads:
+        category_key = _resolve_suggestion_category_key(suggestion_payload)
+        categorized_suggestions.setdefault(category_key, []).append(suggestion_payload)
+
+    return categorized_suggestions
 
 
 @contextmanager
@@ -532,6 +597,10 @@ def run_dataset_analysis(
                 dataset_profile=dataset_profile,
                 suggestions=suggestions,
             )
+            suggestion_payloads = [
+                _to_suggestion_dict(suggestion, suggestion_id=suggestion_row.id)
+                for suggestion, suggestion_row in zip(suggestions, suggestion_rows)
+            ]
             return {
                 "analysis_id": analysis.id,
                 "dataset_id": source.dataset_id,
@@ -549,10 +618,7 @@ def run_dataset_analysis(
                 "source_suggestion_resolved": source_suggestion_resolved,
                 "source_suggestion_match_count": source_suggestion_match_count,
                 "quality_score_delta": quality_score_delta,
-                "suggestions": [
-                    _to_suggestion_dict(suggestion, suggestion_id=suggestion_row.id)
-                    for suggestion, suggestion_row in zip(suggestions, suggestion_rows)
-                ],
+                "suggestions": _build_categorized_suggestions(suggestion_payloads),
                 "dataset_profile": dataset_profile,
             }
     else:
@@ -611,6 +677,10 @@ def run_dataset_analysis(
         dataset_profile=dataset_profile,
         suggestions=suggestions,
     )
+    suggestion_payloads = [
+        _to_suggestion_dict(suggestion, suggestion_id=suggestion_row.id)
+        for suggestion, suggestion_row in zip(suggestions, suggestion_rows)
+    ]
     return {
         "analysis_id": analysis.id,
         "dataset_id": source.dataset_id,
@@ -628,10 +698,7 @@ def run_dataset_analysis(
         "source_suggestion_resolved": source_suggestion_resolved,
         "source_suggestion_match_count": source_suggestion_match_count,
         "quality_score_delta": quality_score_delta,
-        "suggestions": [
-            _to_suggestion_dict(suggestion, suggestion_id=suggestion_row.id)
-            for suggestion, suggestion_row in zip(suggestions, suggestion_rows)
-        ],
+        "suggestions": _build_categorized_suggestions(suggestion_payloads),
         "dataset_profile": dataset_profile,
     }
 
@@ -662,6 +729,21 @@ def get_dataset_analysis_suggestions(
         .order_by(AnalysisSuggestion.created_at.asc(), AnalysisSuggestion.id.asc())
         .all()
     )
+    suggestion_payloads = [
+        {
+            "id": suggestion.id,
+            "title": build_suggestion_title(
+                cleaning_prompt_type=suggestion.cleaning_prompt_type,
+                issue_description=suggestion.issue_description,
+            ),
+            "issue_description": suggestion.issue_description,
+            "priority": suggestion.priority,
+            "resolution_prompt": suggestion.resolution_prompt,
+            "cleaning_prompt_type": suggestion.cleaning_prompt_type,
+            "target_columns": suggestion.target_columns or [],
+        }
+        for suggestion in suggestion_rows
+    ]
 
     return {
         "analysis_id": analysis.id,
@@ -675,21 +757,7 @@ def get_dataset_analysis_suggestions(
         "llm_provider": analysis.llm_provider,
         "llm_model": analysis.llm_model,
         "message": analysis.message,
-        "suggestions": [
-            {
-                "id": suggestion.id,
-                "title": build_suggestion_title(
-                    cleaning_prompt_type=suggestion.cleaning_prompt_type,
-                    issue_description=suggestion.issue_description,
-                ),
-                "issue_description": suggestion.issue_description,
-                "priority": suggestion.priority,
-                "resolution_prompt": suggestion.resolution_prompt,
-                "cleaning_prompt_type": suggestion.cleaning_prompt_type,
-                "target_columns": suggestion.target_columns or [],
-            }
-            for suggestion in suggestion_rows
-        ],
+        "suggestions": _build_categorized_suggestions(suggestion_payloads),
     }
 
 

@@ -14,6 +14,7 @@ class AICleaningRunRequest(BaseModel):
                 "dataset_id": 2,
                 "dataset_type": "uploaded",
                 "suggestion_id": "efbe7944-b9d3-4b13-a9b9-023991df3fff",
+                "custom_prompt": "Replace missing values in the Email Address column with 'data@gmail.com'",
             }
         }
     )
@@ -35,8 +36,18 @@ class AICleaningRunRequest(BaseModel):
             "If omitted, the latest AI-cleaned file for the same dataset is reused automatically."
         ),
     )
+    custom_prompt: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=1000,
+        description=(
+            "Optional custom cleaning instruction to override the suggestion's resolution_prompt. "
+            "For example: \"Replace missing values in the Email Address column with 'data@gmail.com'\". "
+            "If omitted, the original resolution_prompt from the suggestion is used."
+        ),
+    )
 
-    @field_validator("suggestion_id", "source_ai_job_id", mode="before")
+    @field_validator("suggestion_id", "source_ai_job_id", "custom_prompt", mode="before")
     @classmethod
     def _normalize_optional_strings(cls, value):
         if value is None:
