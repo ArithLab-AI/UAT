@@ -2019,11 +2019,20 @@ def clean_dataframe_chunk(
     if hinted_mode == "integer_format" or _is_integer_format_only_prompt(user_prompt):
         cleaned_df = _normalize_integer_format_columns(cleaned_df, target_columns=target_columns)
     if hinted_mode == "phone" or _is_phone_only_prompt(user_prompt):
+        # Replace clearly-invalid phone values (e.g. "string_phone") with the standard
+        # null token by default — consistent with the boolean/integer/float/date
+        # validators. Otherwise invalid values survive cleaning and re-analysis keeps
+        # re-flagging the same phone issue, so it never resolves. An explicit token from
+        # the prompt still wins when provided.
+        if "invalid" in normalized_prompt and generic_replacement:
+            phone_invalid_replacement = generic_replacement
+        else:
+            phone_invalid_replacement = NULL_OUTPUT_TOKEN
         cleaned_df = _normalize_phone_columns(
             cleaned_df,
             user_prompt=user_prompt,
             target_columns=target_columns,
-            invalid_replacement=generic_replacement if "invalid" in normalized_prompt else None,
+            invalid_replacement=phone_invalid_replacement,
             keep_only_valid_rows=_should_keep_only_valid_phone_rows(user_prompt),
         )
     if hinted_mode == "text" or _is_text_normalization_only_prompt(user_prompt):
