@@ -55,6 +55,7 @@ from app.services.temporary_upload_service import (
     delete_temporary_upload,
     validate_temporary_upload,
 )
+from app.utils.object_storage import get_object_storage_service
 from app.utils.responses import error_response, success_response
 
 UPLOAD_MULTIPLE_OPENAPI = {
@@ -116,6 +117,16 @@ def _normalize_sort_timestamp(value: datetime | None) -> float:
     return value.timestamp()
 
 
+def _clean_file_url(clean_state: dict) -> str | None:
+    """Return the cleaned file as a presigned, directly-downloadable HTTPS URL.
+
+    Falls back to the raw ``s3://`` URI if signing is unavailable (e.g. storage off)."""
+    raw_url = clean_state.get("clean_file_url")
+    if not raw_url:
+        return None
+    return get_object_storage_service().presigned_download_url(raw_url) or raw_url
+
+
 def _serialize_uploaded_dataset(uploaded_dataset, clean_state=None):
     clean_state = clean_state or {}
     return {
@@ -127,7 +138,7 @@ def _serialize_uploaded_dataset(uploaded_dataset, clean_state=None):
         "storage_key": uploaded_dataset.storage_key,
         "file_url": uploaded_dataset.file_url,
         "is_clean": bool(clean_state.get("is_clean", False)),
-        "clean_file_url": clean_state.get("clean_file_url"),
+        "clean_file_url": _clean_file_url(clean_state),
         "file_size": uploaded_dataset.file_size,
         "total_rows": uploaded_dataset.total_rows,
         "columns": uploaded_dataset.columns,
@@ -167,7 +178,7 @@ def _serialize_merged_dataset(merged_dataset, source_dataset_map=None, clean_sta
         "storage_key": merged_dataset.storage_key,
         "file_url": merged_dataset.file_url,
         "is_clean": bool(clean_state.get("is_clean", False)),
-        "clean_file_url": clean_state.get("clean_file_url"),
+        "clean_file_url": _clean_file_url(clean_state),
         "file_size": merged_dataset.file_size,
         "total_rows": merged_dataset.total_rows,
         "columns": merged_dataset.columns,
