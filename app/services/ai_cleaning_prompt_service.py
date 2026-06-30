@@ -207,6 +207,8 @@ def prompt_has_deterministic_cleaning_steps(user_prompt: str) -> bool:
     ]
     return (
         _should_normalize_headers(user_prompt)
+        or prompt_requests_numeric_imputation(user_prompt)
+        or prompt_requests_mode_imputation(user_prompt)
         or _prompt_mentions_missing_values(user_prompt)
         or _should_trim_whitespace(user_prompt)
         or prompt_removes_exact_duplicates(user_prompt)
@@ -426,8 +428,60 @@ def _is_type_validation_only_prompt(user_prompt: str) -> bool:
     )
 
 
+def prompt_requests_numeric_imputation(user_prompt: str) -> bool:
+    """Detect a request to fill missing numeric cells with a central statistic
+    (mean / median / average) rather than a fixed placeholder token."""
+    normalized_prompt = user_prompt.strip().lower()
+    has_fill_action = any(term in normalized_prompt for term in ("fill", "impute", "imputation"))
+    has_statistic = any(term in normalized_prompt for term in ("mean", "median", "average"))
+    return has_fill_action and has_statistic
+
+
+def _is_numeric_imputation_only_prompt(user_prompt: str) -> bool:
+    return prompt_requests_numeric_imputation(user_prompt)
+
+
+def numeric_imputation_strategy(user_prompt: str) -> str:
+    """Decide which statistic the numeric-imputation fill should use.
+
+    - "mean"   : prompt asks only for mean/average
+    - "median" : prompt asks only for median
+    - "smart"  : prompt mentions both (default), float -> mean, integer -> rounded median
+    """
+    normalized_prompt = user_prompt.strip().lower()
+    wants_mean = "mean" in normalized_prompt or "average" in normalized_prompt
+    wants_median = "median" in normalized_prompt
+    if wants_median and not wants_mean:
+        return "median"
+    if wants_mean and not wants_median:
+        return "mean"
+    return "smart"
+
+
+def prompt_requests_mode_imputation(user_prompt: str) -> bool:
+    """Detect a request to fill missing cells with the column's most frequent
+    (mode / highest-frequency) existing value."""
+    normalized_prompt = user_prompt.strip().lower()
+    has_fill_action = any(term in normalized_prompt for term in ("fill", "impute", "imputation", "replace"))
+    has_mode_term = any(
+        term in normalized_prompt
+        for term in ("most frequent", "most common", "highest frequency", "max frequency", "modal value", "mode value")
+    )
+    return has_fill_action and has_mode_term
+
+
+def _is_mode_imputation_only_prompt(user_prompt: str) -> bool:
+    return prompt_requests_mode_imputation(user_prompt)
+
+
+def _prompt_requests_any_imputation(user_prompt: str) -> bool:
+    return prompt_requests_numeric_imputation(user_prompt) or prompt_requests_mode_imputation(user_prompt)
+
+
 def _is_missing_value_only_prompt(user_prompt: str) -> bool:
     normalized_prompt = user_prompt.strip().lower()
+    if _prompt_requests_any_imputation(user_prompt):
+        return False
     missing_terms = ["missing", "null", "blank", "empty", "n/a", "placeholder"]
     return any(term in normalized_prompt for term in missing_terms) and not _has_semantic_value_cleaning_terms(
         normalized_prompt
@@ -436,6 +490,8 @@ def _is_missing_value_only_prompt(user_prompt: str) -> bool:
 
 def _is_date_only_prompt(user_prompt: str) -> bool:
     normalized_prompt = user_prompt.strip().lower()
+    if prompt_requests_mode_imputation(user_prompt):
+        return False
     return _prompt_requests_date_normalization(normalized_prompt) and not _has_semantic_value_cleaning_terms(
         normalized_prompt
     )
@@ -558,6 +614,8 @@ def _is_duplicate_only_prompt(user_prompt: str) -> bool:
 def _requires_ai_cleaning(user_prompt: str) -> bool:
     deterministic_only = (
         _is_duplicate_only_prompt(user_prompt)
+        or _is_numeric_imputation_only_prompt(user_prompt)
+        or _is_mode_imputation_only_prompt(user_prompt)
         or _is_missing_value_only_prompt(user_prompt)
         or _is_date_only_prompt(user_prompt)
         or _is_email_only_prompt(user_prompt)
@@ -1006,6 +1064,139 @@ def _replace_missing_values(
     return normalized_df
 
 
+def _missing_value_mask(series: pd.Series) -> pd.Series:
+    string_series = series.astype("string")
+    stripped_series = string_series.str.strip()
+    return series.isna() | stripped_series.eq("") | stripped_series.str.lower().isin(_DEFAULT_NULL_TOKENS)
+
+
+def accumulate_numeric_imputation_stats(
+    df: pd.DataFrame,
+    target_columns: set[str] | None,
+    accumulator: dict[str, dict[str, Any]],
+) -> None:
+    """Collect each target numeric column's non-missing values across chunks.
+
+    Mean/median must be computed over the whole column, but cleaning runs
+    chunk-by-chunk, so values are accumulated here and finalized once at the end.
+    """
+    scoped_columns = {str(column) for column in (target_columns or set())}
+    for column in df.columns:
+        column_name = str(column)
+        if scoped_columns and column_name not in scoped_columns:
+            continue
+
+        series = df[column]
+        present_values = series[~_missing_value_mask(series)]
+        bucket = accumulator.setdefault(column_name, {"values": [], "all_integer": True})
+        for value in present_values.tolist():
+            parsed = _parse_float_value(value)
+            if parsed is None:
+                continue
+            number = float(parsed)
+            bucket["values"].append(number)
+            if not number.is_integer():
+                bucket["all_integer"] = False
+
+
+def finalize_numeric_imputation_values(
+    accumulator: dict[str, dict[str, Any]], *, strategy: str = "smart"
+) -> dict[str, Any]:
+    """Reduce accumulated values to one fill value per column.
+
+    - "smart"  (default): float columns use the mean, integer columns use the median.
+    - "mean"            : every column uses the mean (average).
+    - "median"          : every column uses the median.
+
+    Either way, integer (whole-number) columns round to a clean integer; float columns
+    keep two decimals.
+    """
+    fill_values: dict[str, Any] = {}
+    for column_name, bucket in accumulator.items():
+        values = bucket.get("values") or []
+        if not values:
+            continue
+        numeric_series = pd.Series(values, dtype="float64")
+        is_integer_column = bool(bucket.get("all_integer"))
+
+        if strategy == "mean":
+            statistic = float(numeric_series.mean())
+        elif strategy == "median":
+            statistic = float(numeric_series.median())
+        else:  # smart
+            statistic = float(numeric_series.median()) if is_integer_column else float(numeric_series.mean())
+
+        fill_values[column_name] = int(round(statistic)) if is_integer_column else round(statistic, 2)
+    return fill_values
+
+
+def accumulate_mode_imputation_stats(
+    df: pd.DataFrame,
+    target_columns: set[str] | None,
+    accumulator: dict[str, dict[str, int]],
+) -> None:
+    """Count each target column's existing (non-missing) values across chunks so
+    the most frequent value (mode) can be picked once the whole file is scanned."""
+    scoped_columns = {str(column) for column in (target_columns or set())}
+    for column in df.columns:
+        column_name = str(column)
+        if scoped_columns and column_name not in scoped_columns:
+            continue
+
+        series = df[column]
+        present_values = series[~_missing_value_mask(series)]
+        counts = accumulator.setdefault(column_name, {})
+        for value in present_values.astype("string").str.strip().tolist():
+            if value is None or value == "":
+                continue
+            counts[value] = counts.get(value, 0) + 1
+
+
+def finalize_mode_imputation_values(accumulator: dict[str, dict[str, int]]) -> dict[str, Any]:
+    """Pick the most frequent value per column. Ties break on the value itself so
+    the result is deterministic across runs."""
+    fill_values: dict[str, Any] = {}
+    for column_name, counts in accumulator.items():
+        if not counts:
+            continue
+        most_frequent_value = max(sorted(counts.items()), key=lambda item: item[1])[0]
+        fill_values[column_name] = most_frequent_value
+    return fill_values
+
+
+def _apply_imputation_values(
+    df: pd.DataFrame,
+    *,
+    target_columns: set[str] | None,
+    imputation_values: dict[str, Any] | None,
+) -> pd.DataFrame:
+    """Fill missing/blank/placeholder cells with a precomputed per-column value.
+
+    Strategy-agnostic: the value may be a numeric mean/median or a mode (most
+    frequent) value computed earlier in a whole-file pre-pass.
+    """
+    if not imputation_values:
+        return df
+
+    cleaned_df = df.copy()
+    scoped_columns = {str(column) for column in (target_columns or set())}
+    for column in cleaned_df.columns:
+        column_name = str(column)
+        if scoped_columns and column_name not in scoped_columns:
+            continue
+        if column_name not in imputation_values:
+            continue
+
+        series = cleaned_df[column]
+        missing_mask = _missing_value_mask(series)
+        if missing_mask.any():
+            updated_series = series.astype("object")
+            updated_series.loc[missing_mask] = imputation_values[column_name]
+            cleaned_df[column] = updated_series
+
+    return cleaned_df
+
+
 def _is_effectively_missing_value(value: Any) -> bool:
     if pd.isna(value):
         return True
@@ -1290,7 +1481,11 @@ def _normalize_phone_columns(
             or pd.api.types.is_numeric_dtype(series)
         ):
             continue
-        if not _is_phone_candidate_column(column_name, series):
+        # When the column is explicitly targeted (e.g. from a suggestion's target_columns),
+        # honour it directly instead of second-guessing with the candidate heuristic — a
+        # heavily formatted or partly-invalid phone column could otherwise be skipped and
+        # left uncleaned. The heuristic still gates auto-detection when nothing is targeted.
+        if not scoped_columns and not _is_phone_candidate_column(column_name, series):
             continue
 
         normalized_values: list[Any] = []
@@ -1496,6 +1691,8 @@ def _resolve_cleaning_mode_from_hint(
         "missing_value_normalization": "missing",
         "missing_value_replacement": "missing",
         "missing_value_imputation": "missing",
+        "numeric_missing_imputation": "numeric_imputation",
+        "date_missing_imputation": "mode_imputation",
         "date_normalization": "date",
         "date_format_normalization": "date",
         "email_normalization": "email",
@@ -1755,8 +1952,11 @@ def clean_dataframe_chunk(
     target_columns_hint: list[str] | None = None,
     seen_row_hashes: set[int] | None = None,
     ai_row_cache: dict[Any, Any] | None = None,
+    imputation_values: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
-    should_normalize_missing = _prompt_mentions_missing_values(user_prompt)
+    should_normalize_missing = _prompt_mentions_missing_values(user_prompt) and not _prompt_requests_any_imputation(
+        user_prompt
+    )
     should_trim_whitespace = _should_trim_whitespace(user_prompt)
     target_columns = set(target_columns_hint or []) | _extract_target_columns_from_prompt([str(column) for column in df.columns], user_prompt)
     active_prompt_type_hint = _normalize_prompt_type_hint(prompt_type_hint) or (
@@ -1778,7 +1978,17 @@ def clean_dataframe_chunk(
         target_columns=target_columns,
         preserve_missing_literals={missing_replacement or NULL_OUTPUT_TOKEN},
     )
-    if hinted_mode == "missing" or _is_missing_value_only_prompt(user_prompt):
+    if (
+        hinted_mode in {"numeric_imputation", "mode_imputation"}
+        or _is_numeric_imputation_only_prompt(user_prompt)
+        or _is_mode_imputation_only_prompt(user_prompt)
+    ):
+        cleaned_df = _apply_imputation_values(
+            cleaned_df,
+            target_columns=target_columns,
+            imputation_values=imputation_values,
+        )
+    elif hinted_mode == "missing" or _is_missing_value_only_prompt(user_prompt):
         cleaned_df = _replace_missing_values(
             cleaned_df,
             replacement=missing_replacement or NULL_OUTPUT_TOKEN,

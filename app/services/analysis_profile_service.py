@@ -86,6 +86,21 @@ AGE_NUMBER_WORDS = {
 }
 BOOLEAN_TRUE_VALUES = {"true", "1"}
 BOOLEAN_FALSE_VALUES = {"false", "0"}
+# A boolean column-name hint (e.g. "flag", "status flag") is only honoured when the
+# actual data backs it up. This stops categorical columns such as "Status Flag" with
+# values like "Active"/"Inactive" from being mislabelled as boolean purely by name.
+BOOLEAN_NAME_HINT_MIN_RATIO = 0.5
+# Likewise, a date column-name hint (e.g. "date", "time", "birth") is only honoured
+# when some of the data actually parses as dates. This stops columns like "Update Note"
+# or "Birth Place" (text) from being mislabelled as date purely by name.
+DATE_NAME_HINT_MIN_RATIO = 0.3
+# Same idea for numeric types. A name hint (incl. substring matches like "count" inside
+# "Discount", or "rate"/"score") is only honoured when the data actually parses as that
+# type. This stops a percentage column "Discount" ("10%", "20%") from being forced to
+# float and reported as 100% "Invalid Float Values"; instead it falls through to numeric
+# normalization, which strips the "%".
+INTEGER_NAME_HINT_MIN_RATIO = 0.3
+FLOAT_NAME_HINT_MIN_RATIO = 0.3
 
 
 @dataclass
@@ -421,13 +436,15 @@ def _infer_expected_validation_type(column_name: str, stats: dict[str, Any], non
     float_ratio = float(stats["float_valid_count"]) / non_null_count
     date_ratio = float(stats["date_valid_count"]) / non_null_count
 
-    if _is_boolean_column_name(column_name) or boolean_ratio >= 0.6:
+    if boolean_ratio >= 0.6 or (_is_boolean_column_name(column_name) and boolean_ratio >= BOOLEAN_NAME_HINT_MIN_RATIO):
         return "boolean"
-    if _candidate_by_name(normalized_name, DATE_COLUMN_HINTS) or date_ratio >= 0.6:
+    if date_ratio >= 0.6 or (_candidate_by_name(normalized_name, DATE_COLUMN_HINTS) and date_ratio >= DATE_NAME_HINT_MIN_RATIO):
         return "date"
-    if _is_age_column_name(column_name) or _is_integer_column_name(column_name) or integer_ratio >= 0.6:
+    has_integer_name_hint = _is_age_column_name(column_name) or _is_integer_column_name(column_name)
+    if integer_ratio >= 0.6 or (has_integer_name_hint and integer_ratio >= INTEGER_NAME_HINT_MIN_RATIO):
         return "integer"
-    if _is_float_column_name(column_name) or _candidate_by_name(normalized_name, NUMERIC_COLUMN_HINTS) or float_ratio >= 0.6:
+    has_float_name_hint = _is_float_column_name(column_name) or _candidate_by_name(normalized_name, NUMERIC_COLUMN_HINTS)
+    if float_ratio >= 0.6 or (has_float_name_hint and float_ratio >= FLOAT_NAME_HINT_MIN_RATIO):
         return "float"
     return "string"
 
@@ -874,6 +891,90 @@ def _group_column_targets(column_names: list[str], *, group_size: int = 4) -> li
     ]
 
 
+NUMERIC_IMPUTATION_PROMPT_TYPE = "numeric_missing_imputation"
+
+
+def build_numeric_imputation_suggestions(
+    profile: dict[str, Any], *, threshold: float = 0.0
+) -> list[DataSuggestion]:
+    """Suggest filling empty cells of numeric columns with the column's average (mean).
+
+    Selection is data-driven: only columns whose inferred ``expected_type`` is
+    numeric AND that actually contain missing values (``null_percent`` above the
+    threshold) are proposed. Non-numeric columns are intentionally excluded.
+    """
+    columns = profile.get("columns", [])
+    impute_columns = [
+        str(column.get("name"))
+        for column in columns
+        if str(column.get("name", "")).strip()
+        and str(column.get("expected_type", "")) in {"integer", "float"}
+        and float(column.get("null_percent", 0.0)) > threshold
+    ]
+
+    suggestions: list[DataSuggestion] = []
+    for impute_targets in _group_column_targets(impute_columns):
+        suggestions.append(
+            DataSuggestion(
+                issue_description=(
+                    f"Numeric column(s) {impute_targets} have empty or missing values "
+                    "that can be filled with the column average."
+                ),
+                priority="Medium",
+                resolution_prompt=(
+                    f"In column(s) {impute_targets}, fill every empty, blank, or missing cell with the "
+                    "average (mean) of that column's existing values. Keep all other values and columns unchanged."
+                ),
+                cleaning_prompt_type=NUMERIC_IMPUTATION_PROMPT_TYPE,
+                target_columns=[column.strip("'") for column in re.findall(r"'([^']+)'", impute_targets)],
+            )
+        )
+    return suggestions
+
+
+DATE_IMPUTATION_PROMPT_TYPE = "date_missing_imputation"
+
+
+def build_date_imputation_suggestions(
+    profile: dict[str, Any], *, threshold: float = 0.0
+) -> list[DataSuggestion]:
+    """Suggest filling empty cells of date/datetime columns with the column's most
+    frequent (mode) value.
+
+    Selection is data-driven: only columns whose inferred ``expected_type`` is
+    ``date`` AND that actually contain missing values (``null_percent`` above the
+    threshold) are proposed.
+    """
+    columns = profile.get("columns", [])
+    impute_columns = [
+        str(column.get("name"))
+        for column in columns
+        if str(column.get("name", "")).strip()
+        and str(column.get("expected_type", "")) == "date"
+        and float(column.get("null_percent", 0.0)) > threshold
+    ]
+
+    suggestions: list[DataSuggestion] = []
+    for impute_targets in _group_column_targets(impute_columns):
+        suggestions.append(
+            DataSuggestion(
+                issue_description=(
+                    f"Date/datetime column(s) {impute_targets} contain empty or missing values "
+                    "that can be imputed using the column's existing data."
+                ),
+                priority="Medium",
+                resolution_prompt=(
+                    f"Only in column(s) {impute_targets}, fill empty, blank, or missing cells with the most "
+                    "frequent (mode) value already present in that same column. Leave already-present values "
+                    "and all unrelated columns unchanged."
+                ),
+                cleaning_prompt_type=DATE_IMPUTATION_PROMPT_TYPE,
+                target_columns=[column.strip("'") for column in re.findall(r"'([^']+)'", impute_targets)],
+            )
+        )
+    return suggestions
+
+
 def generate_rule_based_suggestions(profile: dict[str, Any], *, max_suggestions: int = 10) -> list[DataSuggestion]:
     suggestions: list[DataSuggestion] = []
     columns = profile.get("columns", [])
@@ -1073,5 +1174,8 @@ def generate_rule_based_suggestions(profile: dict[str, Any], *, max_suggestions:
                 target_columns=[column.strip("'") for column in re.findall(r"'([^']+)'", numeric_targets)],
             )
         )
+
+    suggestions.extend(build_numeric_imputation_suggestions(profile))
+    suggestions.extend(build_date_imputation_suggestions(profile))
 
     return suggestions[:max(1, max_suggestions)]

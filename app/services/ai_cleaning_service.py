@@ -24,12 +24,19 @@ from app.models.csv_dataset_models import CsvMergedDataset, CsvUploadedDataset
 from app.services.analysis_actionable_suggestion_service import filter_actionable_suggestions
 from app.services.ai_cleaning_prompt_service import (
     AICleaningPlan,
+    accumulate_mode_imputation_stats,
+    accumulate_numeric_imputation_stats,
     build_cleaning_chain,
     clean_dataframe_chunk,
     cleaning_strategy_uses_llm,
+    finalize_mode_imputation_values,
+    finalize_numeric_imputation_values,
     plan_ai_cleaning,
+    numeric_imputation_strategy,
     prompt_has_deterministic_cleaning_steps,
     prompt_removes_exact_duplicates,
+    prompt_requests_mode_imputation,
+    prompt_requests_numeric_imputation,
 )
 from app.services.ai_cleaning_quality_service import (
     cap_quality_score_by_suggestions,
@@ -559,6 +566,42 @@ def _build_cleaning_result(
     effective_chunksize = settings.CHUNK_SIZE if requires_ai_cleaning else max(settings.CHUNK_SIZE, settings.CHUNK_SIZE * 10)
     output_filename = f"ai_cleaned_{Path(source_file_name).stem}.csv"
 
+    # Mean/median imputation needs whole-column statistics, but cleaning runs
+    # chunk-by-chunk. Pre-pass the file once to compute each numeric column's fill
+    # value, then hand it to every chunk so missing cells are filled consistently.
+    imputation_values: dict[str, Any] | None = None
+    normalized_prompt_type = normalize_cleaning_prompt_type(prompt_type_hint) if prompt_type_hint else None
+    wants_numeric_imputation = (
+        prompt_requests_numeric_imputation(prompt) or normalized_prompt_type == "numeric_missing_imputation"
+    )
+    wants_mode_imputation = (
+        prompt_requests_mode_imputation(prompt) or normalized_prompt_type == "date_missing_imputation"
+    )
+    if wants_numeric_imputation or wants_mode_imputation:
+        imputation_targets = set(cleaning_plan.target_columns or [])
+        numeric_accumulator: dict[str, Any] = {}
+        mode_accumulator: dict[str, Any] = {}
+        for impute_chunk_df in _parse_csv_iter(
+            source_path,
+            chunksize=effective_chunksize,
+            preserve_placeholders=preserve_placeholders,
+        ):
+            if wants_numeric_imputation:
+                accumulate_numeric_imputation_stats(impute_chunk_df, imputation_targets, numeric_accumulator)
+            if wants_mode_imputation:
+                accumulate_mode_imputation_stats(impute_chunk_df, imputation_targets, mode_accumulator)
+        imputation_values = {}
+        if wants_numeric_imputation:
+            imputation_values.update(
+                finalize_numeric_imputation_values(
+                    numeric_accumulator, strategy=numeric_imputation_strategy(prompt)
+                )
+            )
+        if wants_mode_imputation:
+            # Numeric mean/median wins if a column somehow qualifies for both.
+            for column_name, fill_value in finalize_mode_imputation_values(mode_accumulator).items():
+                imputation_values.setdefault(column_name, fill_value)
+
     fd, output_path = tempfile.mkstemp(prefix=f"{job_id}_cleaned_", suffix=".csv")
     os.close(fd)
 
@@ -581,6 +624,7 @@ def _build_cleaning_result(
                     target_columns_hint=target_columns_hint,
                     seen_row_hashes=seen_row_hashes,
                     ai_row_cache=ai_row_cache,
+                    imputation_values=imputation_values,
                 )
                 if columns_after == 0:
                     columns_after = len(cleaned_chunk.columns)
@@ -608,6 +652,7 @@ def _build_cleaning_result(
                     target_columns_hint=target_columns_hint,
                     seen_row_hashes=seen_row_hashes,
                     ai_row_cache=ai_row_cache,
+                    imputation_values=imputation_values,
                 )
                 empty_df.to_csv(output_file, header=True, index=False)
                 columns_before = len(empty_df.columns)
