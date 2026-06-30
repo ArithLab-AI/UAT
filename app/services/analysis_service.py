@@ -4,7 +4,7 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Iterable
+from typing import Any, Iterable
 
 import pandas as pd
 from sqlalchemy.orm import Session
@@ -30,6 +30,8 @@ from app.services.analysis_llm_service import generate_llm_suggestions
 from app.services.analysis_profile_service import (
     DataSuggestion,
     build_dataset_profile_from_chunks,
+    build_date_imputation_suggestions,
+    build_numeric_imputation_suggestions,
     compute_quality_score,
     generate_rule_based_suggestions,
 )
@@ -432,6 +434,40 @@ def _persist_analysis_result(
     return analysis, suggestion_rows
 
 
+_IMPUTATION_PROMPT_TYPES = {"numeric_missing_imputation", "date_missing_imputation"}
+
+
+def _merge_imputation_suggestions(
+    suggestions: list[DataSuggestion],
+    profile: dict[str, Any],
+) -> list[DataSuggestion]:
+    """Always surface deterministic imputation suggestions: numeric mean/median fill
+    and date/datetime most-frequent (mode) fill.
+
+    These are appended regardless of whether suggestions came from the LLM or the
+    rule-based generator, so the fill options are offered consistently. Suggestions
+    already covering the same columns with the same fill type are skipped to avoid
+    duplicates.
+    """
+    imputation_suggestions = build_numeric_imputation_suggestions(profile) + build_date_imputation_suggestions(profile)
+    if not imputation_suggestions:
+        return suggestions
+
+    covered_keys = {
+        (suggestion.cleaning_prompt_type or "", frozenset(suggestion.target_columns or []))
+        for suggestion in suggestions
+        if (suggestion.cleaning_prompt_type or "") in _IMPUTATION_PROMPT_TYPES
+    }
+    merged = list(suggestions)
+    for suggestion in imputation_suggestions:
+        key = (suggestion.cleaning_prompt_type or "", frozenset(suggestion.target_columns or []))
+        if key in covered_keys:
+            continue
+        covered_keys.add(key)
+        merged.append(suggestion)
+    return merged
+
+
 def run_dataset_analysis(
     db: Session,
     *,
@@ -625,6 +661,7 @@ def run_dataset_analysis(
         suggestions = generate_rule_based_suggestions(enriched_profile)
 
     suggestions = filter_actionable_suggestions(dataset_profile, suggestions)
+    suggestions = _merge_imputation_suggestions(suggestions, enriched_profile)
 
     (
         source_suggestion_id,

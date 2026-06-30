@@ -4,12 +4,14 @@ import re
 _TITLE_BY_PROMPT_TYPE = {
     "age_normalization": "Invalid Age Values",
     "boolean_validation": "Invalid Boolean Values",
+    "date_missing_imputation": "Date Missing Values (Most Frequent Fill)",
     "date_normalization": "Date Format Issues",
     "duplicate_removal": "Duplicate Rows",
     "float_validation": "Invalid Float Values",
     "header_type_normalization": "Column Type Mismatch",
     "integer_validation": "Invalid Integer Values",
     "missing_value_normalization": "Missing Values",
+    "numeric_missing_imputation": "Numeric Missing Values (Mean/Median Fill)",
     "numeric_normalization": "Numeric Formatting Issues",
     "phone_normalization": "Phone Format Issues",
     "text_normalization": "Text Formatting Issues",
@@ -17,6 +19,8 @@ _TITLE_BY_PROMPT_TYPE = {
 
 _TITLE_BY_KEYWORD = (
     ("duplicate", "Duplicate Rows"),
+    ("most frequent", "Date Missing Values (Most Frequent Fill)"),
+    ("impute", "Numeric Missing Values (Mean/Median Fill)"),
     ("missing", "Missing Values"),
     ("blank", "Missing Values"),
     ("placeholder", "Missing Values"),
