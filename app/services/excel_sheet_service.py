@@ -16,7 +16,7 @@ from app.services.temporary_upload_service import TemporaryUpload
 from app.utils.responses import error_response
 
 EXCEL_EXTENSIONS = {".xlsx", ".xls"}
-MAX_EXCEL_SHEET_ROWS = 100_000
+MAX_EXCEL_SHEET_ROWS = 600_000
 
 
 def _is_excel_file(file_name: str) -> bool:

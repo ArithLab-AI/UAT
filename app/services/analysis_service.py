@@ -2,7 +2,7 @@ import logging
 import os
 import tempfile
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Any, Iterable
 
@@ -106,6 +106,10 @@ def _optional_text(value: object) -> str | None:
     return text or None
 
 
+def _normalize_column_name(value: object) -> str:
+    return str(value or "").strip().lower()
+
+
 def _normalize_suggestion_category_key(value: str | None) -> str:
     normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
     category_aliases = {
@@ -163,6 +167,105 @@ def _build_categorized_suggestions(suggestion_payloads: list[dict]) -> dict[str,
         categorized_suggestions.setdefault(category_key, []).append(suggestion_payload)
 
     return categorized_suggestions
+
+
+# Categories that must never be surfaced as cleaning suggestions.
+# email / phone: sensitive columns whose data must not be altered — only "missing"
+#   detection is allowed on them (handled implicitly since we keep the missing category).
+# date: date-format normalization is suppressed (date_imputation is kept).
+_SUPPRESSED_SUGGESTION_CATEGORIES = {"email", "phone", "date"}
+
+
+def _suggestion_issue_category(suggestion: DataSuggestion) -> str:
+    resolution_prompt = _optional_text(suggestion.resolution_prompt)
+    issue_description = _optional_text(suggestion.issue_description)
+    prompt_type = normalize_cleaning_prompt_type(
+        _optional_text(suggestion.cleaning_prompt_type),
+        resolution_prompt=resolution_prompt,
+        issue_description=issue_description,
+    )
+    return (
+        classify_issue_category(resolution_prompt, prompt_type)
+        or classify_issue_category(issue_description, prompt_type)
+        or prompt_type
+        or "other"
+    )
+
+
+def _apply_suggestion_output_policies(
+    suggestions: list[DataSuggestion],
+) -> list[DataSuggestion]:
+    """Enforce suggestion visibility rules just before persistence/output.
+
+    1. Drop ``email`` and ``phone`` suggestions so sensitive column data is never
+       altered (missing-value suggestions on those columns are still allowed).
+    2. Drop ``date`` format-normalization suggestions (``date_imputation`` is kept).
+    3. Remove columns already covered by a numeric-imputation suggestion from any
+       ``missing`` suggestion so the same numeric columns are not surfaced twice.
+    4. Deduplicate within each category. Two suggestions of the same category that
+       touch the same column are redundant (same kind of fix on the same data),
+       even if their wording differs or their column groupings only overlap. Each
+       column is kept by the first suggestion of that category; later suggestions
+       lose the already-claimed columns and are dropped once nothing is left.
+       Column-less category suggestions (e.g. duplicate-row removal) are kept once.
+    """
+    categories = [_suggestion_issue_category(suggestion) for suggestion in suggestions]
+
+    numeric_imputation_columns = {
+        _normalize_column_name(column)
+        for suggestion, category in zip(suggestions, categories)
+        if category == "numeric_imputation"
+        for column in (suggestion.target_columns or [])
+        if _normalize_column_name(column)
+    }
+
+    claimed_columns_by_category: dict[str, set[str]] = {}
+    seen_columnless_categories: set[str] = set()
+
+    filtered: list[DataSuggestion] = []
+    for suggestion, category in zip(suggestions, categories):
+        if category in _SUPPRESSED_SUGGESTION_CATEGORIES:
+            continue
+
+        original_columns = suggestion.target_columns or []
+        working_columns = list(original_columns)
+
+        # Cross-category rule: numeric-imputation columns must not reappear as
+        # generic missing-value suggestions.
+        if category == "missing" and numeric_imputation_columns:
+            working_columns = [
+                column
+                for column in working_columns
+                if _normalize_column_name(column) not in numeric_imputation_columns
+            ]
+            if original_columns and not working_columns:
+                continue
+
+        # Column-less suggestions (e.g. duplicate-row removal): keep one per category.
+        if not original_columns:
+            if category in seen_columnless_categories:
+                continue
+            seen_columnless_categories.add(category)
+            filtered.append(suggestion)
+            continue
+
+        # Within-category dedup: drop columns already claimed by an earlier
+        # suggestion of the same category (catches exact and overlapping duplicates).
+        claimed_columns = claimed_columns_by_category.setdefault(category, set())
+        remaining_columns = [
+            column
+            for column in working_columns
+            if _normalize_column_name(column) not in claimed_columns
+        ]
+        if not remaining_columns:
+            continue
+        claimed_columns.update(_normalize_column_name(column) for column in remaining_columns)
+
+        if remaining_columns != original_columns:
+            suggestion = replace(suggestion, target_columns=remaining_columns)
+        filtered.append(suggestion)
+
+    return filtered
 
 
 @contextmanager
@@ -620,6 +723,7 @@ def run_dataset_analysis(
                     else f"Selected cleaned suggestion still has {source_suggestion_match_count} matching issue(s) in cleaned analysis."
                 )
                 message = f"{message} {verification_note}"
+            suggestions = _apply_suggestion_output_policies(suggestions)
             analysis, suggestion_rows = _persist_analysis_result(
                 db,
                 current_user=current_user,
@@ -701,6 +805,7 @@ def run_dataset_analysis(
             else f"Selected cleaned suggestion still has {source_suggestion_match_count} matching issue(s) in cleaned analysis."
         )
         message = f"{message} {verification_note}"
+    suggestions = _apply_suggestion_output_policies(suggestions)
     analysis, suggestion_rows = _persist_analysis_result(
         db,
         current_user=current_user,

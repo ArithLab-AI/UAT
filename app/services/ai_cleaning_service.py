@@ -953,6 +953,509 @@ def run_ai_cleaning(
             raise
 
 
+@dataclass(frozen=True)
+class _BatchCleaningStep:
+    suggestion_id: str
+    prompt: str
+    priority: str | None
+    prompt_type: str | None
+    target_columns: tuple[str, ...]
+
+
+_PRIORITY_ORDER = {"high": 3, "medium": 2, "low": 1}
+
+
+def _highest_priority(priorities: list[str | None]) -> str | None:
+    best: str | None = None
+    best_rank = -1
+    for priority in priorities:
+        rank = _PRIORITY_ORDER.get(str(priority or "").strip().lower(), 0)
+        if rank > best_rank:
+            best_rank = rank
+            best = priority
+    return best
+
+
+def _build_batch_cleaning_result(
+    source_path: str,
+    *,
+    job_id: str,
+    steps: list[_BatchCleaningStep],
+    source_type: str,
+    source_file_name: str,
+) -> dict[str, Any]:
+    """Apply several cleaning suggestions in a SINGLE streaming pass over the file.
+
+    The source is read once in chunks; every suggestion is applied to each chunk
+    in order (each on top of the previous suggestion's output); the result is
+    written once and uploaded once. Compared to cleaning one suggestion at a time
+    (download -> stats pass -> clean pass -> upload, repeated N times), this keeps
+    batch cleaning fast on large datasets (hundreds of thousands of rows) because
+    the file is scanned only once for cleaning plus at most one shared pass to
+    compute imputation statistics.
+    """
+    preserve_placeholders = source_type == "clean"
+
+    sample_rows = max(1, int(settings.UAT_AI_PLANNER_SAMPLE_ROWS))
+    planner_sample_df = _read_csv_sample(source_path, nrows=sample_rows, preserve_placeholders=preserve_placeholders)
+    row_limit = settings.UAT_AI_ROW_LEVEL_LARGE_DATASET_THRESHOLD + 1
+    total_rows_hint = _count_csv_rows(source_path, limit=row_limit)
+
+    planned: list[tuple[_BatchCleaningStep, AICleaningPlan]] = []
+    for step in steps:
+        plan = plan_ai_cleaning(
+            planner_sample_df,
+            step.prompt,
+            total_rows=total_rows_hint,
+            prompt_type_hint=step.prompt_type,
+            target_columns_hint=list(step.target_columns),
+        )
+        if plan.strategy == "privacy_blocked":
+            if prompt_has_deterministic_cleaning_steps(step.prompt):
+                plan = AICleaningPlan(
+                    strategy="deterministic_privacy_fallback",
+                    target_columns=plan.target_columns,
+                    reason=plan.reason,
+                )
+            else:
+                raise error_response(
+                    status_code=400,
+                    detail=plan.reason or "AI cleaning is blocked for the requested columns.",
+                )
+        if plan.strategy == "unsupported_large_ai":
+            raise error_response(
+                status_code=400,
+                detail=plan.reason or "Unsupported large-dataset AI cleaning prompt.",
+            )
+        planned.append((step, plan))
+
+    any_requires_ai = any(plan.requires_ai for _, plan in planned)
+    effective_chunksize = (
+        settings.CHUNK_SIZE if any_requires_ai else max(settings.CHUNK_SIZE, settings.CHUNK_SIZE * 10)
+    )
+
+    # One shared imputation pre-pass for every imputation suggestion, instead of
+    # a separate full scan per suggestion. Mean/median needs whole-column stats.
+    numeric_targets: set[str] = set()
+    mode_targets: set[str] = set()
+    step_impute_kinds: list[tuple[bool, bool]] = []
+    for step, plan in planned:
+        normalized_type = normalize_cleaning_prompt_type(step.prompt_type) if step.prompt_type else None
+        wants_numeric = (
+            prompt_requests_numeric_imputation(step.prompt) or normalized_type == "numeric_missing_imputation"
+        )
+        wants_mode = (
+            prompt_requests_mode_imputation(step.prompt) or normalized_type == "date_missing_imputation"
+        )
+        step_impute_kinds.append((wants_numeric, wants_mode))
+        step_targets = set(plan.target_columns or [])
+        if wants_numeric:
+            numeric_targets |= step_targets
+        if wants_mode:
+            mode_targets |= step_targets
+
+    imputation_values: dict[str, Any] | None = None
+    if numeric_targets or mode_targets:
+        numeric_accumulator: dict[str, Any] = {}
+        mode_accumulator: dict[str, Any] = {}
+        for impute_chunk_df in _parse_csv_iter(
+            source_path,
+            chunksize=effective_chunksize,
+            preserve_placeholders=preserve_placeholders,
+        ):
+            if numeric_targets:
+                accumulate_numeric_imputation_stats(impute_chunk_df, numeric_targets, numeric_accumulator)
+            if mode_targets:
+                accumulate_mode_imputation_stats(impute_chunk_df, mode_targets, mode_accumulator)
+        imputation_values = {}
+        for (step, plan), (wants_numeric, wants_mode) in zip(planned, step_impute_kinds):
+            step_targets = set(plan.target_columns or [])
+            if wants_numeric:
+                numeric_subset = {
+                    column: numeric_accumulator[column]
+                    for column in step_targets
+                    if column in numeric_accumulator
+                }
+                imputation_values.update(
+                    finalize_numeric_imputation_values(
+                        numeric_subset, strategy=numeric_imputation_strategy(step.prompt)
+                    )
+                )
+            if wants_mode:
+                mode_subset = {
+                    column: mode_accumulator[column]
+                    for column in step_targets
+                    if column in mode_accumulator
+                }
+                for column_name, fill_value in finalize_mode_imputation_values(mode_subset).items():
+                    imputation_values.setdefault(column_name, fill_value)
+
+    # Per-step runtime state. The LLM chain is stateless and shared; value caches
+    # and cross-chunk duplicate hashes must stay isolated per suggestion.
+    chain = build_cleaning_chain() if any_requires_ai else None
+    ai_caches: dict[int, dict[Any, Any]] = {}
+    seen_hashes: dict[int, set[int]] = {}
+    for index, (step, plan) in enumerate(planned):
+        if plan.requires_ai:
+            ai_caches[index] = {}
+        if prompt_removes_exact_duplicates(step.prompt):
+            seen_hashes[index] = set()
+
+    def _apply_all_steps(chunk_df: pd.DataFrame) -> pd.DataFrame:
+        cleaned = chunk_df
+        for index, (step, plan) in enumerate(planned):
+            cleaned = clean_dataframe_chunk(
+                cleaned,
+                step.prompt,
+                chain=chain,
+                plan=plan,
+                prompt_type_hint=step.prompt_type,
+                target_columns_hint=list(step.target_columns),
+                seen_row_hashes=seen_hashes.get(index),
+                ai_row_cache=ai_caches.get(index),
+                imputation_values=imputation_values,
+            )
+        return cleaned
+
+    preview_rows: list[dict[str, Any]] = []
+    input_total_rows = 0
+    total_rows = 0
+    wrote_header = False
+    changes_detected = False
+    columns_before = 0
+    columns_after = 0
+    output_filename = f"ai_cleaned_{Path(source_file_name).stem}.csv"
+
+    fd, output_path = tempfile.mkstemp(prefix=f"{job_id}_cleaned_", suffix=".csv")
+    os.close(fd)
+
+    try:
+        with open(output_path, "w", encoding="utf-8", newline="") as output_file:
+            for chunk_df in _parse_csv_iter(
+                source_path,
+                chunksize=effective_chunksize,
+                preserve_placeholders=preserve_placeholders,
+            ):
+                if input_total_rows == 0:
+                    columns_before = len(chunk_df.columns)
+                input_total_rows += len(chunk_df)
+                cleaned_chunk = _apply_all_steps(chunk_df)
+                if columns_after == 0:
+                    columns_after = len(cleaned_chunk.columns)
+                if not changes_detected and not _dataframes_match(chunk_df, cleaned_chunk):
+                    changes_detected = True
+
+                preview_remaining = int(settings.UAT_AI_CLEAN_PREVIEW_ROWS) - len(preview_rows)
+                if preview_remaining > 0 and not cleaned_chunk.empty:
+                    preview_rows.extend(_dataframe_to_json_records(cleaned_chunk.head(preview_remaining)))
+
+                cleaned_chunk.to_csv(output_file, header=not wrote_header, index=False)
+                wrote_header = True
+                total_rows += len(cleaned_chunk)
+
+            if not wrote_header:
+                empty_df = _apply_all_steps(
+                    _read_csv_sample(source_path, nrows=0, preserve_placeholders=preserve_placeholders)
+                )
+                empty_df.to_csv(output_file, header=True, index=False)
+                columns_before = len(empty_df.columns)
+                columns_after = len(empty_df.columns)
+
+        cleaned_storage_key = _ai_cleaned_output_key(job_id)
+        cleaned_file_path = get_object_storage_service().upload_file(output_path, cleaned_storage_key)
+        preview_rows_returned = len(preview_rows)
+        preview_limited = total_rows > preview_rows_returned
+
+        union_target_columns = sorted({column for _, plan in planned for column in (plan.target_columns or [])})
+        llm_used = any(cleaning_strategy_uses_llm(plan.strategy) for _, plan in planned)
+        distinct_strategies = list(dict.fromkeys(plan.strategy for _, plan in planned))
+
+        status_note = (
+            "Changes were detected."
+            if changes_detected
+            else "Prompts were processed, but no data changes were detected."
+        )
+        source_label = "original dataset" if source_type == "raw" else "previous AI-cleaned output"
+        target_label = ", ".join(union_target_columns) if union_target_columns else "all columns"
+        message = (
+            f"{status_note} Applied {len(planned)} suggestion(s) in a single pass. "
+            f"Source: {source_label}. Target columns: {target_label}. "
+            f"API response includes {preview_rows_returned} of {total_rows} cleaned row(s)."
+        )
+
+        steps_applied = [
+            {
+                "step": "ai_prompt_cleaning",
+                "status": "applied",
+                "details": {
+                    "cleaning_strategy": plan.strategy,
+                    "target_columns": plan.target_columns,
+                    "llm_used": cleaning_strategy_uses_llm(plan.strategy),
+                    "source_suggestion_id": step.suggestion_id,
+                    "prompt": step.prompt,
+                    "source_type": source_type,
+                },
+            }
+            for step, plan in planned
+        ]
+
+        return {
+            "source_type": source_type,
+            "cleaning_strategy": ",".join(distinct_strategies) or "deterministic",
+            "llm_used": llm_used,
+            "target_columns": union_target_columns,
+            "cleaned_storage_key": cleaned_storage_key,
+            "cleaned_file_path": cleaned_file_path,
+            "cleaned_data": preview_rows,
+            "cleaned_rows": total_rows,
+            "preview_rows_returned": preview_rows_returned,
+            "preview_limited": preview_limited,
+            "changes_detected": changes_detected,
+            "rows_before": input_total_rows,
+            "rows_after": total_rows,
+            "columns_before": columns_before,
+            "columns_after": columns_after,
+            "output_filename": output_filename,
+            "prompt": "\n".join(f"- {step.prompt}" for step, _ in planned),
+            "message": message,
+            "steps_applied": steps_applied,
+            "cleaning_summary": {
+                "total_steps": len(steps_applied),
+                "applied": len(steps_applied),
+                "skipped": 0,
+                "errors": 0,
+                "changes_detected": changes_detected,
+            },
+        }
+    finally:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+
+
+def run_ai_cleaning_batch(
+    db: Session,
+    *,
+    current_user: User,
+    dataset_id: int,
+    dataset_type: str,
+    suggestion_ids: list[str],
+    source_ai_job_id: str | None = None,
+) -> dict[str, Any]:
+    """Clean every selected suggestion in ONE request and ONE streaming pass.
+
+    All suggestions are applied on top of each other into a single cleaned file
+    and a single AI cleaning job, reading the source only once. Used to clean an
+    entire suggestion category at once: the frontend passes all suggestion IDs of
+    that category in ``suggestion_ids``.
+    """
+    _ensure_ai_cleaning_tables()
+    ordered_suggestion_ids = [
+        suggestion_id for suggestion_id in dict.fromkeys(suggestion_ids) if suggestion_id
+    ]
+    if not ordered_suggestion_ids:
+        raise error_response(status_code=400, detail="At least one suggestion_id is required")
+
+    reusable_job_record = _get_reusable_ai_job(
+        db,
+        current_user,
+        dataset_id=dataset_id,
+        dataset_type=dataset_type,
+        source_ai_job_id=source_ai_job_id,
+    )
+    reusable_job: CleaningJob | None = reusable_job_record[0] if reusable_job_record is not None else None
+    reusable_detail: AICleaningJobDetail | None = reusable_job_record[1] if reusable_job_record is not None else None
+    source = _resolve_ai_source(
+        db,
+        current_user,
+        dataset_id=dataset_id,
+        dataset_type=dataset_type,
+        source_ai_job_id=reusable_detail.job_id if reusable_detail is not None else source_ai_job_id,
+    )
+
+    steps: list[_BatchCleaningStep] = []
+    for suggestion_id in ordered_suggestion_ids:
+        (
+            resolved_prompt,
+            resolved_suggestion_id,
+            resolved_priority,
+            resolved_prompt_type,
+            resolved_target_columns,
+        ) = _resolve_ai_cleaning_prompt(
+            db,
+            current_user,
+            dataset_id=dataset_id,
+            dataset_type=dataset_type,
+            suggestion_id=suggestion_id,
+            source_job_detail=reusable_detail,
+        )
+        steps.append(
+            _BatchCleaningStep(
+                suggestion_id=resolved_suggestion_id,
+                prompt=resolved_prompt,
+                priority=resolved_priority,
+                prompt_type=resolved_prompt_type,
+                target_columns=tuple(resolved_target_columns),
+            )
+        )
+
+    applied_suggestion_ids = [step.suggestion_id for step in steps]
+    combined_prompt = "\n".join(f"- {step.prompt}" for step in steps)
+    combined_priority = _highest_priority([step.priority for step in steps])
+
+    with _download_storage_key(source.storage_key, prefix=f"{source.dataset_type}_{source.dataset_id}") as source_path:
+        started_at = time.time()
+        source_file_size = os.path.getsize(source_path)
+        if reusable_job is None or reusable_detail is None:
+            job_id = str(uuid.uuid4())
+            job = CleaningJob(
+                id=job_id,
+                original_filename=source.file_name,
+                file_type="csv",
+                file_size_bytes=source_file_size,
+                source_dataset_id=source.dataset_id,
+                s3_upload_url=source.file_url,
+                download_url=_ai_cleaned_download_url(job_id),
+                status="processing",
+                progress_pct=5,
+                current_step=1,
+                total_steps=3,
+                current_step_name="Preparing AI cleaning",
+                ai_cleaning_type=True,
+            )
+            detail = AICleaningJobDetail(
+                job_id=job_id,
+                created_by_user_id=current_user.id,
+                source_dataset_id=source.dataset_id,
+                source_dataset_type=source.dataset_type,
+                source_dataset_name=source.dataset_name,
+                source_file_name=source.file_name,
+                source_storage_key=source.storage_key,
+                source_file_url=source.file_url,
+                source_suggestion_id=applied_suggestion_ids[0],
+                source_suggestion_priority=combined_priority,
+                source_ai_job_id=source.source_ai_job_id,
+                source_type=source.source_type,
+                prompt=combined_prompt,
+                message="AI cleaning started",
+            )
+            db.add(job)
+            db.add(detail)
+        else:
+            job = reusable_job
+            detail = reusable_detail
+            job_id = job.id
+            job.original_filename = source.file_name
+            job.file_type = "csv"
+            job.file_size_bytes = source_file_size
+            job.source_dataset_id = source.dataset_id
+            job.s3_upload_url = source.file_url
+            job.download_url = _ai_cleaned_download_url(job_id)
+            job.status = "processing"
+            job.progress_pct = 5
+            job.current_step = 1
+            job.total_steps = 3
+            job.current_step_name = "Preparing AI cleaning"
+            job.error_message = None
+            job.completed_at = None
+
+            detail.source_dataset_id = source.dataset_id
+            detail.source_dataset_type = source.dataset_type
+            detail.source_dataset_name = source.dataset_name
+            detail.source_file_name = source.file_name
+            detail.source_storage_key = source.storage_key
+            detail.source_file_url = source.file_url
+            detail.source_suggestion_id = applied_suggestion_ids[0]
+            detail.source_suggestion_priority = combined_priority
+            detail.source_ai_job_id = source.source_ai_job_id
+            detail.source_type = source.source_type
+            detail.prompt = combined_prompt
+            detail.cleaning_strategy = None
+            detail.llm_used = False
+            detail.target_columns = None
+            detail.cleaned_rows = None
+            detail.preview_rows_returned = None
+            detail.preview_limited = False
+            detail.changes_detected = False
+            detail.quality_score = None
+            detail.analysis = None
+            detail.suggestion_source = None
+            detail.llm_provider = None
+            detail.llm_model = None
+            detail.message = "AI cleaning started"
+        db.commit()
+
+        try:
+            job.progress_pct = 25
+            job.current_step_name = "Running AI cleaning"
+            job.current_step = 2
+            db.commit()
+
+            result = _build_batch_cleaning_result(
+                source_path,
+                job_id=job_id,
+                steps=steps,
+                source_type=source.source_type,
+                source_file_name=source.file_name,
+            )
+
+            previous_steps = list(job.steps_applied or [])
+            job.steps_applied = previous_steps + result["steps_applied"]
+
+            job.status = "completed"
+            job.progress_pct = 100
+            job.current_step = 3
+            job.current_step_name = "Done"
+            job.rows_before = result["rows_before"]
+            job.rows_after = result["rows_after"]
+            job.columns_before = result["columns_before"]
+            job.columns_after = result["columns_after"]
+            job.cleaning_summary = {
+                **result["cleaning_summary"],
+                "total_steps": len(job.steps_applied),
+                "applied": sum(1 for item in job.steps_applied if isinstance(item, dict) and item.get("status") == "applied"),
+                "skipped": sum(1 for item in job.steps_applied if isinstance(item, dict) and item.get("status") == "skipped"),
+                "errors": sum(1 for item in job.steps_applied if isinstance(item, dict) and item.get("status") == "error"),
+                "latest_run_changes_detected": result["changes_detected"],
+            }
+            job.duration_seconds = round(time.time() - started_at, 3)
+            job.s3_cleaned_url = result["cleaned_file_path"]
+            job.output_filename = result["output_filename"]
+            job.completed_at = datetime.now(timezone.utc)
+
+            detail.source_type = result["source_type"]
+            detail.cleaning_strategy = result["cleaning_strategy"]
+            detail.llm_used = result["llm_used"]
+            detail.target_columns = result["target_columns"]
+            detail.cleaned_storage_key = result["cleaned_storage_key"]
+            detail.cleaned_file_path = result["cleaned_file_path"]
+            detail.cleaned_data = result["cleaned_data"]
+            detail.cleaned_rows = result["cleaned_rows"]
+            detail.preview_rows_returned = result["preview_rows_returned"]
+            detail.preview_limited = result["preview_limited"]
+            detail.changes_detected = result["changes_detected"]
+            detail.prompt = result["prompt"]
+            detail.message = result["message"]
+
+            db.commit()
+            db.refresh(job)
+            db.refresh(detail)
+            serialized = _serialize_ai_cleaning_detail(job, detail)
+            serialized["applied_suggestion_ids"] = applied_suggestion_ids
+            return serialized
+        except Exception as exc:
+            db.rollback()
+            job = db.query(CleaningJob).filter(CleaningJob.id == job_id).first()
+            detail = db.query(AICleaningJobDetail).filter(AICleaningJobDetail.job_id == job_id).first()
+            if job is not None:
+                job.status = "failed"
+                job.error_message = str(exc)
+                job.duration_seconds = round(time.time() - started_at, 3)
+            if detail is not None:
+                detail.message = str(exc)
+            db.commit()
+            raise
+
+
 def get_ai_cleaning_detail(
     db: Session,
     *,
