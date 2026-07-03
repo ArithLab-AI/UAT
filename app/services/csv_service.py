@@ -12,6 +12,7 @@ import openpyxl
 import pandas as pd
 import xlrd
 from fastapi import UploadFile
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session, object_session
 from app.models.csv_dataset_models import (
     CsvMergedDataset,
@@ -336,7 +337,9 @@ async def parse_csv_upload(file: UploadFile, *, user_id: int) -> ParsedUpload | 
         file_size = len(content)
 
         if suffix == ".csv":
-            original_columns, internal_columns, rows = _parse_csv_content(file_name, content)
+            original_columns, internal_columns, rows = await run_in_threadpool(
+                _parse_csv_content, file_name, content
+            )
             return ParsedUpload(
                 file_name=file_name,
                 file_size=file_size,
@@ -346,7 +349,7 @@ async def parse_csv_upload(file: UploadFile, *, user_id: int) -> ParsedUpload | 
             )
         from app.services.excel_sheet_service import extract_sheet_names, process_selected_sheet
 
-        sheet_names = extract_sheet_names(content)
+        sheet_names = await run_in_threadpool(extract_sheet_names, content)
         if len(sheet_names) > 1:
             from app.services.temporary_upload_service import store_temporary_upload
 
@@ -373,7 +376,8 @@ async def parse_csv_upload(file: UploadFile, *, user_id: int) -> ParsedUpload | 
                 internal_columns,
                 rows,
                 sheet_name,
-            ) = process_selected_sheet(
+            ) = await run_in_threadpool(
+                process_selected_sheet,
                 file_path=str(temp_path),
                 file_name=file_name,
                 sheet_name=sheet_names[0],
