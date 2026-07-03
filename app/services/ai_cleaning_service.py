@@ -1,6 +1,7 @@
 import csv
 import os
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -15,7 +16,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.config.config import settings
-from app.db.database import Base, engine
+from app.db.database import Base, SessionLocal, engine
 from app.models.ai_cleaning_models import AICleaningJobDetail
 from app.models.analysis_models import AnalysisSuggestion, DatasetAnalysis
 from app.models.auth_models import User
@@ -791,89 +792,140 @@ def run_ai_cleaning(
     if custom_prompt:
         resolved_prompt = custom_prompt
 
-    with _download_storage_key(source.storage_key, prefix=f"{source.dataset_type}_{source.dataset_id}") as source_path:
-        started_at = time.time()
-        source_file_size = os.path.getsize(source_path)
-        if reusable_job is None or reusable_detail is None:
-            job_id = str(uuid.uuid4())
-            job = CleaningJob(
-                id=job_id,
-                original_filename=source.file_name,
-                file_type="csv",
-                file_size_bytes=source_file_size,
-                source_dataset_id=source.dataset_id,
-                s3_upload_url=source.file_url,
-                download_url=_ai_cleaned_download_url(job_id),
-                status="processing",
-                progress_pct=5,
-                current_step=1,
-                total_steps=3,
-                current_step_name="Preparing AI cleaning",
-                ai_cleaning_type=True,
-            )
-            detail = AICleaningJobDetail(
-                job_id=job_id,
-                created_by_user_id=current_user.id,
-                source_dataset_id=source.dataset_id,
-                source_dataset_type=source.dataset_type,
-                source_dataset_name=source.dataset_name,
-                source_file_name=source.file_name,
-                source_storage_key=source.storage_key,
-                source_file_url=source.file_url,
-                source_suggestion_id=resolved_suggestion_id,
-                source_suggestion_priority=resolved_suggestion_priority,
-                source_ai_job_id=source.source_ai_job_id,
-                source_type=source.source_type,
-                prompt=resolved_prompt,
-                message="AI cleaning started",
-            )
-            db.add(job)
-            db.add(detail)
-        else:
-            job = reusable_job
-            detail = reusable_detail
-            job_id = job.id
-            job.original_filename = source.file_name
-            job.file_type = "csv"
+    if reusable_job is None or reusable_detail is None:
+        job_id = str(uuid.uuid4())
+        job = CleaningJob(
+            id=job_id,
+            original_filename=source.file_name,
+            file_type="csv",
+            file_size_bytes=0,
+            source_dataset_id=source.dataset_id,
+            s3_upload_url=source.file_url,
+            download_url=_ai_cleaned_download_url(job_id),
+            status="processing",
+            progress_pct=5,
+            current_step=1,
+            total_steps=3,
+            current_step_name="Preparing AI cleaning",
+            ai_cleaning_type=True,
+        )
+        detail = AICleaningJobDetail(
+            job_id=job_id,
+            created_by_user_id=current_user.id,
+            source_dataset_id=source.dataset_id,
+            source_dataset_type=source.dataset_type,
+            source_dataset_name=source.dataset_name,
+            source_file_name=source.file_name,
+            source_storage_key=source.storage_key,
+            source_file_url=source.file_url,
+            source_suggestion_id=resolved_suggestion_id,
+            source_suggestion_priority=resolved_suggestion_priority,
+            source_ai_job_id=source.source_ai_job_id,
+            source_type=source.source_type,
+            prompt=resolved_prompt,
+            message="AI cleaning started",
+        )
+        db.add(job)
+        db.add(detail)
+    else:
+        job = reusable_job
+        detail = reusable_detail
+        job_id = job.id
+        job.original_filename = source.file_name
+        job.file_type = "csv"
+        job.file_size_bytes = 0
+        job.source_dataset_id = source.dataset_id
+        job.s3_upload_url = source.file_url
+        job.download_url = _ai_cleaned_download_url(job_id)
+        job.status = "processing"
+        job.progress_pct = 5
+        job.current_step = 1
+        job.total_steps = 3
+        job.current_step_name = "Preparing AI cleaning"
+        job.error_message = None
+        job.completed_at = None
+
+        detail.source_dataset_id = source.dataset_id
+        detail.source_dataset_type = source.dataset_type
+        detail.source_dataset_name = source.dataset_name
+        detail.source_file_name = source.file_name
+        detail.source_storage_key = source.storage_key
+        detail.source_file_url = source.file_url
+        detail.source_suggestion_id = resolved_suggestion_id
+        detail.source_suggestion_priority = resolved_suggestion_priority
+        detail.source_ai_job_id = source.source_ai_job_id
+        detail.source_type = source.source_type
+        detail.prompt = resolved_prompt
+        detail.cleaning_strategy = None
+        detail.llm_used = False
+        detail.target_columns = None
+        detail.cleaned_rows = None
+        detail.preview_rows_returned = None
+        detail.preview_limited = False
+        detail.changes_detected = False
+        detail.quality_score = None
+        detail.analysis = None
+        detail.suggestion_source = None
+        detail.llm_provider = None
+        detail.llm_model = None
+        detail.message = "AI cleaning started"
+    db.commit()
+    db.refresh(job)
+    db.refresh(detail)
+
+    # Heavy AI cleaning (LLM over the whole dataset) runs in a background thread so
+    # the request returns immediately. On large datasets this can take minutes, which
+    # would otherwise blow past the platform's fixed request timeout (App Runner: 120s)
+    # and surface as a 504. The client polls GET /ai-cleaning/job/{job_id} for status.
+    threading.Thread(
+        target=_run_ai_cleaning_worker,
+        kwargs={
+            "job_id": job_id,
+            "storage_key": source.storage_key,
+            "source_dataset_id": source.dataset_id,
+            "source_dataset_type": source.dataset_type,
+            "source_file_name": source.file_name,
+            "source_type": source.source_type,
+            "resolved_prompt": resolved_prompt,
+            "resolved_suggestion_id": resolved_suggestion_id,
+            "resolved_cleaning_prompt_type": resolved_cleaning_prompt_type,
+            "resolved_target_columns": resolved_target_columns,
+        },
+        daemon=True,
+    ).start()
+
+    return _serialize_ai_cleaning_detail(job, detail)
+
+
+def _run_ai_cleaning_worker(
+    *,
+    job_id: str,
+    storage_key: str,
+    source_dataset_id: int,
+    source_dataset_type: str,
+    source_file_name: str,
+    source_type: str,
+    resolved_prompt: str,
+    resolved_suggestion_id: str | None,
+    resolved_cleaning_prompt_type: Any,
+    resolved_target_columns: Any,
+) -> None:
+    """Background worker: download source, run AI cleaning, finalize the job.
+
+    Runs in its own thread with its own DB session (never share the request session
+    across threads). Any failure is recorded on the job as status='failed'.
+    """
+    db = SessionLocal()
+    started_at = time.time()
+    try:
+        with _download_storage_key(storage_key, prefix=f"{source_dataset_type}_{source_dataset_id}") as source_path:
+            source_file_size = os.path.getsize(source_path)
+            job = db.query(CleaningJob).filter(CleaningJob.id == job_id).first()
+            detail = db.query(AICleaningJobDetail).filter(AICleaningJobDetail.job_id == job_id).first()
+            if job is None or detail is None:
+                return
+
             job.file_size_bytes = source_file_size
-            job.source_dataset_id = source.dataset_id
-            job.s3_upload_url = source.file_url
-            job.download_url = _ai_cleaned_download_url(job_id)
-            job.status = "processing"
-            job.progress_pct = 5
-            job.current_step = 1
-            job.total_steps = 3
-            job.current_step_name = "Preparing AI cleaning"
-            job.error_message = None
-            job.completed_at = None
-
-            detail.source_dataset_id = source.dataset_id
-            detail.source_dataset_type = source.dataset_type
-            detail.source_dataset_name = source.dataset_name
-            detail.source_file_name = source.file_name
-            detail.source_storage_key = source.storage_key
-            detail.source_file_url = source.file_url
-            detail.source_suggestion_id = resolved_suggestion_id
-            detail.source_suggestion_priority = resolved_suggestion_priority
-            detail.source_ai_job_id = source.source_ai_job_id
-            detail.source_type = source.source_type
-            detail.prompt = resolved_prompt
-            detail.cleaning_strategy = None
-            detail.llm_used = False
-            detail.target_columns = None
-            detail.cleaned_rows = None
-            detail.preview_rows_returned = None
-            detail.preview_limited = False
-            detail.changes_detected = False
-            detail.quality_score = None
-            detail.analysis = None
-            detail.suggestion_source = None
-            detail.llm_provider = None
-            detail.llm_model = None
-            detail.message = "AI cleaning started"
-        db.commit()
-
-        try:
             job.progress_pct = 25
             job.current_step_name = "Running AI cleaning"
             job.current_step = 2
@@ -883,8 +935,8 @@ def run_ai_cleaning(
                 source_path,
                 job_id=job_id,
                 prompt=resolved_prompt,
-                source_type=source.source_type,
-                source_file_name=source.file_name,
+                source_type=source_type,
+                source_file_name=source_file_name,
                 prompt_type_hint=resolved_cleaning_prompt_type,
                 target_columns_hint=resolved_target_columns,
             )
@@ -898,7 +950,7 @@ def run_ai_cleaning(
                 if isinstance(details, dict):
                     details["source_suggestion_id"] = resolved_suggestion_id
                     details["prompt"] = resolved_prompt
-                    details["source_type"] = source.source_type
+                    details["source_type"] = source_type
             job.steps_applied = previous_steps + latest_steps
 
             job.status = "completed"
@@ -936,21 +988,19 @@ def run_ai_cleaning(
             detail.message = result["message"]
 
             db.commit()
-            db.refresh(job)
-            db.refresh(detail)
-            return _serialize_ai_cleaning_detail(job, detail)
-        except Exception as exc:
-            db.rollback()
-            job = db.query(CleaningJob).filter(CleaningJob.id == job_id).first()
-            detail = db.query(AICleaningJobDetail).filter(AICleaningJobDetail.job_id == job_id).first()
-            if job is not None:
-                job.status = "failed"
-                job.error_message = str(exc)
-                job.duration_seconds = round(time.time() - started_at, 3)
-            if detail is not None:
-                detail.message = str(exc)
-            db.commit()
-            raise
+    except Exception as exc:
+        db.rollback()
+        job = db.query(CleaningJob).filter(CleaningJob.id == job_id).first()
+        detail = db.query(AICleaningJobDetail).filter(AICleaningJobDetail.job_id == job_id).first()
+        if job is not None:
+            job.status = "failed"
+            job.error_message = str(exc)
+            job.duration_seconds = round(time.time() - started_at, 3)
+        if detail is not None:
+            detail.message = str(exc)
+        db.commit()
+    finally:
+        db.close()
 
 
 @dataclass(frozen=True)
@@ -1302,89 +1352,131 @@ def run_ai_cleaning_batch(
     combined_prompt = "\n".join(f"- {step.prompt}" for step in steps)
     combined_priority = _highest_priority([step.priority for step in steps])
 
-    with _download_storage_key(source.storage_key, prefix=f"{source.dataset_type}_{source.dataset_id}") as source_path:
-        started_at = time.time()
-        source_file_size = os.path.getsize(source_path)
-        if reusable_job is None or reusable_detail is None:
-            job_id = str(uuid.uuid4())
-            job = CleaningJob(
-                id=job_id,
-                original_filename=source.file_name,
-                file_type="csv",
-                file_size_bytes=source_file_size,
-                source_dataset_id=source.dataset_id,
-                s3_upload_url=source.file_url,
-                download_url=_ai_cleaned_download_url(job_id),
-                status="processing",
-                progress_pct=5,
-                current_step=1,
-                total_steps=3,
-                current_step_name="Preparing AI cleaning",
-                ai_cleaning_type=True,
-            )
-            detail = AICleaningJobDetail(
-                job_id=job_id,
-                created_by_user_id=current_user.id,
-                source_dataset_id=source.dataset_id,
-                source_dataset_type=source.dataset_type,
-                source_dataset_name=source.dataset_name,
-                source_file_name=source.file_name,
-                source_storage_key=source.storage_key,
-                source_file_url=source.file_url,
-                source_suggestion_id=applied_suggestion_ids[0],
-                source_suggestion_priority=combined_priority,
-                source_ai_job_id=source.source_ai_job_id,
-                source_type=source.source_type,
-                prompt=combined_prompt,
-                message="AI cleaning started",
-            )
-            db.add(job)
-            db.add(detail)
-        else:
-            job = reusable_job
-            detail = reusable_detail
-            job_id = job.id
-            job.original_filename = source.file_name
-            job.file_type = "csv"
+    if reusable_job is None or reusable_detail is None:
+        job_id = str(uuid.uuid4())
+        job = CleaningJob(
+            id=job_id,
+            original_filename=source.file_name,
+            file_type="csv",
+            file_size_bytes=0,
+            source_dataset_id=source.dataset_id,
+            s3_upload_url=source.file_url,
+            download_url=_ai_cleaned_download_url(job_id),
+            status="processing",
+            progress_pct=5,
+            current_step=1,
+            total_steps=3,
+            current_step_name="Preparing AI cleaning",
+            ai_cleaning_type=True,
+        )
+        detail = AICleaningJobDetail(
+            job_id=job_id,
+            created_by_user_id=current_user.id,
+            source_dataset_id=source.dataset_id,
+            source_dataset_type=source.dataset_type,
+            source_dataset_name=source.dataset_name,
+            source_file_name=source.file_name,
+            source_storage_key=source.storage_key,
+            source_file_url=source.file_url,
+            source_suggestion_id=applied_suggestion_ids[0],
+            source_suggestion_priority=combined_priority,
+            source_ai_job_id=source.source_ai_job_id,
+            source_type=source.source_type,
+            prompt=combined_prompt,
+            message="AI cleaning started",
+        )
+        db.add(job)
+        db.add(detail)
+    else:
+        job = reusable_job
+        detail = reusable_detail
+        job_id = job.id
+        job.original_filename = source.file_name
+        job.file_type = "csv"
+        job.file_size_bytes = 0
+        job.source_dataset_id = source.dataset_id
+        job.s3_upload_url = source.file_url
+        job.download_url = _ai_cleaned_download_url(job_id)
+        job.status = "processing"
+        job.progress_pct = 5
+        job.current_step = 1
+        job.total_steps = 3
+        job.current_step_name = "Preparing AI cleaning"
+        job.error_message = None
+        job.completed_at = None
+
+        detail.source_dataset_id = source.dataset_id
+        detail.source_dataset_type = source.dataset_type
+        detail.source_dataset_name = source.dataset_name
+        detail.source_file_name = source.file_name
+        detail.source_storage_key = source.storage_key
+        detail.source_file_url = source.file_url
+        detail.source_suggestion_id = applied_suggestion_ids[0]
+        detail.source_suggestion_priority = combined_priority
+        detail.source_ai_job_id = source.source_ai_job_id
+        detail.source_type = source.source_type
+        detail.prompt = combined_prompt
+        detail.cleaning_strategy = None
+        detail.llm_used = False
+        detail.target_columns = None
+        detail.cleaned_rows = None
+        detail.preview_rows_returned = None
+        detail.preview_limited = False
+        detail.changes_detected = False
+        detail.quality_score = None
+        detail.analysis = None
+        detail.suggestion_source = None
+        detail.llm_provider = None
+        detail.llm_model = None
+        detail.message = "AI cleaning started"
+    db.commit()
+    db.refresh(job)
+    db.refresh(detail)
+
+    # Batch AI cleaning runs one streaming pass over the whole file applying every
+    # suggestion. On large datasets this exceeds the platform request timeout, so it
+    # runs in a background thread; the client polls GET /ai-cleaning/job/{job_id}.
+    threading.Thread(
+        target=_run_ai_cleaning_batch_worker,
+        kwargs={
+            "job_id": job_id,
+            "storage_key": source.storage_key,
+            "source_dataset_id": source.dataset_id,
+            "source_dataset_type": source.dataset_type,
+            "source_file_name": source.file_name,
+            "source_type": source.source_type,
+            "steps": steps,
+        },
+        daemon=True,
+    ).start()
+
+    serialized = _serialize_ai_cleaning_detail(job, detail)
+    serialized["applied_suggestion_ids"] = applied_suggestion_ids
+    return serialized
+
+
+def _run_ai_cleaning_batch_worker(
+    *,
+    job_id: str,
+    storage_key: str,
+    source_dataset_id: int,
+    source_dataset_type: str,
+    source_file_name: str,
+    source_type: str,
+    steps: list[_BatchCleaningStep],
+) -> None:
+    """Background worker for batch AI cleaning. Own thread, own DB session."""
+    db = SessionLocal()
+    started_at = time.time()
+    try:
+        with _download_storage_key(storage_key, prefix=f"{source_dataset_type}_{source_dataset_id}") as source_path:
+            source_file_size = os.path.getsize(source_path)
+            job = db.query(CleaningJob).filter(CleaningJob.id == job_id).first()
+            detail = db.query(AICleaningJobDetail).filter(AICleaningJobDetail.job_id == job_id).first()
+            if job is None or detail is None:
+                return
+
             job.file_size_bytes = source_file_size
-            job.source_dataset_id = source.dataset_id
-            job.s3_upload_url = source.file_url
-            job.download_url = _ai_cleaned_download_url(job_id)
-            job.status = "processing"
-            job.progress_pct = 5
-            job.current_step = 1
-            job.total_steps = 3
-            job.current_step_name = "Preparing AI cleaning"
-            job.error_message = None
-            job.completed_at = None
-
-            detail.source_dataset_id = source.dataset_id
-            detail.source_dataset_type = source.dataset_type
-            detail.source_dataset_name = source.dataset_name
-            detail.source_file_name = source.file_name
-            detail.source_storage_key = source.storage_key
-            detail.source_file_url = source.file_url
-            detail.source_suggestion_id = applied_suggestion_ids[0]
-            detail.source_suggestion_priority = combined_priority
-            detail.source_ai_job_id = source.source_ai_job_id
-            detail.source_type = source.source_type
-            detail.prompt = combined_prompt
-            detail.cleaning_strategy = None
-            detail.llm_used = False
-            detail.target_columns = None
-            detail.cleaned_rows = None
-            detail.preview_rows_returned = None
-            detail.preview_limited = False
-            detail.changes_detected = False
-            detail.quality_score = None
-            detail.analysis = None
-            detail.suggestion_source = None
-            detail.llm_provider = None
-            detail.llm_model = None
-            detail.message = "AI cleaning started"
-        db.commit()
-
-        try:
             job.progress_pct = 25
             job.current_step_name = "Running AI cleaning"
             job.current_step = 2
@@ -1394,8 +1486,8 @@ def run_ai_cleaning_batch(
                 source_path,
                 job_id=job_id,
                 steps=steps,
-                source_type=source.source_type,
-                source_file_name=source.file_name,
+                source_type=source_type,
+                source_file_name=source_file_name,
             )
 
             previous_steps = list(job.steps_applied or [])
@@ -1437,23 +1529,19 @@ def run_ai_cleaning_batch(
             detail.message = result["message"]
 
             db.commit()
-            db.refresh(job)
-            db.refresh(detail)
-            serialized = _serialize_ai_cleaning_detail(job, detail)
-            serialized["applied_suggestion_ids"] = applied_suggestion_ids
-            return serialized
-        except Exception as exc:
-            db.rollback()
-            job = db.query(CleaningJob).filter(CleaningJob.id == job_id).first()
-            detail = db.query(AICleaningJobDetail).filter(AICleaningJobDetail.job_id == job_id).first()
-            if job is not None:
-                job.status = "failed"
-                job.error_message = str(exc)
-                job.duration_seconds = round(time.time() - started_at, 3)
-            if detail is not None:
-                detail.message = str(exc)
-            db.commit()
-            raise
+    except Exception as exc:
+        db.rollback()
+        job = db.query(CleaningJob).filter(CleaningJob.id == job_id).first()
+        detail = db.query(AICleaningJobDetail).filter(AICleaningJobDetail.job_id == job_id).first()
+        if job is not None:
+            job.status = "failed"
+            job.error_message = str(exc)
+            job.duration_seconds = round(time.time() - started_at, 3)
+        if detail is not None:
+            detail.message = str(exc)
+        db.commit()
+    finally:
+        db.close()
 
 
 def get_ai_cleaning_detail(

@@ -52,7 +52,7 @@ def create_ai_cleaning_job(
         custom_prompt=payload.custom_prompt,
     )
     return success_response(
-        "AI cleaning completed successfully",
+        "AI cleaning started. Poll GET /ai-cleaning/job/{job_id} for progress.",
         status_code=201,
         data=data,
     )
@@ -78,7 +78,7 @@ def create_ai_cleaning_batch_job(
         source_ai_job_id=payload.source_ai_job_id,
     )
     return success_response(
-        "AI cleaning completed successfully for all selected suggestions",
+        "AI cleaning started for all selected suggestions. Poll GET /ai-cleaning/job/{job_id} for progress.",
         status_code=201,
         data=data,
     )
@@ -110,8 +110,9 @@ def get_ai_cleaning_job(
     "/job/{job_id}",
     response_model=AICleaningDetailSuccessResponse,
     response_model_exclude_none=True,
+    summary="Poll AI cleaning job progress",
 )
-def get_ai_cleaning_job_by_job_id(
+def poll_ai_cleaning_job(
     job_id: str,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
