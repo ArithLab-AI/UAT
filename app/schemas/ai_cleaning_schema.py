@@ -139,7 +139,7 @@ class AICleaningPayloadResponse(BaseModel):
     cleaning_strategy: str | None = None
     llm_used: bool = False
     target_columns: list[str] = Field(default_factory=list)
-    cleaned_file_url: str
+    cleaned_file_url: str | None = None
     message: str | None = None
     cleaned_rows: int = 0
     preview_rows_returned: int = 0
