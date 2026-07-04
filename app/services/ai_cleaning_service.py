@@ -266,7 +266,14 @@ def _get_reusable_ai_job(
     dataset_type: str,
     source_ai_job_id: str | None,
 ) -> tuple[CleaningJob, AICleaningJobDetail] | None:
-    base_query = (
+    # Each AI cleaning run is an independent job by default: a fresh job_id cleaned
+    # from the raw source. A previous job is reused ONLY when the client explicitly
+    # asks to continue one via source_ai_job_id. This avoids a second suggestion
+    # silently reusing (and resetting) the previous suggestion's job.
+    if not source_ai_job_id:
+        return None
+
+    record = (
         db.query(CleaningJob, AICleaningJobDetail)
         .join(AICleaningJobDetail, AICleaningJobDetail.job_id == CleaningJob.id)
         .filter(
@@ -274,25 +281,13 @@ def _get_reusable_ai_job(
             AICleaningJobDetail.created_by_user_id == current_user.id,
             AICleaningJobDetail.source_dataset_id == dataset_id,
             AICleaningJobDetail.source_dataset_type == dataset_type,
+            AICleaningJobDetail.job_id == source_ai_job_id,
         )
-    )
-
-    if source_ai_job_id:
-        record = (
-            base_query
-            .filter(AICleaningJobDetail.job_id == source_ai_job_id)
-            .first()
-        )
-        if record is None:
-            raise error_response(status_code=404, detail="Source AI cleaning job not found")
-        return record
-
-    return (
-        base_query
-        .filter(AICleaningJobDetail.cleaned_storage_key.isnot(None))
-        .order_by(AICleaningJobDetail.updated_at.desc())
         .first()
     )
+    if record is None:
+        raise error_response(status_code=404, detail="Source AI cleaning job not found")
+    return record
 
 
 def _resolve_ai_cleaning_prompt(
