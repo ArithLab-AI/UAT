@@ -134,6 +134,7 @@ class AICleaningPayloadResponse(BaseModel):
     source_ai_job_id: str | None = None
     ai_cleaning_type: bool = True
     status: str
+    error_message: str | None = None
     prompt: str | None = None
     source_type: Literal["raw", "clean"] = "raw"
     cleaning_strategy: str | None = None
