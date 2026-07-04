@@ -1,4 +1,5 @@
 import csv
+import logging
 import os
 import tempfile
 import threading
@@ -57,6 +58,8 @@ from app.services.analysis_suggestion_match_service import (
 from app.services.analysis_suggestion_title_service import build_suggestion_title
 from app.utils.object_storage import get_object_storage_service
 from app.utils.responses import error_response
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -737,6 +740,7 @@ def _serialize_ai_cleaning_detail(job: CleaningJob, detail: AICleaningJobDetail)
         "source_ai_job_id": detail.source_ai_job_id,
         "ai_cleaning_type": bool(job.ai_cleaning_type),
         "status": job.status,
+        "error_message": job.error_message,
         "prompt": detail.prompt,
         "source_type": detail.source_type or "raw",
         "cleaning_strategy": detail.cleaning_strategy,
@@ -1001,6 +1005,7 @@ def _run_ai_cleaning_worker(
 
             db.commit()
     except Exception as exc:
+        logger.exception("AI cleaning job %s failed", job_id)
         db.rollback()
         job = db.query(CleaningJob).filter(CleaningJob.id == job_id).first()
         detail = db.query(AICleaningJobDetail).filter(AICleaningJobDetail.job_id == job_id).first()
@@ -1542,6 +1547,7 @@ def _run_ai_cleaning_batch_worker(
 
             db.commit()
     except Exception as exc:
+        logger.exception("AI cleaning job %s failed", job_id)
         db.rollback()
         job = db.query(CleaningJob).filter(CleaningJob.id == job_id).first()
         detail = db.query(AICleaningJobDetail).filter(AICleaningJobDetail.job_id == job_id).first()
