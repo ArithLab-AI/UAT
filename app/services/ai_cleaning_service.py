@@ -716,6 +716,23 @@ def _build_cleaning_result(
             os.remove(output_path)
 
 
+def _resolve_cleaned_file_url(job: CleaningJob, detail: AICleaningJobDetail) -> str | None:
+    """Presigned, directly-downloadable HTTPS URL for the cleaned file.
+
+    Mirrors the ``/csv-datasets`` ``clean_file_url`` behaviour: sign the cleaned S3
+    key so the client can download straight from the bucket. Returns ``None`` while
+    the job is still processing (no cleaned file exists yet) so the field is omitted
+    from the response; falls back to the internal download route only if a cleaned
+    file exists but storage signing is unavailable."""
+    storage_ref = detail.cleaned_storage_key or detail.cleaned_file_path or job.s3_cleaned_url
+    if not storage_ref:
+        return None
+    presigned = get_object_storage_service().presigned_download_url(storage_ref)
+    if presigned:
+        return presigned
+    return _ai_cleaned_download_url(job.id)
+
+
 def _serialize_ai_cleaning_detail(job: CleaningJob, detail: AICleaningJobDetail) -> dict[str, Any]:
     return {
         "job_id": job.id,
@@ -730,7 +747,7 @@ def _serialize_ai_cleaning_detail(job: CleaningJob, detail: AICleaningJobDetail)
         "cleaning_strategy": detail.cleaning_strategy,
         "llm_used": bool(detail.llm_used),
         "target_columns": detail.target_columns or [],
-        "cleaned_file_url": _ai_cleaned_download_url(job.id),
+        "cleaned_file_url": _resolve_cleaned_file_url(job, detail),
         "message": detail.message or job.error_message,
         "cleaned_rows": detail.cleaned_rows or 0,
         "preview_rows_returned": detail.preview_rows_returned or 0,
