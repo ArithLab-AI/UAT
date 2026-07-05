@@ -293,6 +293,37 @@ def _get_reusable_ai_job(
     return record
 
 
+def _latest_clean_source_job_id(
+    db: Session,
+    current_user: User,
+    *,
+    dataset_id: int,
+    dataset_type: str,
+) -> str | None:
+    """job_id of the most recent completed AI cleaning for this dataset.
+
+    Used to CHAIN cleanings: each new cleaning starts from the previous cleaned
+    output (cumulative) so fixes accumulate across suggestions and an already-fixed
+    issue does not reappear. Returns None when no prior cleaned output exists, so the
+    first cleaning runs against the raw dataset. Matches the selection used by the
+    clean re-analysis (`_resolve_clean_dataset_source`) so cleaning and analysis
+    always operate on the same latest cleaned file."""
+    record = (
+        db.query(AICleaningJobDetail.job_id)
+        .join(CleaningJob, CleaningJob.id == AICleaningJobDetail.job_id)
+        .filter(
+            CleaningJob.ai_cleaning_type.is_(True),
+            AICleaningJobDetail.created_by_user_id == current_user.id,
+            AICleaningJobDetail.source_dataset_id == dataset_id,
+            AICleaningJobDetail.source_dataset_type == dataset_type,
+            AICleaningJobDetail.cleaned_storage_key.isnot(None),
+        )
+        .order_by(AICleaningJobDetail.updated_at.desc())
+        .first()
+    )
+    return record[0] if record is not None else None
+
+
 def _resolve_ai_cleaning_prompt(
     db: Session,
     current_user: User,
@@ -774,21 +805,25 @@ def run_ai_cleaning(
     custom_prompt: str | None = None,
 ) -> dict[str, Any]:
     _ensure_ai_cleaning_tables()
-    reusable_job_record = _get_reusable_ai_job(
+    # Cumulative cleaning: every run is a NEW job (its own job_id for independent
+    # polling), but it cleans the LATEST cleaned output for this dataset instead of
+    # the raw file, so fixes from earlier suggestions carry forward and don't
+    # reappear. The first cleaning (no prior cleaned output) runs against raw. An
+    # explicit source_ai_job_id still lets the client chain from a specific job.
+    reusable_job: CleaningJob | None = None
+    reusable_detail: AICleaningJobDetail | None = None
+    effective_source_job_id = source_ai_job_id or _latest_clean_source_job_id(
         db,
         current_user,
         dataset_id=dataset_id,
         dataset_type=dataset_type,
-        source_ai_job_id=source_ai_job_id,
     )
-    reusable_job: CleaningJob | None = reusable_job_record[0] if reusable_job_record is not None else None
-    reusable_detail: AICleaningJobDetail | None = reusable_job_record[1] if reusable_job_record is not None else None
     source = _resolve_ai_source(
         db,
         current_user,
         dataset_id=dataset_id,
         dataset_type=dataset_type,
-        source_ai_job_id=reusable_detail.job_id if reusable_detail is not None else source_ai_job_id,
+        source_ai_job_id=effective_source_job_id,
     )
     (
         resolved_prompt,
@@ -1322,21 +1357,23 @@ def run_ai_cleaning_batch(
     if not ordered_suggestion_ids:
         raise error_response(status_code=400, detail="At least one suggestion_id is required")
 
-    reusable_job_record = _get_reusable_ai_job(
+    # Cumulative cleaning (same as single): a NEW job, but chained from the latest
+    # cleaned output so batch cleaning also builds on earlier fixes instead of
+    # restarting from raw.
+    reusable_job: CleaningJob | None = None
+    reusable_detail: AICleaningJobDetail | None = None
+    effective_source_job_id = source_ai_job_id or _latest_clean_source_job_id(
         db,
         current_user,
         dataset_id=dataset_id,
         dataset_type=dataset_type,
-        source_ai_job_id=source_ai_job_id,
     )
-    reusable_job: CleaningJob | None = reusable_job_record[0] if reusable_job_record is not None else None
-    reusable_detail: AICleaningJobDetail | None = reusable_job_record[1] if reusable_job_record is not None else None
     source = _resolve_ai_source(
         db,
         current_user,
         dataset_id=dataset_id,
         dataset_type=dataset_type,
-        source_ai_job_id=reusable_detail.job_id if reusable_detail is not None else source_ai_job_id,
+        source_ai_job_id=effective_source_job_id,
     )
 
     steps: list[_BatchCleaningStep] = []
