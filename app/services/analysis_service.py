@@ -7,6 +7,7 @@ from functools import lru_cache
 from typing import Any, Iterable
 
 import pandas as pd
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.db.database import Base, engine
@@ -407,6 +408,28 @@ def _get_latest_raw_analysis_score(db: Session, current_user: User, source: Data
     return int(record[0]) if record is not None and record[0] is not None else None
 
 
+def _get_best_clean_analysis_score(db: Session, current_user: User, source: DatasetSource) -> int | None:
+    """Best quality score achieved by ANY prior AI cleaning of this dataset.
+
+    Used as the regression floor when re-analysing a cleaned dataset. Because each
+    AI cleaning run is now an independent job (not one accumulating job), the floor
+    must span all of the dataset's cleaning jobs — otherwise re-analysing a fresh
+    job (whose own quality_score is still unset) would drop below an earlier clean
+    result. Matches the documented intent: never regress below any earlier clean
+    score."""
+    best = (
+        db.query(func.max(AICleaningJobDetail.quality_score))
+        .filter(
+            AICleaningJobDetail.created_by_user_id == current_user.id,
+            AICleaningJobDetail.source_dataset_id == source.dataset_id,
+            AICleaningJobDetail.source_dataset_type == source.dataset_type,
+            AICleaningJobDetail.quality_score.isnot(None),
+        )
+        .scalar()
+    )
+    return int(best) if best is not None else None
+
+
 def _resolve_ai_cleaning_detail_priority(
     db: Session,
     current_user: User,
@@ -595,6 +618,7 @@ def run_dataset_analysis(
     quality_score = base_quality_score
     clean_detail: AICleaningJobDetail | None = None
     raw_quality_score: int | None = None
+    best_clean_score: int | None = None
     verification_rule_suggestions: list[DataSuggestion] | None = None
     if source.is_clean and source.ai_cleaning_job_id:
         clean_detail = (
@@ -607,6 +631,7 @@ def run_dataset_analysis(
         )
         if clean_detail is not None:
             raw_quality_score = _get_latest_raw_analysis_score(db, current_user, source)
+            best_clean_score = _get_best_clean_analysis_score(db, current_user, source)
     enriched_profile = {**dataset_profile, "quality_score": base_quality_score}
     if source.is_clean:
         verification_rule_suggestions = generate_rule_based_suggestions(enriched_profile)
@@ -623,10 +648,21 @@ def run_dataset_analysis(
             suggestions=current_suggestions,
         )
         if source.is_clean and clean_detail is not None:
+            # Floor at the best clean score ever achieved for this dataset (across all
+            # of its independent cleaning jobs), not just this job's own score, so a
+            # freshly-cleaned job (quality_score still unset) never regresses below an
+            # earlier clean result.
+            previous_clean_score = best_clean_score
+            if clean_detail.quality_score is not None:
+                previous_clean_score = (
+                    clean_detail.quality_score
+                    if previous_clean_score is None
+                    else max(previous_clean_score, clean_detail.quality_score)
+                )
             return coalesce_priority_clean_quality_score(
                 suggestion_aligned_score,
                 raw_score=raw_quality_score,
-                previous_clean_score=clean_detail.quality_score,
+                previous_clean_score=previous_clean_score,
                 changes_detected=bool(clean_detail.changes_detected),
                 suggestion_priority=_resolve_ai_cleaning_detail_priority(db, current_user, clean_detail),
             )
