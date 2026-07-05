@@ -77,7 +77,11 @@ def value_looks_sensitive(value: Any) -> bool:
         return True
     if _looks_like_numeric_identifier(text):
         return True
-    if ID_LIKE_PATTERN.fullmatch(text):
+    # An ID-like token must actually contain a digit. Without this, ordinary 8+ letter
+    # words ("Refunded", "Bengaluru", "Marketing") match the pattern and get flagged as
+    # sensitive, which privacy-blocks (and silently no-ops) legitimate cleaning of plain
+    # categorical/text columns like Status, City, or Job Title.
+    if ID_LIKE_PATTERN.fullmatch(text) and any(char.isdigit() for char in text):
         return True
     return False
 

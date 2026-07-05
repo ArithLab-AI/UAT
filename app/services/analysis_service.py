@@ -173,8 +173,9 @@ def _build_categorized_suggestions(suggestion_payloads: list[dict]) -> dict[str,
 # Categories that must never be surfaced as cleaning suggestions.
 # email / phone: sensitive columns whose data must not be altered — only "missing"
 #   detection is allowed on them (handled implicitly since we keep the missing category).
-# date: date-format normalization is suppressed (date_imputation is kept).
-_SUPPRESSED_SUGGESTION_CATEGORIES = {"email", "phone", "date"}
+# Date-format normalization is intentionally NOT suppressed: date issues are shown as
+# suggestions and count toward the score, since date cleaning is a supported operation.
+_SUPPRESSED_SUGGESTION_CATEGORIES = {"email", "phone"}
 
 
 def _suggestion_issue_category(suggestion: DataSuggestion) -> str:
@@ -200,10 +201,9 @@ def _apply_suggestion_output_policies(
 
     1. Drop ``email`` and ``phone`` suggestions so sensitive column data is never
        altered (missing-value suggestions on those columns are still allowed).
-    2. Drop ``date`` format-normalization suggestions (``date_imputation`` is kept).
-    3. Remove columns already covered by a numeric-imputation suggestion from any
+    2. Remove columns already covered by a numeric-imputation suggestion from any
        ``missing`` suggestion so the same numeric columns are not surfaced twice.
-    4. Deduplicate within each category. Two suggestions of the same category that
+    3. Deduplicate within each category. Two suggestions of the same category that
        touch the same column are redundant (same kind of fix on the same data),
        even if their wording differs or their column groupings only overlap. Each
        column is kept by the first suggestion of that category; later suggestions
@@ -594,6 +594,31 @@ def _merge_imputation_suggestions(
     return merged
 
 
+def _ensure_issue_coverage(
+    suggestions: list[DataSuggestion],
+    coverage_suggestions: list[DataSuggestion],
+) -> list[DataSuggestion]:
+    """Backfill any detected issue that the shown list is missing.
+
+    The quality score is ``100 - penalty(coverage_suggestions)`` (every profile-detected
+    issue). If the LLM/filtered list omits an issue that the score still penalises, the
+    user would see a low score with no matching suggestion. Appending the missing
+    coverage suggestions keeps the shown list aligned with the score: every point the
+    score loses maps to a visible, actionable suggestion."""
+    def _key(suggestion: DataSuggestion) -> tuple[str, frozenset]:
+        return (suggestion.cleaning_prompt_type or "", frozenset(suggestion.target_columns or []))
+
+    seen = {_key(suggestion) for suggestion in suggestions}
+    merged = list(suggestions)
+    for suggestion in coverage_suggestions:
+        key = _key(suggestion)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(suggestion)
+    return merged
+
+
 def run_dataset_analysis(
     db: Session,
     *,
@@ -636,6 +661,18 @@ def run_dataset_analysis(
     if source.is_clean:
         verification_rule_suggestions = generate_rule_based_suggestions(enriched_profile)
 
+    # Comprehensive, profile-derived set of every detected issue. It drives the
+    # suggestion-driven quality score (100 minus a penalty per remaining issue) and
+    # is merged into the shown suggestions so the list always covers what the score
+    # penalises: the score hits 100 only when no issue remains, and rises as issues
+    # are resolved.
+    coverage_suggestions = _merge_imputation_suggestions(
+        verification_rule_suggestions
+        if verification_rule_suggestions is not None
+        else generate_rule_based_suggestions(enriched_profile),
+        enriched_profile,
+    )
+
     suggestions: list[DataSuggestion]
     llm_used = False
     suggestion_source = "rule_based"
@@ -643,8 +680,14 @@ def run_dataset_analysis(
     resolved_model: str | None = None
 
     def _finalize_quality_score(current_suggestions: list[DataSuggestion]) -> int:
+        # Suggestion-driven score: start at 100 and subtract a penalty for every
+        # remaining issue that is actually shown to the user. Scored on the FINAL
+        # suggestion list (after coverage backfill AND output policies) so the score
+        # and the visible suggestions always agree: no shown suggestions -> 100, and
+        # categories that are intentionally suppressed (email/phone/date) never drag
+        # the score down for issues the user cannot act on.
         suggestion_aligned_score = cap_quality_score_by_suggestions(
-            base_quality_score,
+            100,
             suggestions=current_suggestions,
         )
         if source.is_clean and clean_detail is not None:
@@ -744,6 +787,8 @@ def run_dataset_analysis(
                 source_suggestion_match_count,
                 quality_score_delta,
             ) = _build_clean_verification(suggestions)
+            suggestions = _ensure_issue_coverage(suggestions, coverage_suggestions)
+            suggestions = _apply_suggestion_output_policies(suggestions)
             quality_score = _finalize_quality_score(suggestions)
             quality_score_delta = (
                 quality_score - raw_quality_score
@@ -759,7 +804,6 @@ def run_dataset_analysis(
                     else f"Selected cleaned suggestion still has {source_suggestion_match_count} matching issue(s) in cleaned analysis."
                 )
                 message = f"{message} {verification_note}"
-            suggestions = _apply_suggestion_output_policies(suggestions)
             analysis, suggestion_rows = _persist_analysis_result(
                 db,
                 current_user=current_user,
@@ -821,6 +865,12 @@ def run_dataset_analysis(
             cleaned_target_columns=source_target_columns,
             suggestions=suggestions,
         )
+    # Build the final shown list first — coverage backfill, then output policies
+    # (which suppress email/phone/date categories) — and score on exactly that list
+    # so the score and the visible suggestions always agree: empty list -> 100, and
+    # suppressed categories never lower the score for issues the user can't act on.
+    suggestions = _ensure_issue_coverage(suggestions, coverage_suggestions)
+    suggestions = _apply_suggestion_output_policies(suggestions)
     quality_score = _finalize_quality_score(suggestions)
     quality_score_delta = (
         quality_score - raw_quality_score
@@ -841,7 +891,6 @@ def run_dataset_analysis(
             else f"Selected cleaned suggestion still has {source_suggestion_match_count} matching issue(s) in cleaned analysis."
         )
         message = f"{message} {verification_note}"
-    suggestions = _apply_suggestion_output_policies(suggestions)
     analysis, suggestion_rows = _persist_analysis_result(
         db,
         current_user=current_user,
