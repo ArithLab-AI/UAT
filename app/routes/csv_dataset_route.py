@@ -751,10 +751,14 @@ def list_csv_datasets(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    uploaded_search_term = _resolve_search_query(uploaded_search, search)
+    merged_search_term = _resolve_search_query(merged_search, search)
+    is_uploaded_search_only = uploaded_search_term is not None and merged_search_term is None
+    is_merged_search_only = merged_search_term is not None and uploaded_search_term is None
+
     uploaded_query = db.query(CsvUploadedDataset).filter(
         CsvUploadedDataset.created_by_user_id == current_user.id
     )
-    uploaded_search_term = _resolve_search_query(uploaded_search, search)
     if uploaded_search_term:
         uploaded_search_pattern = f"%{uploaded_search_term}%"
         uploaded_query = uploaded_query.filter(
@@ -766,16 +770,19 @@ def list_csv_datasets(
             )
         )
     uploaded_query = uploaded_query.order_by(CsvUploadedDataset.id.desc())
-    uploaded_datasets, uploaded_pagination = _paginate_dataset_query(
-        uploaded_query,
-        page=uploaded_page,
-        page_size=uploaded_page_size,
-    )
+    if is_merged_search_only:
+        uploaded_datasets = []
+        uploaded_pagination = _pagination_meta(0, uploaded_page, uploaded_page_size)
+    else:
+        uploaded_datasets, uploaded_pagination = _paginate_dataset_query(
+            uploaded_query,
+            page=uploaded_page,
+            page_size=uploaded_page_size,
+        )
 
     merged_query = db.query(CsvMergedDataset).filter(
         CsvMergedDataset.created_by_user_id == current_user.id
     )
-    merged_search_term = _resolve_search_query(merged_search, search)
     if merged_search_term:
         merged_search_pattern = f"%{merged_search_term}%"
         merged_query = merged_query.filter(
@@ -788,11 +795,15 @@ def list_csv_datasets(
             )
         )
     merged_query = merged_query.order_by(CsvMergedDataset.id.desc())
-    merged_datasets, merged_pagination = _paginate_dataset_query(
-        merged_query,
-        page=merged_page,
-        page_size=merged_page_size,
-    )
+    if is_uploaded_search_only:
+        merged_datasets = []
+        merged_pagination = _pagination_meta(0, merged_page, merged_page_size)
+    else:
+        merged_datasets, merged_pagination = _paginate_dataset_query(
+            merged_query,
+            page=merged_page,
+            page_size=merged_page_size,
+        )
     source_dataset_ids = sorted(
         {
             item["id"]
