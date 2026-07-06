@@ -751,10 +751,24 @@ def list_csv_datasets(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    uploaded_specific_search = _normalize_search_query(uploaded_search)
+    merged_specific_search = _normalize_search_query(merged_search)
+    shared_search = _normalize_search_query(search)
+    has_specific_search = (
+        uploaded_specific_search is not None or merged_specific_search is not None
+    )
+    uploaded_search_term = uploaded_specific_search or (
+        shared_search if not has_specific_search else None
+    )
+    merged_search_term = merged_specific_search or (
+        shared_search if not has_specific_search else None
+    )
+    include_uploaded_datasets = uploaded_search_term is not None or not has_specific_search
+    include_merged_datasets = merged_search_term is not None or not has_specific_search
+
     uploaded_query = db.query(CsvUploadedDataset).filter(
         CsvUploadedDataset.created_by_user_id == current_user.id
     )
-    uploaded_search_term = _resolve_search_query(uploaded_search, search)
     if uploaded_search_term:
         uploaded_search_pattern = f"%{uploaded_search_term}%"
         uploaded_query = uploaded_query.filter(
@@ -766,16 +780,19 @@ def list_csv_datasets(
             )
         )
     uploaded_query = uploaded_query.order_by(CsvUploadedDataset.id.desc())
-    uploaded_datasets, uploaded_pagination = _paginate_dataset_query(
-        uploaded_query,
-        page=uploaded_page,
-        page_size=uploaded_page_size,
-    )
+    if include_uploaded_datasets:
+        uploaded_datasets, uploaded_pagination = _paginate_dataset_query(
+            uploaded_query,
+            page=uploaded_page,
+            page_size=uploaded_page_size,
+        )
+    else:
+        uploaded_datasets = []
+        uploaded_pagination = _pagination_meta(0, uploaded_page, uploaded_page_size)
 
     merged_query = db.query(CsvMergedDataset).filter(
         CsvMergedDataset.created_by_user_id == current_user.id
     )
-    merged_search_term = _resolve_search_query(merged_search, search)
     if merged_search_term:
         merged_search_pattern = f"%{merged_search_term}%"
         merged_query = merged_query.filter(
@@ -788,11 +805,15 @@ def list_csv_datasets(
             )
         )
     merged_query = merged_query.order_by(CsvMergedDataset.id.desc())
-    merged_datasets, merged_pagination = _paginate_dataset_query(
-        merged_query,
-        page=merged_page,
-        page_size=merged_page_size,
-    )
+    if include_merged_datasets:
+        merged_datasets, merged_pagination = _paginate_dataset_query(
+            merged_query,
+            page=merged_page,
+            page_size=merged_page_size,
+        )
+    else:
+        merged_datasets = []
+        merged_pagination = _pagination_meta(0, merged_page, merged_page_size)
     source_dataset_ids = sorted(
         {
             item["id"]
