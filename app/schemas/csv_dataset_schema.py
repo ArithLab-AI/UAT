@@ -83,20 +83,17 @@ class SelectExcelSheetRequest(BaseModel):
 class CsvMergedDatasetResponse(CsvDatasetSummaryResponse):
     source_datasets: list[CsvMergedSourceDatasetResponse]
 
-
-class CsvDatasetPaginationResponse(BaseModel):
+class PaginationMetaResponse(BaseModel):
     page: int
-    limit: int
-    uploaded_total: int
-    merged_total: int
-    uploaded_total_pages: int
-    merged_total_pages: int
-
+    page_size: int
+    total: int
+    total_pages: int
 
 class CsvDatasetListResponse(BaseModel):
     uploaded_datasets: list[CsvUploadedDatasetResponse]
+    uploaded_pagination: PaginationMetaResponse
     merged_datasets: list[CsvMergedDatasetResponse]
-    pagination: CsvDatasetPaginationResponse
+    merged_pagination: PaginationMetaResponse
 
 
 class MergeJoinColumnMapping(BaseModel):
