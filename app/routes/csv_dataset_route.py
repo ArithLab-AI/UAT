@@ -3,7 +3,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Body, Depends, Request
+from fastapi import APIRouter, Body, Depends, Query, Request
 from sqlalchemy.orm import Session
 
 from app.config.deps import get_current_user
@@ -48,6 +48,7 @@ from app.services.file_retention_service import (
 )
 from app.services.subscription_service import (
     ensure_upload_storage_available,
+    get_recorded_upload_count,
     get_user_plan_capabilities,
     record_upload_storage_usage,
 )
@@ -326,18 +327,18 @@ async def upload_multiple_csv_datasets(
         )
 
     plan_capabilities = get_user_plan_capabilities(db, current_user)
-    active_dataset_count = count_user_active_datasets(db, current_user.id)
+    recorded_upload_count = get_recorded_upload_count(db, current_user.id)
     max_active_datasets = plan_capabilities["max_active_datasets"]
 
     if (
         max_active_datasets is not None
-        and active_dataset_count + len(files) > max_active_datasets
+        and recorded_upload_count + len(files) > max_active_datasets
     ):
         raise error_response(
             status_code=400,
             detail=(
-                f"Your current plan allows up to {max_active_datasets} active datasets. "
-                "Please delete an existing dataset or upgrade your plan."
+                f"Your current plan allows up to {max_active_datasets} uploaded files. "
+                "Please upgrade your plan."
             ),
         )
 
@@ -478,17 +479,17 @@ def select_excel_sheet_for_upload(
 
     selected_sheet_count = sum(len(selection.selected_sheet_names()) for selection in payload)
     plan_capabilities = get_user_plan_capabilities(db, current_user)
-    active_dataset_count = count_user_active_datasets(db, current_user.id)
+    recorded_upload_count = get_recorded_upload_count(db, current_user.id)
     max_active_datasets = plan_capabilities["max_active_datasets"]
     if (
         max_active_datasets is not None
-        and active_dataset_count + selected_sheet_count > max_active_datasets
+        and recorded_upload_count + selected_sheet_count > max_active_datasets
     ):
         raise error_response(
             status_code=400,
             detail=(
-                f"Your current plan allows up to {max_active_datasets} active datasets. "
-                "Please delete an existing dataset or upgrade your plan."
+                f"Your current plan allows up to {max_active_datasets} uploaded files. "
+                "Please upgrade your plan."
             ),
         )
 
@@ -692,19 +693,35 @@ def merge_csv_datasets(
 
 @router.get("", response_model=CsvDatasetListSuccessResponse)
 def list_csv_datasets(
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=100),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    offset = (page - 1) * limit
+
+    uploaded_query = db.query(CsvUploadedDataset).filter(
+        CsvUploadedDataset.created_by_user_id == current_user.id
+    )
+    merged_query = db.query(CsvMergedDataset).filter(
+        CsvMergedDataset.created_by_user_id == current_user.id
+    )
+
+    uploaded_total = uploaded_query.count()
+    merged_total = merged_query.count()
+
     uploaded_datasets = (
-        db.query(CsvUploadedDataset)
-        .filter(CsvUploadedDataset.created_by_user_id == current_user.id)
+        uploaded_query
         .order_by(CsvUploadedDataset.id.desc())
+        .offset(offset)
+        .limit(limit)
         .all()
     )
     merged_datasets = (
-        db.query(CsvMergedDataset)
-        .filter(CsvMergedDataset.created_by_user_id == current_user.id)
+        merged_query
         .order_by(CsvMergedDataset.id.desc())
+        .offset(offset)
+        .limit(limit)
         .all()
     )
     source_dataset_ids = sorted(
@@ -750,6 +767,14 @@ def list_csv_datasets(
                 )
                 for merged_dataset in merged_datasets
             ],
+            "pagination": {
+                "page": page,
+                "limit": limit,
+                "uploaded_total": uploaded_total,
+                "merged_total": merged_total,
+                "uploaded_total_pages": (uploaded_total + limit - 1) // limit,
+                "merged_total_pages": (merged_total + limit - 1) // limit,
+            },
         },
     )
 

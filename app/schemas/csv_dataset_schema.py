@@ -84,9 +84,19 @@ class CsvMergedDatasetResponse(CsvDatasetSummaryResponse):
     source_datasets: list[CsvMergedSourceDatasetResponse]
 
 
+class CsvDatasetPaginationResponse(BaseModel):
+    page: int
+    limit: int
+    uploaded_total: int
+    merged_total: int
+    uploaded_total_pages: int
+    merged_total_pages: int
+
+
 class CsvDatasetListResponse(BaseModel):
     uploaded_datasets: list[CsvUploadedDatasetResponse]
     merged_datasets: list[CsvMergedDatasetResponse]
+    pagination: CsvDatasetPaginationResponse
 
 
 class MergeJoinColumnMapping(BaseModel):
