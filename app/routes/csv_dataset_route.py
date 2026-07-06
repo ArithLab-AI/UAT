@@ -1,9 +1,11 @@
 import logging
 import os
+from math import ceil
 from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, Query, Request
+from sqlalchemy import String, or_
 from sqlalchemy.orm import Session
 
 from app.config.deps import get_current_user
@@ -84,7 +86,8 @@ UPLOAD_MULTIPLE_OPENAPI = {
 
 router = APIRouter(prefix="/csv-datasets", tags=["CSV Datasets"])
 logger = logging.getLogger(__name__)
-
+DEFAULT_DATASET_PAGE_SIZE = 10
+MAX_DATASET_PAGE_SIZE = 100
 
 def _get_file_size(file) -> int | None:
     if not hasattr(file, "file"):
@@ -304,6 +307,34 @@ def _build_dataset_clean_state_map(
 
     return clean_state_map
 
+def _normalize_search_query(search: str | None) -> str | None:
+    if search is None:
+        return None
+
+    normalized_search = search.strip()
+    return normalized_search or None
+
+def _resolve_search_query(*search_terms: str | None) -> str | None:
+    for search_term in search_terms:
+        normalized_search = _normalize_search_query(search_term)
+        if normalized_search:
+            return normalized_search
+    return None
+
+
+def _pagination_meta(total: int, page: int, page_size: int) -> dict[str, int]:
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": ceil(total / page_size) if total else 0,
+    }
+
+
+def _paginate_dataset_query(query, *, page: int, page_size: int):
+    total = query.order_by(None).count()
+    items = query.offset((page - 1) * page_size).limit(page_size).all()
+    return items, _pagination_meta(total, page, page_size)
 
 @router.post(
     "/upload-multiple",
@@ -693,36 +724,74 @@ def merge_csv_datasets(
 
 @router.get("", response_model=CsvDatasetListSuccessResponse)
 def list_csv_datasets(
-    page: int = Query(1, ge=1),
-    limit: int = Query(10, ge=1, le=100),
+    search: str | None = Query(
+        default=None,
+        description="Search term applied to uploaded and merged datasets unless a list-specific search is provided.",
+    ),
+    uploaded_search: str | None = Query(
+        default=None,
+        description="Search term for uploaded datasets.",
+    ),
+    merged_search: str | None = Query(
+        default=None,
+        description="Search term for merged datasets.",
+    ),
+    uploaded_page: int = Query(default=1, ge=1),
+    uploaded_page_size: int = Query(
+        default=DEFAULT_DATASET_PAGE_SIZE,
+        ge=1,
+        le=MAX_DATASET_PAGE_SIZE,
+    ),
+    merged_page: int = Query(default=1, ge=1),
+    merged_page_size: int = Query(
+        default=DEFAULT_DATASET_PAGE_SIZE,
+        ge=1,
+        le=MAX_DATASET_PAGE_SIZE,
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    offset = (page - 1) * limit
-
     uploaded_query = db.query(CsvUploadedDataset).filter(
         CsvUploadedDataset.created_by_user_id == current_user.id
     )
+    uploaded_search_term = _resolve_search_query(uploaded_search, search)
+    if uploaded_search_term:
+        uploaded_search_pattern = f"%{uploaded_search_term}%"
+        uploaded_query = uploaded_query.filter(
+            or_(
+                CsvUploadedDataset.name.ilike(uploaded_search_pattern),
+                CsvUploadedDataset.file_name.ilike(uploaded_search_pattern),
+                CsvUploadedDataset.sheet_name.ilike(uploaded_search_pattern),
+                CsvUploadedDataset.table_name.ilike(uploaded_search_pattern),
+            )
+        )
+    uploaded_query = uploaded_query.order_by(CsvUploadedDataset.id.desc())
+    uploaded_datasets, uploaded_pagination = _paginate_dataset_query(
+        uploaded_query,
+        page=uploaded_page,
+        page_size=uploaded_page_size,
+    )
+
     merged_query = db.query(CsvMergedDataset).filter(
         CsvMergedDataset.created_by_user_id == current_user.id
     )
-
-    uploaded_total = uploaded_query.count()
-    merged_total = merged_query.count()
-
-    uploaded_datasets = (
-        uploaded_query
-        .order_by(CsvUploadedDataset.id.desc())
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
-    merged_datasets = (
-        merged_query
-        .order_by(CsvMergedDataset.id.desc())
-        .offset(offset)
-        .limit(limit)
-        .all()
+    merged_search_term = _resolve_search_query(merged_search, search)
+    if merged_search_term:
+        merged_search_pattern = f"%{merged_search_term}%"
+        merged_query = merged_query.filter(
+            or_(
+                CsvMergedDataset.name.ilike(merged_search_pattern),
+                CsvMergedDataset.table_name.ilike(merged_search_pattern),
+                CsvMergedDataset.source_datasets_metadata.cast(String).ilike(
+                    merged_search_pattern
+                ),
+            )
+        )
+    merged_query = merged_query.order_by(CsvMergedDataset.id.desc())
+    merged_datasets, merged_pagination = _paginate_dataset_query(
+        merged_query,
+        page=merged_page,
+        page_size=merged_page_size,
     )
     source_dataset_ids = sorted(
         {
@@ -742,42 +811,19 @@ def list_csv_datasets(
         else []
     )
     source_dataset_map = {dataset.id: dataset for dataset in source_datasets}
-    clean_state_map = _build_dataset_clean_state_map(
-        db,
-        current_user=current_user,
-        uploaded_datasets=uploaded_datasets,
-        merged_datasets=merged_datasets,
-    )
 
     return success_response(
         "Datasets fetched successfully",
         data={
-            "uploaded_datasets": [
-                _serialize_uploaded_dataset(
-                    uploaded_dataset,
-                    clean_state_map.get(("uploaded", uploaded_dataset.id)),
-                )
-                for uploaded_dataset in uploaded_datasets
-            ],
+            "uploaded_datasets": uploaded_datasets,
+            "uploaded_pagination": uploaded_pagination,
             "merged_datasets": [
-                _serialize_merged_dataset(
-                    merged_dataset,
-                    source_dataset_map,
-                    clean_state_map.get(("merged", merged_dataset.id)),
-                )
+                _serialize_merged_dataset(merged_dataset, source_dataset_map)
                 for merged_dataset in merged_datasets
             ],
-            "pagination": {
-                "page": page,
-                "limit": limit,
-                "uploaded_total": uploaded_total,
-                "merged_total": merged_total,
-                "uploaded_total_pages": (uploaded_total + limit - 1) // limit,
-                "merged_total_pages": (merged_total + limit - 1) // limit,
-            },
+            "merged_pagination": merged_pagination,
         },
     )
-
 
 @router.post("/uploaded/{dataset_id}/retention", response_model=MessageSuccessResponse)
 def retention_csv_uploaded_dataset(
