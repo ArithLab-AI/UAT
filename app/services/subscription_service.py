@@ -99,6 +99,21 @@ def get_used_upload_storage_bytes(db: Session, user_id: int) -> int:
     return used_file_size_bytes
 
 
+def get_recorded_upload_count(db: Session, user_id: int) -> int:
+    active_subscription = get_active_subscription(db, user_id)
+    if not active_subscription:
+        return 0
+
+    return (
+        db.query(UserUploadStorageUsage)
+        .filter(
+            UserUploadStorageUsage.user_id == user_id,
+            UserUploadStorageUsage.subscription_id == active_subscription.id,
+        )
+        .count()
+    )
+
+
 def ensure_upload_storage_available(
     db: Session,
     *,
