@@ -34,6 +34,7 @@ from app.services.analysis_profile_service import (
     _to_snake_case,
 )
 from app.utils.openai_utils import get_openai_client
+from app.utils.token_usage import TokenUsageLogger
 
 logger = logging.getLogger(__name__)
 
@@ -256,10 +257,11 @@ def _apply_text_cleaning(
     *,
     normalize_missing: bool = False,
     trim_whitespace: bool = False,
+    collapse_spaces: bool = False,
     target_columns: set[str] | None = None,
     preserve_missing_literals: set[str] | None = None,
 ) -> pd.DataFrame:
-    if not normalize_missing and not trim_whitespace:
+    if not normalize_missing and not trim_whitespace and not collapse_spaces:
         return df
 
     normalized_df = df.copy()
@@ -280,7 +282,9 @@ def _apply_text_cleaning(
             if not isinstance(value, str):
                 return value
 
-            transformed = value.strip() if trim_whitespace else value
+            transformed = value.strip() if (trim_whitespace or collapse_spaces) else value
+            if collapse_spaces:
+                transformed = re.sub(r"\s+", " ", transformed)
             normalized_value = transformed.strip().lower()
             if (
                 should_normalize_column
@@ -343,8 +347,125 @@ def _should_normalize_headers(user_prompt: str) -> bool:
 
 def _should_trim_whitespace(user_prompt: str) -> bool:
     normalized_prompt = user_prompt.strip().lower()
-    whitespace_terms = ["whitespace", "leading or trailing", "trim", "strip spaces"]
+    whitespace_terms = [
+        "whitespace",
+        "leading or trailing",
+        "trim",
+        "strip spaces",
+        "extra space",
+        "extra spaces",
+        "double space",
+        "double spaces",
+        "multiple spaces",
+        "collapse space",
+        "collapse spaces",
+        "redundant space",
+        "redundant spaces",
+    ]
     return any(term in normalized_prompt for term in whitespace_terms)
+
+
+def _should_collapse_spaces(user_prompt: str) -> bool:
+    """Detect a request to collapse runs of internal whitespace down to a single
+    space (e.g. "remove extra/double/multiple spaces"), which is fully
+    deterministic and never needs the LLM."""
+    normalized_prompt = user_prompt.strip().lower()
+    collapse_terms = [
+        "extra space",
+        "extra spaces",
+        "double space",
+        "double spaces",
+        "multiple spaces",
+        "collapse space",
+        "collapse spaces",
+        "redundant space",
+        "redundant spaces",
+        "extra whitespace",
+    ]
+    return any(term in normalized_prompt for term in collapse_terms)
+
+
+def _case_conversion_mode(user_prompt: str) -> str | None:
+    """Return "lower"/"upper" for a plain, deterministic case-conversion request,
+    or None when no such request is present or the casing is context-dependent
+    (title/proper/sentence case, capitalization) and genuinely needs the LLM."""
+    normalized_prompt = user_prompt.strip().lower()
+
+    # Context-dependent casing needs judgement (e.g. proper-noun capitalization,
+    # "uppercase the first letter") -> leave it to the LLM.
+    context_dependent_terms = [
+        "capitalize",
+        "capitalization",
+        "title case",
+        "proper case",
+        "sentence case",
+        "first letter",
+        "first character",
+        "each word",
+        "initial letter",
+    ]
+    if any(term in normalized_prompt for term in context_dependent_terms):
+        return None
+
+    # Hard-semantic instructions bundled with the casing request also need the LLM.
+    hard_semantic_terms = [
+        "typo",
+        "spelling",
+        "map value",
+        "map to",
+        "category",
+        "categorize",
+        "translate",
+        "rewrite",
+        "harmonize",
+        "abbreviation",
+    ]
+    if any(term in normalized_prompt for term in hard_semantic_terms):
+        return None
+
+    lower_terms = ["lowercase", "lower case", "to lower", "all lower"]
+    upper_terms = ["uppercase", "upper case", "to upper", "all caps", "all upper"]
+    wants_lower = any(term in normalized_prompt for term in lower_terms)
+    wants_upper = any(term in normalized_prompt for term in upper_terms)
+    if wants_lower and not wants_upper:
+        return "lower"
+    if wants_upper and not wants_lower:
+        return "upper"
+    return None
+
+
+def _is_case_conversion_only_prompt(user_prompt: str) -> bool:
+    return _case_conversion_mode(user_prompt) is not None
+
+
+def _apply_case_conversion(
+    df: pd.DataFrame,
+    *,
+    mode: str,
+    target_columns: set[str] | None = None,
+) -> pd.DataFrame:
+    """Deterministically lower/upper-case string columns, scoped to
+    target_columns when provided. Non-string values and NA are left untouched."""
+    if mode not in {"lower", "upper"}:
+        return df
+
+    converted_df = df.copy()
+    scoped_columns = {str(column) for column in (target_columns or set())}
+    for column in converted_df.columns:
+        if scoped_columns and str(column) not in scoped_columns:
+            continue
+        series = converted_df[column]
+        if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
+            continue
+
+        def _transform_value(value):
+            if not isinstance(value, str):
+                return value
+            return value.lower() if mode == "lower" else value.upper()
+
+        converted_df[column] = series.map(_transform_value)
+
+    return converted_df
 
 
 def _has_semantic_value_cleaning_terms(normalized_prompt: str) -> bool:
@@ -627,6 +748,8 @@ def _requires_ai_cleaning(user_prompt: str) -> bool:
         or _is_numeric_only_prompt(user_prompt)
         or _is_header_only_prompt(user_prompt)
         or _is_header_type_only_prompt(user_prompt)
+        or _is_case_conversion_only_prompt(user_prompt)
+        or _should_collapse_spaces(user_prompt)
     )
     return not deterministic_only
 
@@ -1765,7 +1888,14 @@ def _compute_record_hashes(records: list[dict[str, Any]], *, columns: list[str])
     return pd.util.hash_pandas_object(comparable_df.astype(str), index=False).astype("uint64").tolist()
 
 
-def _invoke_cleaning_batch(chain, batch_json: str, user_prompt: str, expected_rows: int) -> list[dict[str, Any]]:
+def _invoke_cleaning_batch(
+    chain,
+    batch_json: str,
+    user_prompt: str,
+    expected_rows: int,
+    *,
+    max_attempts: int = 2,
+) -> list[dict[str, Any]]:
     retry_prompts = [
         user_prompt,
         (
@@ -1773,11 +1903,14 @@ def _invoke_cleaning_batch(chain, batch_json: str, user_prompt: str, expected_ro
             f"Important: return only a JSON array with exactly {expected_rows} objects, keep all original keys, "
             'and if the instruction asks for a literal placeholder like NaN then output the string value "NaN".'
         ),
-    ]
+    ][: max(1, max_attempts)]
     last_error: Exception | None = None
     for prompt in retry_prompts:
         try:
-            raw_response = chain.invoke({"batch_json": batch_json, "user_prompt": prompt})
+            raw_response = chain.invoke(
+                {"batch_json": batch_json, "user_prompt": prompt},
+                config={"callbacks": [TokenUsageLogger(label="ai-cleaning")]},
+            )
             cleaned_batch = _normalize_cleaned_batch_payload(_extract_json_payload(raw_response))
             if not isinstance(cleaned_batch, list):
                 raise ValueError(f"Expected a list of JSON objects, got {type(cleaned_batch)}")
@@ -1789,27 +1922,46 @@ def _invoke_cleaning_batch(chain, batch_json: str, user_prompt: str, expected_ro
     raise last_error if last_error is not None else ValueError("Cleaning batch failed")
 
 
-def _invoke_cleaning_batch_with_fallback(chain, batch_records: list[dict[str, Any]], user_prompt: str) -> list[dict[str, Any]]:
+def _invoke_cleaning_batch_with_fallback(
+    chain,
+    batch_records: list[dict[str, Any]],
+    user_prompt: str,
+    *,
+    _depth: int = 0,
+) -> list[dict[str, Any]]:
     expected_rows = len(batch_records)
     if expected_rows == 0:
         return []
 
+    # The top-level attempt keeps both prompts (best chance to succeed without
+    # splitting). Once we are already bisecting, retry only once per sub-batch so
+    # the same rows are not re-sent to the model twice at every level.
+    max_attempts = 2 if _depth == 0 else 1
     batch_json = json.dumps(batch_records, ensure_ascii=False, separators=(",", ":"))
     try:
-        return _invoke_cleaning_batch(chain=chain, batch_json=batch_json, user_prompt=user_prompt, expected_rows=expected_rows)
+        return _invoke_cleaning_batch(
+            chain=chain,
+            batch_json=batch_json,
+            user_prompt=user_prompt,
+            expected_rows=expected_rows,
+            max_attempts=max_attempts,
+        )
     except Exception:
-        if expected_rows == 1:
-            return [dict(batch_records[0])]
+        # Stop recursing (and re-sending) once a single row still fails or we hit
+        # the depth cap; return the original rows unchanged rather than burning
+        # more tokens on a chunk the model keeps mishandling.
+        if expected_rows == 1 or _depth >= settings.UAT_AI_CLEANING_MAX_FALLBACK_DEPTH:
+            return [dict(row) for row in batch_records]
 
         mid = expected_rows // 2
         left_records = batch_records[:mid]
         right_records = batch_records[mid:]
         try:
-            left_cleaned = _invoke_cleaning_batch_with_fallback(chain, left_records, user_prompt)
+            left_cleaned = _invoke_cleaning_batch_with_fallback(chain, left_records, user_prompt, _depth=_depth + 1)
         except Exception:
             left_cleaned = [dict(row) for row in left_records]
         try:
-            right_cleaned = _invoke_cleaning_batch_with_fallback(chain, right_records, user_prompt)
+            right_cleaned = _invoke_cleaning_batch_with_fallback(chain, right_records, user_prompt, _depth=_depth + 1)
         except Exception:
             right_cleaned = [dict(row) for row in right_records]
         return left_cleaned + right_cleaned
@@ -1958,6 +2110,8 @@ def clean_dataframe_chunk(
         user_prompt
     )
     should_trim_whitespace = _should_trim_whitespace(user_prompt)
+    should_collapse_spaces = _should_collapse_spaces(user_prompt)
+    case_conversion_mode = _case_conversion_mode(user_prompt)
     target_columns = set(target_columns_hint or []) | _extract_target_columns_from_prompt([str(column) for column in df.columns], user_prompt)
     active_prompt_type_hint = _normalize_prompt_type_hint(prompt_type_hint) or (
         plan.prompt_type_hint if plan is not None else None
@@ -1975,9 +2129,16 @@ def clean_dataframe_chunk(
         df,
         normalize_missing=should_normalize_missing,
         trim_whitespace=should_trim_whitespace,
+        collapse_spaces=should_collapse_spaces,
         target_columns=target_columns,
         preserve_missing_literals={missing_replacement or NULL_OUTPUT_TOKEN},
     )
+    if case_conversion_mode:
+        cleaned_df = _apply_case_conversion(
+            cleaned_df,
+            mode=case_conversion_mode,
+            target_columns=target_columns,
+        )
     if (
         hinted_mode in {"numeric_imputation", "mode_imputation"}
         or _is_numeric_imputation_only_prompt(user_prompt)

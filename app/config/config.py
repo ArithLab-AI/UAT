@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     UAT_AI_CLEANING_TEMPERATURE: float = 0
     UAT_AI_CLEANING_MAX_TOKENS: int = 3000
     UAT_AI_BATCH_SIZE: int = 50
+    # Caps how deep the batch bisection fallback recurses before a stubborn
+    # sub-batch is returned as-is (original rows). Bounds worst-case token use
+    # when the model keeps returning malformed/short responses for a chunk.
+    UAT_AI_CLEANING_MAX_FALLBACK_DEPTH: int = 3
     UAT_AI_VALUE_BATCH_SIZE: int = 500
     UAT_AI_VALUE_BATCH_PARALLELISM: int = 8
     UAT_AI_VALUE_CLEAN_MAX_UNIQUE_VALUES: int = 5000

@@ -101,6 +101,12 @@ DATE_NAME_HINT_MIN_RATIO = 0.3
 # normalization, which strips the "%".
 INTEGER_NAME_HINT_MIN_RATIO = 0.3
 FLOAT_NAME_HINT_MIN_RATIO = 0.3
+# Generic guard applied to every column-type candidate (email / phone / numeric /
+# age / date). A column-name hint alone is never enough to flag a column as a broken
+# type X: at least this share of the actual values must parse as type X. This is what
+# stops float columns like "uptime_pct" (name contains "time") from being reported as
+# invalid date columns, "email_count" from being treated as email, etc.
+CANDIDATE_NAME_HINT_MIN_RATIO = 0.3
 
 
 @dataclass
@@ -638,25 +644,43 @@ def build_dataset_profile_from_chunks(chunks: Iterable[pd.DataFrame]) -> dict[st
             continue
 
         column_name_lower = column_name.lower()
+        # Every candidate below follows the same data-driven rule: a column-name hint
+        # only counts when the actual values back it up (>= CANDIDATE_NAME_HINT_MIN_RATIO),
+        # while a strong value match (>= 0.6) stands on its own regardless of the name.
         email_validity_ratio = float(stats["email_valid_count"]) / non_null_count
-        is_email_candidate = _candidate_by_name(column_name_lower, EMAIL_COLUMN_HINTS) or email_validity_ratio >= 0.6
+        is_email_candidate = email_validity_ratio >= 0.6 or (
+            _candidate_by_name(column_name_lower, EMAIL_COLUMN_HINTS)
+            and email_validity_ratio >= CANDIDATE_NAME_HINT_MIN_RATIO
+        )
 
         phone_validity_ratio = float(stats["phone_valid_count"]) / non_null_count
-        is_phone_candidate = _candidate_by_name(column_name_lower, PHONE_COLUMN_HINTS) or phone_validity_ratio >= 0.6
+        is_phone_candidate = phone_validity_ratio >= 0.6 or (
+            _candidate_by_name(column_name_lower, PHONE_COLUMN_HINTS)
+            and phone_validity_ratio >= CANDIDATE_NAME_HINT_MIN_RATIO
+        )
 
         expected_type = _infer_expected_validation_type(column_name, stats, non_null_count)
         profile["expected_type"] = expected_type
 
-        is_age_candidate = _is_age_column_name(column_name)
+        age_success_ratio = float(stats["age_valid_count"]) / non_null_count
+        is_age_candidate = (
+            _is_age_column_name(column_name) and age_success_ratio >= CANDIDATE_NAME_HINT_MIN_RATIO
+        )
         numeric_success_ratio = float(stats["numeric_valid_count"]) / non_null_count
-        is_numeric_candidate = _candidate_by_name(column_name_lower, NUMERIC_COLUMN_HINTS)
-        if not is_numeric_candidate and not is_phone_candidate and not is_email_candidate and not is_age_candidate:
-            is_numeric_candidate = numeric_success_ratio >= 0.6
+        is_numeric_candidate = False
+        if not is_phone_candidate and not is_email_candidate and not is_age_candidate:
+            is_numeric_candidate = numeric_success_ratio >= 0.6 or (
+                _candidate_by_name(column_name_lower, NUMERIC_COLUMN_HINTS)
+                and numeric_success_ratio >= CANDIDATE_NAME_HINT_MIN_RATIO
+            )
 
         date_success_ratio = float(stats["date_valid_count"]) / non_null_count
-        is_date_candidate = _candidate_by_name(column_name_lower, DATE_COLUMN_HINTS)
-        if not is_date_candidate and not is_phone_candidate and not is_email_candidate:
-            is_date_candidate = date_success_ratio >= 0.6
+        is_date_candidate = False
+        if not is_phone_candidate and not is_email_candidate:
+            is_date_candidate = date_success_ratio >= 0.6 or (
+                _candidate_by_name(column_name_lower, DATE_COLUMN_HINTS)
+                and date_success_ratio >= CANDIDATE_NAME_HINT_MIN_RATIO
+            )
 
         if expected_type == "boolean":
             invalid_boolean_percent = round(float(non_null_count - stats["boolean_valid_count"]) / row_count_safe * 100, 2)

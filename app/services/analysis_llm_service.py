@@ -17,6 +17,7 @@ from app.services.analysis_suggestion_match_service import (
     normalize_cleaning_prompt_type,
 )
 from app.utils.openai_utils import get_openai_client
+from app.utils.token_usage import TokenUsageLogger
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +176,8 @@ def _call_openai(config: AnalysisLLMConfig, *, system_prompt: str, user_prompt: 
         [
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_prompt),
-        ]
+        ],
+        config={"callbacks": [TokenUsageLogger(label="analysis-suggestions")]},
     )
 
     raw_text = str(getattr(response, "content", "") or "").strip()
