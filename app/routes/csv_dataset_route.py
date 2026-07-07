@@ -113,6 +113,12 @@ def _build_uploaded_dataset_name(file_name: str, sheet_name: str | None = None) 
     return dataset_name
 
 
+def _build_uploaded_file_name(file_name: str, sheet_name: str | None = None) -> str:
+    if sheet_name:
+        return f"{file_name} ({sheet_name})"
+    return file_name
+
+
 def _normalize_sort_timestamp(value: datetime | None) -> float:
     if value is None:
         return float("-inf")
@@ -336,6 +342,16 @@ def _paginate_dataset_query(query, *, page: int, page_size: int):
     items = query.offset((page - 1) * page_size).limit(page_size).all()
     return items, _pagination_meta(total, page, page_size)
 
+
+def _selected_sheet_names_for_route(selection: SelectExcelSheetRequest) -> list[str]:
+    sheet_names = [sheet_name.strip() for sheet_name in selection.selected_sheet_names()]
+    if len(set(sheet_names)) != len(sheet_names):
+        raise error_response(
+            status_code=400,
+            detail="Sheet names must be unique for each file token",
+        )
+    return sheet_names
+
 @router.post(
     "/upload-multiple",
     response_model=CsvUploadedDatasetListSuccessResponse,
@@ -508,7 +524,13 @@ def select_excel_sheet_for_upload(
             detail="At least one sheet selection is required",
         )
 
-    selected_sheet_count = sum(len(selection.selected_sheet_names()) for selection in payload)
+    selected_sheet_names_by_selection = [
+        (selection, _selected_sheet_names_for_route(selection))
+        for selection in payload
+    ]
+    selected_sheet_count = sum(
+        len(sheet_names) for _, sheet_names in selected_sheet_names_by_selection
+    )
     plan_capabilities = get_user_plan_capabilities(db, current_user)
     recorded_upload_count = get_recorded_upload_count(db, current_user.id)
     max_active_datasets = plan_capabilities["max_active_datasets"]
@@ -526,12 +548,20 @@ def select_excel_sheet_for_upload(
 
     selected_uploads = []
     total_selected_upload_size = 0
-    for selection in payload:
+    seen_file_sheet_selections: set[tuple[str, str]] = set()
+    for selection, selected_sheet_names in selected_sheet_names_by_selection:
         temporary_upload = validate_temporary_upload(
             token=selection.file_token,
             user_id=current_user.id,
         )
-        for selected_sheet_name in selection.selected_sheet_names():
+        for selected_sheet_name in selected_sheet_names:
+            file_sheet_key = (selection.file_token, selected_sheet_name)
+            if file_sheet_key in seen_file_sheet_selections:
+                raise error_response(
+                    status_code=400,
+                    detail="Each sheet can only be selected once per uploaded file",
+                )
+            seen_file_sheet_selections.add(file_sheet_key)
             (
                 file_name,
                 file_size,
@@ -553,6 +583,7 @@ def select_excel_sheet_for_upload(
             selected_uploads.append(
                 {
                     "file_name": file_name,
+                    "display_file_name": _build_uploaded_file_name(file_name, sheet_name),
                     "file_size": file_size,
                     "columns": columns,
                     "internal_columns": internal_columns,
@@ -569,7 +600,7 @@ def select_excel_sheet_for_upload(
                 selected_upload["file_name"],
                 selected_upload["sheet_name"],
             ),
-            file_name=selected_upload["file_name"],
+            file_name=selected_upload["display_file_name"],
             sheet_name=selected_upload["sheet_name"],
             file_size=selected_upload["file_size"],
             columns=selected_upload["columns"],
