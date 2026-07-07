@@ -9,8 +9,8 @@ from fastapi import HTTPException
 from app.services.csv_service import (
     _build_row_from_values,
     _clean_upload_file_name,
-    _normalize_columns,
     _normalize_scalar_value,
+    _split_rows_by_detected_header,
 )
 from app.services.temporary_upload_service import TemporaryUpload
 from app.utils.responses import error_response
@@ -69,15 +69,17 @@ def _dataframe_to_rows(
     if dataframe.empty and len(dataframe.columns) == 0:
         raise error_response(status_code=400, detail=f"{file_name} selected sheet is empty")
 
-    original_columns, internal_columns = _normalize_columns(file_name, list(dataframe.columns))
+    original_columns, internal_columns, data_rows = _split_rows_by_detected_header(
+        file_name,
+        dataframe.astype(object).where(pd.notna(dataframe), None).values.tolist(),
+    )
     if not internal_columns:
         raise error_response(status_code=400, detail=f"{file_name} selected sheet is empty")
-    if dataframe.empty:
+    if not data_rows:
         raise error_response(status_code=400, detail=f"{file_name} selected sheet does not contain data rows")
 
-    normalized_dataframe = dataframe.astype(object).where(pd.notna(dataframe), None)
     rows: list[dict[str, Any]] = []
-    for values in normalized_dataframe.itertuples(index=False, name=None):
+    for values in data_rows:
         rows.append(
             {
                 column: _normalize_scalar_value(values[index] if index < len(values) else None)
@@ -102,15 +104,22 @@ def _process_xlsx_selected_sheet(
             data_only=True,
         )
         sheet = workbook[sheet_name]
-        row_iterator = sheet.iter_rows(values_only=True)
-        header_row = next(row_iterator, None)
-        columns, internal_columns = _normalize_columns(
+        sheet_rows = []
+        for row_count, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+            if row_count > MAX_EXCEL_SHEET_ROWS + 25:
+                raise error_response(
+                    status_code=400,
+                    detail=f"{sheet_name} exceeds the maximum supported row count of {MAX_EXCEL_SHEET_ROWS}",
+                )
+            sheet_rows.append(list(row or []))
+
+        columns, internal_columns, data_rows = _split_rows_by_detected_header(
             file_name,
-            list(header_row) if header_row is not None else [],
+            sheet_rows,
         )
 
         rows = []
-        for row_count, row in enumerate(row_iterator, start=1):
+        for row_count, row in enumerate(data_rows, start=1):
             if row_count > MAX_EXCEL_SHEET_ROWS:
                 raise error_response(
                     status_code=400,
@@ -157,6 +166,7 @@ def process_selected_sheet(
             dataframe = pd.read_excel(
                 file_path,
                 sheet_name=sheet_name,
+                header=None,
                 nrows=MAX_EXCEL_SHEET_ROWS + 1,
             )
         except Exception as exc:
