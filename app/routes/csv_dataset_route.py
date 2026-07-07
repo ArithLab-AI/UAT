@@ -352,6 +352,25 @@ def _selected_sheet_names_for_route(selection: SelectExcelSheetRequest) -> list[
         )
     return sheet_names
 
+
+def _ensure_merge_allowed(plan_capabilities: dict, source_count: int) -> None:
+    if not plan_capabilities["can_merge"]:
+        raise error_response(
+            status_code=400,
+            detail="Data merging is not available on your current plan. Please upgrade your plan.",
+        )
+
+    max_merge_sources = plan_capabilities["max_merge_sources"]
+    if max_merge_sources is not None and source_count > max_merge_sources:
+        raise error_response(
+            status_code=400,
+            detail=(
+                f"Your current plan allows merging up to {max_merge_sources} source datasets at a time. "
+                "Please upgrade your plan."
+            ),
+        )
+
+
 @router.post(
     "/upload-multiple",
     response_model=CsvUploadedDatasetListSuccessResponse,
@@ -644,11 +663,7 @@ def suggest_csv_dataset_merge(
     current_user: User = Depends(get_current_user),
 ):
     plan_capabilities = get_user_plan_capabilities(db, current_user)
-    if not plan_capabilities["can_merge"]:
-        raise error_response(
-            status_code=400,
-            detail="Data merging is not available on your current plan. Please upgrade your plan.",
-        )
+    _ensure_merge_allowed(plan_capabilities, len(payload.source_dataset_ids))
 
     source_datasets = get_ordered_uploaded_datasets(
         db,
@@ -668,11 +683,7 @@ def preview_csv_dataset_merge(
     current_user: User = Depends(get_current_user),
 ):
     plan_capabilities = get_user_plan_capabilities(db, current_user)
-    if not plan_capabilities["can_merge"]:
-        raise error_response(
-            status_code=400,
-            detail="Data merging is not available on your current plan. Please upgrade your plan.",
-        )
+    _ensure_merge_allowed(plan_capabilities, len(payload.source_dataset_ids))
 
     source_datasets = get_ordered_uploaded_datasets(
         db,
@@ -696,21 +707,7 @@ def merge_csv_datasets(
     current_user: User = Depends(get_current_user),
 ):
     plan_capabilities = get_user_plan_capabilities(db, current_user)
-    if not plan_capabilities["can_merge"]:
-        raise error_response(
-            status_code=400,
-            detail="Data merging is not available on your current plan. Please upgrade your plan.",
-        )
-
-    max_merge_sources = plan_capabilities["max_merge_sources"]
-    if max_merge_sources is not None and len(payload.source_dataset_ids) > max_merge_sources:
-        raise error_response(
-            status_code=400,
-            detail=(
-                f"Your current plan allows merging up to {max_merge_sources} source datasets at a time. "
-                "Please upgrade your plan."
-            ),
-        )
+    _ensure_merge_allowed(plan_capabilities, len(payload.source_dataset_ids))
 
     active_dataset_count = count_user_active_datasets(db, current_user.id)
     max_active_datasets = plan_capabilities["max_active_datasets"]
