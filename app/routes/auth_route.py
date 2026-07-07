@@ -11,6 +11,7 @@ from app.db.database import get_db
 from app.config.deps import get_current_user, send_otp_email
 from app.config.config import settings
 from app.auth.security import hash_password, verify_password
+from app.enum.user_role_enum import FREE_USER
 from app.schemas.common_schema import MessageSuccessResponse
 from app.services.subscription_service import ensure_default_free_subscription
 from app.services.file_retention_service import get_user_retention_summary
@@ -53,12 +54,22 @@ def register(payload: auth_schema.Register, db: Session = Depends(get_db)):
         username=payload.username,
         first_name=payload.first_name,
         last_name=payload.last_name,
-        user_role=payload.user_role,
+        user_role=FREE_USER,
         password=hash_password(payload.password),
         is_verified=True
     )
 
     db.add(user)
+    db.flush()
+    subscription = ensure_default_free_subscription(db, user.id)
+    if not subscription or not subscription.plan:
+        db.rollback()
+        logger.error("Register failed for email=%s: default free subscription was not assigned", payload.email)
+        raise error_response(
+            status_code=500,
+            detail="Default free subscription is not configured",
+        )
+
     db.commit()
     db.refresh(user)
     logger.info("User registered successfully user_id=%s email=%s", user.id, user.email)

@@ -225,6 +225,56 @@ def _normalize_columns(file_name: str, columns: list[Any]) -> tuple[list[str], l
     return original_columns, internal_columns
 
 
+def _is_empty_upload_row(row: list[Any]) -> bool:
+    return all(_normalize_header_value(value) == "" for value in row)
+
+
+def _is_header_annotation_row(row: list[Any]) -> bool:
+    non_empty_values = [
+        _normalize_header_value(value)
+        for value in row
+        if _normalize_header_value(value) != ""
+    ]
+    if not non_empty_values:
+        return False
+    return all(value.startswith("(") and value.endswith(")") for value in non_empty_values)
+
+
+def _detect_header_row_index(rows: list[list[Any]]) -> int:
+    scan_rows = rows[:25]
+    best_index = 0
+    best_non_empty_count = -1
+
+    for index, row in enumerate(scan_rows):
+        non_empty_count = sum(1 for value in row if _normalize_header_value(value) != "")
+        if non_empty_count > best_non_empty_count:
+            best_index = index
+            best_non_empty_count = non_empty_count
+
+    return best_index
+
+
+def _split_rows_by_detected_header(
+    file_name: str,
+    rows: list[list[Any]],
+) -> tuple[list[str], list[str], list[list[Any]]]:
+    if not rows:
+        raise error_response(
+            status_code=400,
+            detail=f"{file_name} does not contain a header row",
+        )
+
+    header_index = _detect_header_row_index(rows)
+    header_row = rows[header_index]
+    original_columns, internal_columns = _normalize_columns(file_name, header_row)
+
+    data_rows = rows[header_index + 1 :]
+    while data_rows and (_is_empty_upload_row(data_rows[0]) or _is_header_annotation_row(data_rows[0])):
+        data_rows = data_rows[1:]
+
+    return original_columns, internal_columns, data_rows
+
+
 def _get_csv_dialect(text_content: str):
     sample = text_content[:4096]
     try:
@@ -243,11 +293,13 @@ def _parse_csv_content(file_name: str, content: bytes) -> tuple[list[str], list[
         ) from exc
 
     csv_reader = csv.reader(io.StringIO(text_content), dialect=_get_csv_dialect(text_content))
-    columns = next(csv_reader, None)
-    original_columns, internal_columns = _normalize_columns(file_name, columns or [])
+    original_columns, internal_columns, data_rows = _split_rows_by_detected_header(
+        file_name,
+        [list(row or []) for row in csv_reader],
+    )
 
     rows = []
-    for row in csv_reader:
+    for row in data_rows:
         rows.append(_build_row_from_values(internal_columns, row, missing_value=""))
 
     return original_columns, internal_columns, rows
@@ -270,12 +322,14 @@ def _parse_xlsx_content(file_name: str, content: bytes) -> tuple[list[str], list
     if sheet is None:
         raise error_response(status_code=400, detail=f"{file_name} does not contain any sheets")
 
-    iterator = sheet.iter_rows(values_only=True)
-    header_row = next(iterator, None)
-    original_columns, internal_columns = _normalize_columns(file_name, list(header_row) if header_row is not None else [])
+    sheet_rows = [list(row or []) for row in sheet.iter_rows(values_only=True)]
+    original_columns, internal_columns, data_rows = _split_rows_by_detected_header(
+        file_name,
+        sheet_rows,
+    )
 
     rows = []
-    for row in iterator:
+    for row in data_rows:
         rows.append(_build_row_from_values(internal_columns, list(row or [])))
 
     workbook.close()
@@ -295,12 +349,15 @@ def _parse_xls_content(file_name: str, content: bytes) -> tuple[list[str], list[
         raise error_response(status_code=400, detail=f"{file_name} does not contain any sheets")
 
     sheet = workbook.sheet_by_index(0)
-    header_row = sheet.row_values(0) if sheet.nrows else []
-    original_columns, internal_columns = _normalize_columns(file_name, header_row)
+    sheet_rows = [sheet.row_values(row_index) for row_index in range(sheet.nrows)]
+    original_columns, internal_columns, data_rows = _split_rows_by_detected_header(
+        file_name,
+        sheet_rows,
+    )
 
     rows = []
-    for row_index in range(1, sheet.nrows):
-        rows.append(_build_row_from_values(internal_columns, sheet.row_values(row_index)))
+    for row in data_rows:
+        rows.append(_build_row_from_values(internal_columns, row))
 
     return original_columns, internal_columns, rows
 
