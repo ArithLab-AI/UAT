@@ -861,13 +861,30 @@ def list_csv_datasets(
     )
     source_dataset_map = {dataset.id: dataset for dataset in source_datasets}
 
+    clean_state_map = _build_dataset_clean_state_map(
+        db,
+        current_user=current_user,
+        uploaded_datasets=uploaded_datasets,
+        merged_datasets=merged_datasets,
+    )
+
     return success_response(
         "Datasets fetched successfully",
         data={
-            "uploaded_datasets": uploaded_datasets,
+            "uploaded_datasets": [
+                _serialize_uploaded_dataset(
+                    uploaded_dataset,
+                    clean_state_map.get(("uploaded", uploaded_dataset.id)),
+                )
+                for uploaded_dataset in uploaded_datasets
+            ],
             "uploaded_pagination": uploaded_pagination,
             "merged_datasets": [
-                _serialize_merged_dataset(merged_dataset, source_dataset_map)
+                _serialize_merged_dataset(
+                    merged_dataset,
+                    source_dataset_map,
+                    clean_state_map.get(("merged", merged_dataset.id)),
+                )
                 for merged_dataset in merged_datasets
             ],
             "merged_pagination": merged_pagination,

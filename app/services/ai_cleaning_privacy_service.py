@@ -7,6 +7,15 @@ EMAIL_PATTERN = re.compile(r"^[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}$", re.IGNO
 PHONE_DIGITS_PATTERN = re.compile(r"^\d{10,15}$")
 ID_LIKE_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9\-_]{7,}$", re.IGNORECASE)
 
+# Number of leading non-empty values sampled per column for value-based screening.
+PRIVACY_SAMPLE_SIZE = 25
+# A column is value-blocked only when at least this share of its sampled values look
+# sensitive. Genuine PII columns (emails, phones, account/card numbers) are ~100%
+# sensitive-looking, whereas a numeric column such as "price" only has the odd large
+# amount that happens to resemble an ID/phone — one such value must not block the whole
+# column (and silently no-op its cleaning).
+SENSITIVE_VALUE_RATIO = 0.5
+
 SENSITIVE_COLUMN_HINTS = (
     "name",
     "full_name",
@@ -96,9 +105,11 @@ def select_llm_safe_columns(df: pd.DataFrame, ai_columns: list[str]) -> list[str
             continue
 
         series = df[column]
-        sample_values = [value for value in series.head(25).tolist() if not _is_empty(value)]
-        if any(value_looks_sensitive(value) for value in sample_values):
-            continue
+        sample_values = [value for value in series.head(PRIVACY_SAMPLE_SIZE).tolist() if not _is_empty(value)]
+        if sample_values:
+            sensitive_count = sum(1 for value in sample_values if value_looks_sensitive(value))
+            if sensitive_count / len(sample_values) >= SENSITIVE_VALUE_RATIO:
+                continue
 
         safe_columns.append(column)
 
