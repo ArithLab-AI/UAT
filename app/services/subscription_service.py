@@ -65,13 +65,9 @@ def get_plan_capabilities(plan_name: str | None) -> dict:
 def get_user_storage_summary(db: Session, user_id: int, plan_name: str | None) -> dict:
     plan_capabilities = get_plan_capabilities(plan_name)
     total_file_size_bytes = plan_capabilities["max_file_size_bytes"]
-    active_subscription = get_active_subscription(db, user_id)
     used_file_size_bytes = (
-        db.query(func.coalesce(func.sum(UserUploadStorageUsage.file_size_bytes), 0))
-        .filter(
-            UserUploadStorageUsage.user_id == user_id,
-            UserUploadStorageUsage.subscription_id == active_subscription.id,
-        )
+        db.query(func.coalesce(func.sum(CsvUploadedDataset.file_size), 0))
+        .filter(CsvUploadedDataset.created_by_user_id == user_id)
         .scalar()
     ) or 0
 
@@ -87,29 +83,18 @@ def get_user_storage_summary(db: Session, user_id: int, plan_name: str | None) -
 
 
 def get_used_upload_storage_bytes(db: Session, user_id: int) -> int:
-    active_subscription = get_active_subscription(db, user_id)
     used_file_size_bytes = (
-        db.query(func.coalesce(func.sum(UserUploadStorageUsage.file_size_bytes), 0))
-        .filter(
-            UserUploadStorageUsage.user_id == user_id,
-            UserUploadStorageUsage.subscription_id == active_subscription.id,
-        )
+        db.query(func.coalesce(func.sum(CsvUploadedDataset.file_size), 0))
+        .filter(CsvUploadedDataset.created_by_user_id == user_id)
         .scalar()
     ) or 0
     return used_file_size_bytes
 
 
 def get_recorded_upload_count(db: Session, user_id: int) -> int:
-    active_subscription = get_active_subscription(db, user_id)
-    if not active_subscription:
-        return 0
-
     return (
-        db.query(UserUploadStorageUsage)
-        .filter(
-            UserUploadStorageUsage.user_id == user_id,
-            UserUploadStorageUsage.subscription_id == active_subscription.id,
-        )
+        db.query(CsvUploadedDataset)
+        .filter(CsvUploadedDataset.created_by_user_id == user_id)
         .count()
     )
 
@@ -155,11 +140,15 @@ def record_upload_storage_usage(
     )
 
     if existing_usage:
+        existing_usage.subscription_id = active_subscription.id if active_subscription else None
+        existing_usage.file_size_bytes = dataset.file_size
+        existing_usage.file_name = dataset.file_name
+        existing_usage.sheet_name = dataset.sheet_name
         return existing_usage
 
     usage = UserUploadStorageUsage(
         user_id=user_id,
-        subscription_id=active_subscription.id,
+        subscription_id=active_subscription.id if active_subscription else None,
         uploaded_dataset_id=dataset.id,
         file_size_bytes=dataset.file_size,
         file_name=dataset.file_name,

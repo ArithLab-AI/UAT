@@ -102,17 +102,16 @@ class MergeJoinColumnMapping(BaseModel):
 
 
 class MultiSourceJoinRequest(BaseModel):
-    source_dataset_ids: list[int] = Field(..., min_length=1)
+    source_dataset_ids: list[int] = Field(..., min_length=2)
     merge_type: Literal["inner", "left", "right", "full"] | None = None
     join_columns: list[MergeJoinColumnMapping] | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def require_join_details_for_multiple_sources(self):
-        if len(self.source_dataset_ids) > 1:
-            if self.merge_type is None:
-                raise ValueError("Merge type is required when merging multiple source datasets")
-            if not self.join_columns:
-                raise ValueError("At least one join column is required when merging multiple source datasets")
+        if self.merge_type is None:
+            raise ValueError("Merge type is required when merging source datasets")
+        if not self.join_columns:
+            raise ValueError("At least one join column is required when merging source datasets")
         return self
 
 
