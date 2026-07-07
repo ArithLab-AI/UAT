@@ -3,7 +3,7 @@ from typing import Optional
 
 from pydantic import BaseModel, EmailStr, validator
 
-from app.enum.user_role_enum import DEFAULT_USER_ROLE
+from app.enum.user_role_enum import DEFAULT_USER_ROLE, FREE_USER
 from app.enum.user_role_enum import normalize_user_role
 from app.schemas.common_schema import SuccessResponse
 
@@ -18,7 +18,10 @@ class Register(BaseModel):
 
     @validator("user_role", pre=True)
     def validate_user_role(cls, value):
-        return normalize_user_role(value)
+        normalized_role = normalize_user_role(value)
+        if normalized_role != FREE_USER:
+            raise ValueError("New users must register with the Free plan")
+        return normalized_role
 
 
 class Login(BaseModel):
