@@ -404,7 +404,7 @@ async def upload_multiple_csv_datasets(
             status_code=400,
             detail=(
                 f"Your current plan allows up to {max_active_datasets} uploaded files. "
-                "Please upgrade your plan."
+                "You have reached your upload limit. Please upgrade your plan."
             ),
         )
 
@@ -561,7 +561,7 @@ def select_excel_sheet_for_upload(
             status_code=400,
             detail=(
                 f"Your current plan allows up to {max_active_datasets} uploaded files. "
-                "Please upgrade your plan."
+                "You have reached your upload limit. Please upgrade your plan."
             ),
         )
 
