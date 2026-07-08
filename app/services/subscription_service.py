@@ -92,11 +92,27 @@ def get_used_upload_storage_bytes(db: Session, user_id: int) -> int:
 
 
 def get_recorded_upload_count(db: Session, user_id: int) -> int:
-    return (
-        db.query(CsvUploadedDataset)
-        .filter(CsvUploadedDataset.created_by_user_id == user_id)
+    recorded_upload_count = (
+        db.query(UserUploadStorageUsage)
+        .filter(UserUploadStorageUsage.user_id == user_id)
         .count()
     )
+    recorded_dataset_ids = (
+        db.query(UserUploadStorageUsage.uploaded_dataset_id)
+        .filter(
+            UserUploadStorageUsage.user_id == user_id,
+            UserUploadStorageUsage.uploaded_dataset_id.isnot(None),
+        )
+    )
+    unrecorded_active_upload_count = (
+        db.query(CsvUploadedDataset)
+        .filter(
+            CsvUploadedDataset.created_by_user_id == user_id,
+            CsvUploadedDataset.id.notin_(recorded_dataset_ids),
+        )
+        .count()
+    )
+    return recorded_upload_count + unrecorded_active_upload_count
 
 
 def ensure_upload_storage_available(
