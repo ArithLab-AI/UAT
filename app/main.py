@@ -19,6 +19,7 @@ from app.utils.object_storage import get_object_storage_service
 from app.utils.responses import http_exception_response, validation_error_response
 from app.utils.subs_plan_seed import seed_subscription_plans
 from app.utils.ai_cleaning_schema_setup import ensure_ai_cleaning_schema
+from app.utils.ai_cleaning_job_reaper import reap_stale_ai_cleaning_jobs
 from app.utils.subscription_schema_setup import ensure_subscription_schema
 from app.services.file_retention_service import (
     start_file_retention_scheduler,
@@ -70,6 +71,7 @@ def startup_event():
     db = SessionLocal()
     try:
         seed_subscription_plans(db)
+        reap_stale_ai_cleaning_jobs(db)
     finally:
         db.close()
     start_file_retention_scheduler()

@@ -37,6 +37,12 @@ class Settings(BaseSettings):
     UAT_AI_CLEANING_MODEL: Optional[str] = None
     UAT_AI_CLEANING_TEMPERATURE: float = 0
     UAT_AI_CLEANING_MAX_TOKENS: int = 3000
+    # Per-request LLM timeout (seconds) and retry cap. Without these the OpenAI SDK can
+    # block a cleaning batch for its long default timeout, leaving the background job
+    # stuck in "processing". A bounded timeout makes a hung call fail fast so the job is
+    # marked "failed" instead of hanging forever.
+    UAT_AI_LLM_TIMEOUT_SECONDS: float = 60.0
+    UAT_AI_LLM_MAX_RETRIES: int = 2
     UAT_AI_BATCH_SIZE: int = 50
     # Caps how deep the batch bisection fallback recurses before a stubborn
     # sub-batch is returned as-is (original rows). Bounds worst-case token use

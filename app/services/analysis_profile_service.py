@@ -1061,7 +1061,22 @@ def generate_rule_based_suggestions(profile: dict[str, Any], *, max_suggestions:
             )
         )
 
-    missing_value_columns = _columns_with_metric(columns, "null_percent", threshold=10.0)
+    # Numeric/date columns with missing values are already handled by the dedicated
+    # imputation suggestions (fill with mean / mode) added below. Exclude them here so a
+    # column does not get both a "fill with average" suggestion and a redundant generic
+    # "missing values" suggestion.
+    imputation_covered_columns = {
+        str(column.get("name"))
+        for column in columns
+        if str(column.get("name", "")).strip()
+        and float(column.get("null_percent", 0.0)) > 0.0
+        and str(column.get("expected_type", "")) in {"integer", "float", "date"}
+    }
+    missing_value_columns = [
+        column
+        for column in _columns_with_metric(columns, "null_percent", threshold=10.0)
+        if column not in imputation_covered_columns
+    ]
     for missing_targets in _group_column_targets(missing_value_columns):
         suggestions.append(
             DataSuggestion(
