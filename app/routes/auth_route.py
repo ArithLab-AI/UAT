@@ -1,6 +1,11 @@
 import secrets
 import logging
+from app.models.ai_cleaning_models import AICleaningJobDetail
+from app.models.analysis_models import AnalysisSuggestion, DatasetAnalysis
 from app.models import auth_models
+from app.models.csv_dataset_models import CsvMergedDataset, CsvUploadedDataset
+from app.models.file_upload_models import UploadedFile
+from app.models.subscription_models import UserSubscription, UserUploadStorageUsage
 from app.schemas import auth_schema
 from fastapi import APIRouter, Depends, status
 from jose import jwt, JWTError
@@ -374,6 +379,106 @@ def protected_route(
             **retention_summary,
         },
     )
+
+
+@router.get("/my-account", response_model=auth_schema.UserSuccessResponse)
+def get_my_account(
+    current_user: auth_models.User = Depends(get_current_user),
+):
+    logger.info("My-account fetched for user_id=%s", current_user.id)
+    return success_response("Account fetched successfully", data=current_user)
+
+
+@router.patch("/my-account", response_model=auth_schema.UserSuccessResponse)
+def update_my_account(
+    payload: auth_schema.MyAccountUpdate,
+    current_user: auth_models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    new_email = str(payload.email).strip().lower() if payload.email is not None else None
+    new_username = payload.username.strip() if payload.username is not None else None
+
+    if new_email and new_email != current_user.email:
+        existing_email = (
+            db.query(auth_models.User)
+            .filter(
+                auth_models.User.email == new_email,
+                auth_models.User.id != current_user.id,
+            )
+            .first()
+        )
+        if existing_email:
+            logger.warning(
+                "My-account update rejected for user_id=%s: email already registered",
+                current_user.id,
+            )
+            raise error_response(status_code=400, detail="Email already registered")
+        current_user.email = new_email
+
+    if new_username and new_username != current_user.username:
+        existing_username = (
+            db.query(auth_models.User)
+            .filter(
+                auth_models.User.username == new_username,
+                auth_models.User.id != current_user.id,
+            )
+            .first()
+        )
+        if existing_username:
+            logger.warning(
+                "My-account update rejected for user_id=%s: username already taken",
+                current_user.id,
+            )
+            raise error_response(status_code=400, detail="Username already taken")
+        current_user.username = new_username
+
+    db.commit()
+    db.refresh(current_user)
+    logger.info("My-account updated for user_id=%s", current_user.id)
+    return success_response("Account updated successfully", data=current_user)
+
+
+@router.delete("/my-account", response_model=MessageSuccessResponse)
+def delete_my_account(
+    current_user: auth_models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    user_id = current_user.id
+    user_email = current_user.email
+    logger.info("My-account delete requested for user_id=%s", user_id)
+
+    db.query(AnalysisSuggestion).filter(
+        AnalysisSuggestion.created_by_user_id == user_id
+    ).delete(synchronize_session=False)
+    db.query(DatasetAnalysis).filter(
+        DatasetAnalysis.created_by_user_id == user_id
+    ).delete(synchronize_session=False)
+    db.query(AICleaningJobDetail).filter(
+        AICleaningJobDetail.created_by_user_id == user_id
+    ).delete(synchronize_session=False)
+    db.query(UserUploadStorageUsage).filter(
+        UserUploadStorageUsage.user_id == user_id
+    ).delete(synchronize_session=False)
+    db.query(UserSubscription).filter(
+        UserSubscription.user_id == user_id
+    ).delete(synchronize_session=False)
+    db.query(UploadedFile).filter(
+        UploadedFile.created_by_user_id == user_id
+    ).delete(synchronize_session=False)
+    db.query(CsvMergedDataset).filter(
+        CsvMergedDataset.created_by_user_id == user_id
+    ).delete(synchronize_session=False)
+    db.query(CsvUploadedDataset).filter(
+        CsvUploadedDataset.created_by_user_id == user_id
+    ).delete(synchronize_session=False)
+    db.query(auth_models.OTP).filter(
+        auth_models.OTP.email == user_email
+    ).delete(synchronize_session=False)
+
+    db.delete(current_user)
+    db.commit()
+    logger.info("My-account deleted for user_id=%s", user_id)
+    return success_response("Account deleted successfully", data=None)
 
 
 @router.post("/logout", response_model=MessageSuccessResponse)

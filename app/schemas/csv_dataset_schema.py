@@ -81,6 +81,7 @@ class SelectExcelSheetRequest(BaseModel):
 
 
 class CsvMergedDatasetResponse(CsvDatasetSummaryResponse):
+    file_name: str
     source_datasets: list[CsvMergedSourceDatasetResponse]
 
 class PaginationMetaResponse(BaseModel):
@@ -89,11 +90,19 @@ class PaginationMetaResponse(BaseModel):
     total: int
     total_pages: int
 
+class CsvDatasetListUploadedResponse(CsvUploadedDatasetResponse):
+    dataset_type: Literal["uploaded"]
+
+class CsvDatasetListMergedResponse(CsvMergedDatasetResponse):
+    dataset_type: Literal["merged"]
+
+class CsvDatasetListGroupsResponse(BaseModel):
+    uploaded_datasets: list[CsvDatasetListUploadedResponse]
+    merged_datasets: list[CsvDatasetListMergedResponse]
+
 class CsvDatasetListResponse(BaseModel):
-    uploaded_datasets: list[CsvUploadedDatasetResponse]
-    uploaded_pagination: PaginationMetaResponse
-    merged_datasets: list[CsvMergedDatasetResponse]
-    merged_pagination: PaginationMetaResponse
+    datasets: CsvDatasetListGroupsResponse
+    pagination: PaginationMetaResponse
 
 
 class MergeJoinColumnMapping(BaseModel):
