@@ -826,35 +826,34 @@ def list_csv_datasets(
         uploaded_datasets=uploaded_datasets,
         merged_datasets=merged_datasets,
     )
+    datasets = []
+    for dataset_type, dataset in paginated_datasets:
+        if dataset_type == "uploaded":
+            datasets.append(
+                {
+                    **_serialize_uploaded_dataset(
+                        dataset,
+                        clean_state_map.get(("uploaded", dataset.id)),
+                    ),
+                    "dataset_type": "uploaded",
+                }
+            )
+        else:
+            datasets.append(
+                {
+                    **_serialize_merged_dataset(
+                        dataset,
+                        source_dataset_map,
+                        clean_state_map.get(("merged", dataset.id)),
+                    ),
+                    "dataset_type": "merged",
+                }
+            )
 
     return success_response(
         "Datasets fetched successfully",
         data={
-            "datasets": {
-                "uploaded_datasets": [
-                    {
-                        **_serialize_uploaded_dataset(
-                            dataset,
-                            clean_state_map.get(("uploaded", dataset.id)),
-                        ),
-                        "dataset_type": "uploaded",
-                    }
-                    for dataset_type, dataset in paginated_datasets
-                    if dataset_type == "uploaded"
-                ],
-                "merged_datasets": [
-                    {
-                        **_serialize_merged_dataset(
-                            dataset,
-                            source_dataset_map,
-                            clean_state_map.get(("merged", dataset.id)),
-                        ),
-                        "dataset_type": "merged",
-                    }
-                    for dataset_type, dataset in paginated_datasets
-                    if dataset_type == "merged"
-                ],
-            },
+            "datasets": datasets,
             "pagination": _pagination_meta(total, page, page_size),
         },
     )
