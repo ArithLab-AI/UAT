@@ -96,12 +96,8 @@ class CsvDatasetListUploadedResponse(CsvUploadedDatasetResponse):
 class CsvDatasetListMergedResponse(CsvMergedDatasetResponse):
     dataset_type: Literal["merged"]
 
-class CsvDatasetListGroupsResponse(BaseModel):
-    uploaded_datasets: list[CsvDatasetListUploadedResponse]
-    merged_datasets: list[CsvDatasetListMergedResponse]
-
 class CsvDatasetListResponse(BaseModel):
-    datasets: CsvDatasetListGroupsResponse
+    datasets: list[CsvDatasetListUploadedResponse | CsvDatasetListMergedResponse]
     pagination: PaginationMetaResponse
 
 
