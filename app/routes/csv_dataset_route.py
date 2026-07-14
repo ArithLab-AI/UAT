@@ -2,7 +2,7 @@ import logging
 import os
 from math import ceil
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Body, Depends, Query, Request
 from sqlalchemy.orm import Session
@@ -748,6 +748,10 @@ def list_csv_datasets(
         default=None,
         description="Search term applied to uploaded and merged dataset file names.",
     ),
+    dataset_type: Literal["uploaded", "merged"] | None = Query(
+        default=None,
+        description="Filter datasets by type.",
+    ),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(
         default=DEFAULT_DATASET_PAGE_SIZE,
@@ -759,26 +763,30 @@ def list_csv_datasets(
 ):
     search_term = _normalize_search_query(search)
 
-    uploaded_query = db.query(CsvUploadedDataset).filter(
-        CsvUploadedDataset.created_by_user_id == current_user.id
-    )
-    if search_term:
-        uploaded_query = uploaded_query.filter(
-            CsvUploadedDataset.file_name.ilike(f"%{search_term}%")
+    uploaded_datasets = []
+    if dataset_type in (None, "uploaded"):
+        uploaded_query = db.query(CsvUploadedDataset).filter(
+            CsvUploadedDataset.created_by_user_id == current_user.id
         )
-    uploaded_datasets = uploaded_query.order_by(CsvUploadedDataset.id.desc()).all()
+        if search_term:
+            uploaded_query = uploaded_query.filter(
+                CsvUploadedDataset.file_name.ilike(f"%{search_term}%")
+            )
+        uploaded_datasets = uploaded_query.order_by(CsvUploadedDataset.id.desc()).all()
 
-    merged_query = db.query(CsvMergedDataset).filter(
-        CsvMergedDataset.created_by_user_id == current_user.id
-    )
-    merged_datasets = merged_query.order_by(CsvMergedDataset.id.desc()).all()
-    if search_term:
-        normalized_search_term = search_term.lower()
-        merged_datasets = [
-            dataset
-            for dataset in merged_datasets
-            if normalized_search_term in _build_merged_file_name(dataset).lower()
-        ]
+    merged_datasets = []
+    if dataset_type in (None, "merged"):
+        merged_query = db.query(CsvMergedDataset).filter(
+            CsvMergedDataset.created_by_user_id == current_user.id
+        )
+        merged_datasets = merged_query.order_by(CsvMergedDataset.id.desc()).all()
+        if search_term:
+            normalized_search_term = search_term.lower()
+            merged_datasets = [
+                dataset
+                for dataset in merged_datasets
+                if normalized_search_term in _build_merged_file_name(dataset).lower()
+            ]
 
     combined_datasets = [
         ("uploaded", dataset)
