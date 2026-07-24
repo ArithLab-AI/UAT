@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, EmailStr, validator
+from pydantic import BaseModel, EmailStr, Field, model_validator, validator
 
 from app.enum.user_role_enum import DEFAULT_USER_ROLE, FREE_USER
 from app.enum.user_role_enum import normalize_user_role
@@ -56,6 +56,19 @@ class Token(BaseModel):
 
 class RefreshToken(BaseModel):
     refresh_token: str
+
+
+class MyAccountUpdate(BaseModel):
+    email: EmailStr | None = None
+    username: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def require_update_field(self):
+        if self.email is None and self.username is None:
+            raise ValueError("Email or username is required")
+        if self.username is not None and not self.username.strip():
+            raise ValueError("Username cannot be empty")
+        return self
 
 
 class UserResponse(BaseModel):

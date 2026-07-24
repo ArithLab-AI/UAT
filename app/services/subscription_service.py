@@ -2,6 +2,7 @@ import logging
 from datetime import datetime, timedelta
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+from app.enum.user_role_enum import FREE_USER
 from app.models.auth_models import User
 from app.models.csv_dataset_models import CsvUploadedDataset
 from app.models.subscription_models import SubscriptionPlan, UserSubscription, UserUploadStorageUsage
@@ -35,6 +36,14 @@ PLAN_CAPABILITIES = {
         "max_merge_sources": None,
         "can_merge": True,
     },
+}
+
+DEFAULT_FREE_PLAN = {
+    "name": "Free",
+    "user_role": FREE_USER,
+    "price": 0,
+    "duration_days": 30,
+    "is_active": True,
 }
 
 
@@ -92,11 +101,27 @@ def get_used_upload_storage_bytes(db: Session, user_id: int) -> int:
 
 
 def get_recorded_upload_count(db: Session, user_id: int) -> int:
-    return (
-        db.query(CsvUploadedDataset)
-        .filter(CsvUploadedDataset.created_by_user_id == user_id)
+    recorded_upload_count = (
+        db.query(UserUploadStorageUsage)
+        .filter(UserUploadStorageUsage.user_id == user_id)
         .count()
     )
+    recorded_dataset_ids = (
+        db.query(UserUploadStorageUsage.uploaded_dataset_id)
+        .filter(
+            UserUploadStorageUsage.user_id == user_id,
+            UserUploadStorageUsage.uploaded_dataset_id.isnot(None),
+        )
+    )
+    unrecorded_active_upload_count = (
+        db.query(CsvUploadedDataset)
+        .filter(
+            CsvUploadedDataset.created_by_user_id == user_id,
+            CsvUploadedDataset.id.notin_(recorded_dataset_ids),
+        )
+        .count()
+    )
+    return recorded_upload_count + unrecorded_active_upload_count
 
 
 def ensure_upload_storage_available(
@@ -187,6 +212,36 @@ def get_user_plan_capabilities(db: Session, user: User) -> dict:
     return get_plan_capabilities(plan_name)
 
 
+def _get_or_create_default_free_plan(db: Session) -> SubscriptionPlan:
+    plans = (
+        db.query(SubscriptionPlan)
+        .filter(SubscriptionPlan.is_active == True)
+        .order_by(SubscriptionPlan.id.asc())
+        .all()
+    )
+    free_plan = next(
+        (plan for plan in plans if normalize_plan_tier(plan.name) == "free"),
+        None,
+    )
+
+    if free_plan:
+        return free_plan
+
+    free_plan = db.query(SubscriptionPlan).filter_by(name=DEFAULT_FREE_PLAN["name"]).first()
+    if not free_plan:
+        free_plan = SubscriptionPlan(**DEFAULT_FREE_PLAN)
+        db.add(free_plan)
+    else:
+        free_plan.user_role = DEFAULT_FREE_PLAN["user_role"]
+        free_plan.price = DEFAULT_FREE_PLAN["price"]
+        free_plan.duration_days = DEFAULT_FREE_PLAN["duration_days"]
+        free_plan.is_active = DEFAULT_FREE_PLAN["is_active"]
+
+    db.flush()
+    logger.info("Default free plan created or reactivated with id=%s", free_plan.id)
+    return free_plan
+
+
 def ensure_default_free_subscription(db: Session, user_id: int) -> UserSubscription | None:
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
@@ -204,30 +259,11 @@ def ensure_default_free_subscription(db: Session, user_id: int) -> UserSubscript
         )
         return valid_active_subscription
 
-    free_plan = (
-        db.query(SubscriptionPlan)
-        .filter(
-            SubscriptionPlan.is_active == True,
-        )
-        .order_by(SubscriptionPlan.id.asc())
-        .all()
-    )
-
-    free_plan = next(
-        (plan for plan in free_plan if normalize_plan_tier(plan.name) == "free"),
-        None,
-    )
-
-    if not free_plan:
-        logger.warning(
-            "Default free plan not found for user_id=%s",
-            user_id,
-        )
-        return None
+    free_plan = _get_or_create_default_free_plan(db)
 
     new_subscription = UserSubscription(
         user_id=user_id,
-        plan_id=free_plan.id,
+        plan=free_plan,
         start_date=current_time,
         end_date=current_time + timedelta(days=free_plan.duration_days),
         status="active",
