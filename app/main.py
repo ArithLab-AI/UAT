@@ -10,6 +10,7 @@ from app.routes.analysis_route import router as analysis_router
 from app.routes.analysis_suggestion_route import router as analysis_suggestion_router
 from app.routes.test_llm_route import router as test_llm_router
 from app.routes.token_usage_route import router as token_usage_router
+from app.routes.data_chat_route import router as data_chat_router
 from app.db.database import engine, Base, SessionLocal
 from app.config.config import settings
 from app.utils.auth_schema_setup import ensure_auth_schema
@@ -38,6 +39,7 @@ app.include_router(analysis_router)
 app.include_router(analysis_suggestion_router)
 app.include_router(test_llm_router)
 app.include_router(token_usage_router)
+app.include_router(data_chat_router)
 
 @app.exception_handler(RequestValidationError)
 async def request_validation_exception_handler(request: Request, exc: RequestValidationError):

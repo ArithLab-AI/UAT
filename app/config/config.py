@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     UAT_AI_PLANNER_SAMPLE_ROWS: int = 100
     UAT_AI_CLEAN_PREVIEW_ROWS: int = 25
 
+    # Data-chat (natural-language query) DuckDB execution guards. These cap a single
+    # LLM-generated query so one heavy/runaway query cannot exhaust the server: RAM cap,
+    # CPU-thread cap, and a wall-clock timeout after which the query is interrupted.
+    UAT_DATA_CHAT_MEMORY_LIMIT: str = "512MB"
+    UAT_DATA_CHAT_MAX_THREADS: int = 2
+    UAT_DATA_CHAT_TIMEOUT_SECONDS: int = 20
+
     class Config:
         env_file = ".env"
 
