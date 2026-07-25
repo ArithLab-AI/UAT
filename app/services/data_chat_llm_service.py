@@ -11,6 +11,7 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.config.config import settings
+from app.services.data_chat_chart_service import CHART_SELECTION_GUIDE
 from app.services.data_chat_query_engine import DATASET_TABLE_NAME
 from app.utils.openai_utils import get_openai_client
 from app.utils.token_usage import TokenUsageLogger, _extract_usage
@@ -35,13 +36,21 @@ _SQL_SYSTEM_PROMPT = (
 )
 
 _SUMMARY_SYSTEM_PROMPT = (
-    "You summarise a SQL query result for a business user and choose the best chart.\n"
+    "You summarise a SQL query result for a business user and choose the best ECharts-style chart.\n"
     "Output JSON only: {\"answer\": \"one or two sentence plain-language answer\", "
-    "\"chart\": {\"type\": \"table|bar|line|pie|scatter|kpi\", \"x\": null, \"y\": [], "
-    "\"series\": null, \"title\": null}}.\n"
-    "Pick 'kpi' for a single number, 'bar' for category comparisons, 'line' for time series, "
-    "'pie' for parts-of-whole (<=8 slices), 'scatter' for two numeric columns, else 'table'. "
-    "x/y/series must be exact result column names or null."
+    "\"chart\": {\"type\": \"table|kpi|bar|stacked_bar|smooth_line|area|stacked_line|"
+    "stacked_area|waterfall|mixed|doughnut|scatter|bubble|heatmap\", \"x\": null, "
+    "\"y\": [], \"series\": null, \"size\": null, \"title\": null, \"orientation\": null}}.\n"
+    f"Chart catalogue:\n{CHART_SELECTION_GUIDE}\n"
+    "Rules:\n"
+    "- Choose only a chart type that the result columns can genuinely support; otherwise use table.\n"
+    "- x, y, series, and size must be exact result column names from the SQL result or null.\n"
+    "- Use y for numeric measure columns.\n"
+    "- Use series for the grouping dimension in stacked charts or heatmaps.\n"
+    "- For mixed, return exactly two y columns.\n"
+    "- For doughnut, keep it to small part-to-whole outputs.\n"
+    "- If the result is a single headline number, prefer kpi.\n"
+    "- If a chart would be misleading, return table."
 )
 
 

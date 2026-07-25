@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from app.db.database import Base, engine
 from app.models.auth_models import User
 from app.models.data_chat_models import DataChatMessage, DataChatSession
+from app.services.data_chat_chart_service import normalize_chart_spec
 from app.services.analysis_service import DatasetSource, _resolve_analysis_source
 from app.services.data_chat_llm_service import (
     build_schema_context,
@@ -100,8 +101,12 @@ def _node_summarize(state: _ChatState) -> _ChatState:
     payload, tokens = summarize_result(state["question"], state["columns"], state["rows"])
     state["tokens"] = state.get("tokens", 0) + tokens
     state["answer"] = str(payload.get("answer") or "Here are the results.")
-    chart = payload.get("chart")
-    state["chart"] = chart if isinstance(chart, dict) else {"type": "table"}
+    state["chart"] = normalize_chart_spec(
+        state["question"],
+        state.get("columns", []) or [],
+        state.get("rows", []) or [],
+        payload.get("chart") if isinstance(payload, dict) else None,
+    )
     return state
 
 
