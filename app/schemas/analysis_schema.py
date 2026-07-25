@@ -108,6 +108,8 @@ class LLMTestRequest(BaseModel):
 
 
 class LLMTestResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     provider: str
     model_id: str
     api_key_configured: bool
