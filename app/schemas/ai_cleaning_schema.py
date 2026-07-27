@@ -147,6 +147,7 @@ class AICleaningPayloadResponse(BaseModel):
     preview_limited: bool = False
     changes_detected: bool = False
     cleaned_data: list[dict] = Field(default_factory=list)
+    cleaned_columns: list[str] = Field(default_factory=list)
 
 
 class AICleaningBatchPayloadResponse(AICleaningPayloadResponse):

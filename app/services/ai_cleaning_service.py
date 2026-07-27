@@ -557,6 +557,7 @@ def _build_cleaning_result(
     rows_after = 0
     columns_before = 0
     columns_after = 0
+    columns_after_names: list[str] = []
     preserve_placeholders = source_type == "clean"
 
     sample_rows = max(1, int(settings.UAT_AI_PLANNER_SAMPLE_ROWS))
@@ -658,6 +659,7 @@ def _build_cleaning_result(
                 )
                 if columns_after == 0:
                     columns_after = len(cleaned_chunk.columns)
+                    columns_after_names = list(cleaned_chunk.columns)
                 if not changes_detected and not _dataframes_match(chunk_df, cleaned_chunk):
                     changes_detected = True
 
@@ -687,6 +689,7 @@ def _build_cleaning_result(
                 empty_df.to_csv(output_file, header=True, index=False)
                 columns_before = len(empty_df.columns)
                 columns_after = len(empty_df.columns)
+                columns_after_names = list(empty_df.columns)
 
         cleaned_storage_key = _ai_cleaned_output_key(job_id)
         cleaned_file_path = get_object_storage_service().upload_file(output_path, cleaned_storage_key)
@@ -719,6 +722,7 @@ def _build_cleaning_result(
             "rows_after": rows_after,
             "columns_before": columns_before,
             "columns_after": columns_after,
+            "columns_after_names": columns_after_names,
             "output_filename": output_filename,
             "message": message,
             "steps_applied": [
@@ -784,6 +788,7 @@ def _serialize_ai_cleaning_detail(job: CleaningJob, detail: AICleaningJobDetail)
         "preview_limited": bool(detail.preview_limited),
         "changes_detected": bool(detail.changes_detected),
         "cleaned_data": detail.cleaned_data or [],
+        "cleaned_columns": detail.cleaned_columns or [],
         "source_dataset_name": detail.source_dataset_name,
         "source_file_name": detail.source_file_name,
         "cleaned_file_path": detail.cleaned_file_path,
@@ -1032,6 +1037,7 @@ def _run_ai_cleaning_worker(
             detail.cleaned_storage_key = result["cleaned_storage_key"]
             detail.cleaned_file_path = result["cleaned_file_path"]
             detail.cleaned_data = result["cleaned_data"]
+            detail.cleaned_columns = result["columns_after_names"]
             detail.cleaned_rows = result["cleaned_rows"]
             detail.preview_rows_returned = result["preview_rows_returned"]
             detail.preview_limited = result["preview_limited"]
@@ -1226,6 +1232,7 @@ def _build_batch_cleaning_result(
     changes_detected = False
     columns_before = 0
     columns_after = 0
+    columns_after_names: list[str] = []
     output_filename = f"ai_cleaned_{Path(source_file_name).stem}.csv"
 
     fd, output_path = tempfile.mkstemp(prefix=f"{job_id}_cleaned_", suffix=".csv")
@@ -1244,6 +1251,7 @@ def _build_batch_cleaning_result(
                 cleaned_chunk = _apply_all_steps(chunk_df)
                 if columns_after == 0:
                     columns_after = len(cleaned_chunk.columns)
+                    columns_after_names = list(cleaned_chunk.columns)
                 if not changes_detected and not _dataframes_match(chunk_df, cleaned_chunk):
                     changes_detected = True
 
@@ -1262,6 +1270,7 @@ def _build_batch_cleaning_result(
                 empty_df.to_csv(output_file, header=True, index=False)
                 columns_before = len(empty_df.columns)
                 columns_after = len(empty_df.columns)
+                columns_after_names = list(empty_df.columns)
 
         cleaned_storage_key = _ai_cleaned_output_key(job_id)
         cleaned_file_path = get_object_storage_service().upload_file(output_path, cleaned_storage_key)
@@ -1317,6 +1326,7 @@ def _build_batch_cleaning_result(
             "rows_after": total_rows,
             "columns_before": columns_before,
             "columns_after": columns_after,
+            "columns_after_names": columns_after_names,
             "output_filename": output_filename,
             "prompt": "\n".join(f"- {step.prompt}" for step, _ in planned),
             "message": message,
@@ -1575,6 +1585,7 @@ def _run_ai_cleaning_batch_worker(
             detail.cleaned_storage_key = result["cleaned_storage_key"]
             detail.cleaned_file_path = result["cleaned_file_path"]
             detail.cleaned_data = result["cleaned_data"]
+            detail.cleaned_columns = result["columns_after_names"]
             detail.cleaned_rows = result["cleaned_rows"]
             detail.preview_rows_returned = result["preview_rows_returned"]
             detail.preview_limited = result["preview_limited"]

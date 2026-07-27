@@ -34,6 +34,7 @@ class AICleaningJobDetail(Base):
     cleaned_storage_key = Column(String(255), nullable=True)
     cleaned_file_path = Column(Text, nullable=True)
     cleaned_data = Column(JSON, nullable=True)
+    cleaned_columns = Column(JSON, nullable=True)
     cleaned_rows = Column(Integer, nullable=True)
     preview_rows_returned = Column(Integer, nullable=True)
     preview_limited = Column(Boolean, nullable=True, default=False)

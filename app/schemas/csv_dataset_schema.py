@@ -226,6 +226,8 @@ CsvUploadedDatasetListSuccessResponse = SuccessResponse[
 ]
 CsvUploadedDatasetSuccessResponse = SuccessResponse[CsvUploadedDatasetResponse]
 CsvMergedDatasetSuccessResponse = SuccessResponse[CsvMergedDatasetResponse]
+CsvDatasetItemResponse = CsvDatasetListUploadedResponse | CsvDatasetListMergedResponse
+CsvDatasetItemSuccessResponse = SuccessResponse[CsvDatasetItemResponse]
 CsvDatasetListSuccessResponse = SuccessResponse[CsvDatasetListResponse]
 MergeSuggestionsSuccessResponse = SuccessResponse[MergeSuggestionsResponse]
 PreviewMergeSuccessResponse = SuccessResponse[PreviewMergeResponse]

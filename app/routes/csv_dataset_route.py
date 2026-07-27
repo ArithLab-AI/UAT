@@ -14,6 +14,7 @@ from app.models.auth_models import User
 from app.models.cleaning_models import CleaningJob
 from app.models.csv_dataset_models import CsvMergedDataset, CsvUploadedDataset
 from app.schemas.csv_dataset_schema import (
+    CsvDatasetItemSuccessResponse,
     CsvDatasetListSuccessResponse,
     CsvMergedDatasetSuccessResponse,
     CsvUploadedDatasetListSuccessResponse,
@@ -865,6 +866,88 @@ def list_csv_datasets(
             "pagination": _pagination_meta(total, page, page_size),
         },
     )
+
+
+@router.get("/{dataset_id}", response_model=CsvDatasetItemSuccessResponse)
+def get_csv_dataset(
+    dataset_id: int,
+    dataset_type: Literal["uploaded", "merged"] = Query(
+        ...,
+        description="Whether dataset_id refers to an uploaded or a merged dataset.",
+    ),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if dataset_type == "uploaded":
+        dataset = (
+            db.query(CsvUploadedDataset)
+            .filter(
+                CsvUploadedDataset.id == dataset_id,
+                CsvUploadedDataset.created_by_user_id == current_user.id,
+            )
+            .first()
+        )
+        if not dataset:
+            raise error_response(status_code=404, detail="Uploaded dataset not found")
+
+        clean_state_map = _build_dataset_clean_state_map(
+            db,
+            current_user=current_user,
+            uploaded_datasets=[dataset],
+            merged_datasets=[],
+        )
+        return success_response(
+            "Dataset fetched successfully",
+            data={
+                **_serialize_uploaded_dataset(dataset, clean_state_map.get(("uploaded", dataset.id))),
+                "dataset_type": "uploaded",
+            },
+        )
+
+    dataset = (
+        db.query(CsvMergedDataset)
+        .filter(
+            CsvMergedDataset.id == dataset_id,
+            CsvMergedDataset.created_by_user_id == current_user.id,
+        )
+        .first()
+    )
+    if not dataset:
+        raise error_response(status_code=404, detail="Merged dataset not found")
+
+    source_dataset_ids = sorted(
+        {item["id"] for item in (dataset.source_datasets_metadata or [])}
+    )
+    source_datasets = (
+        db.query(CsvUploadedDataset)
+        .filter(
+            CsvUploadedDataset.created_by_user_id == current_user.id,
+            CsvUploadedDataset.id.in_(source_dataset_ids),
+        )
+        .all()
+        if source_dataset_ids
+        else []
+    )
+    source_dataset_map = {source.id: source for source in source_datasets}
+
+    clean_state_map = _build_dataset_clean_state_map(
+        db,
+        current_user=current_user,
+        uploaded_datasets=[],
+        merged_datasets=[dataset],
+    )
+    return success_response(
+        "Dataset fetched successfully",
+        data={
+            **_serialize_merged_dataset(
+                dataset,
+                source_dataset_map,
+                clean_state_map.get(("merged", dataset.id)),
+            ),
+            "dataset_type": "merged",
+        },
+    )
+
 
 @router.post("/uploaded/{dataset_id}/retention", response_model=MessageSuccessResponse)
 def retention_csv_uploaded_dataset(
