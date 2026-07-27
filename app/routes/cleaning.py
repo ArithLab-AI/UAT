@@ -108,6 +108,7 @@ async def get_status(job_id: str, db: Session = Depends(get_db)):
             "rows_after": job.rows_after,
             "columns_before": job.columns_before,
             "columns_after": job.columns_after,
+            "columns_after_names": job.columns_after_names,
             "cleaning_summary": job.cleaning_summary,
             "steps_applied": job.steps_applied,
             "duration_seconds": job.duration_seconds,
