@@ -18,11 +18,12 @@ from sqlalchemy.orm import Session
 
 from app.db.database import Base, engine
 from app.models.auth_models import User
-from app.models.data_chat_models import DataChatMessage, DataChatSession
+from app.models.data_chat_models import DataChatMessage, DataChatSession, DataChatSuggestionCache
 from app.services.data_chat_chart_service import normalize_chart_spec
 from app.services.analysis_service import DatasetSource, _resolve_analysis_source
 from app.services.data_chat_llm_service import (
     build_schema_context,
+    generate_sample_questions,
     generate_sql,
     summarize_result,
 )
@@ -37,13 +38,19 @@ from app.utils.responses import error_response
 logger = logging.getLogger(__name__)
 
 MAX_SQL_ATTEMPTS = 3
+DEFAULT_SUGGESTED_QUESTIONS = 5
+SUGGESTIONS_CACHE_TTL_SECONDS = 6 * 60 * 60  # 6 hours
 
 
 @lru_cache(maxsize=1)
 def ensure_data_chat_tables() -> None:
     Base.metadata.create_all(
         bind=engine,
-        tables=[DataChatSession.__table__, DataChatMessage.__table__],
+        tables=[
+            DataChatSession.__table__,
+            DataChatMessage.__table__,
+            DataChatSuggestionCache.__table__,
+        ],
     )
 
 
@@ -276,6 +283,95 @@ def run_data_chat_query(
         "attempts": message.attempts,
         "error": final.get("error"),
     }
+
+
+def get_suggested_questions(
+    db: Session,
+    current_user: User,
+    *,
+    dataset_type: str,
+    dataset_id: int,
+    is_clean: bool,
+    count: int = DEFAULT_SUGGESTED_QUESTIONS,
+) -> list[dict[str, Any]]:
+    """Generate a handful of dummy questions for a dataset and answer each with its chart,
+    so the frontend can show a preview of what data chat can do without the user typing anything.
+    Results are cached per dataset so repeated hits skip the LLM entirely."""
+    ensure_data_chat_tables()
+
+    cache_row = (
+        db.query(DataChatSuggestionCache)
+        .filter(
+            DataChatSuggestionCache.source_dataset_id == dataset_id,
+            DataChatSuggestionCache.source_type == dataset_type,
+            DataChatSuggestionCache.is_clean == is_clean,
+        )
+        .first()
+    )
+    cache_age = (
+        (datetime.utcnow() - cache_row.updated_at).total_seconds() if cache_row else None
+    )
+    cached_suggestions = cache_row.suggestions if cache_row else None
+    if cached_suggestions and cache_age is not None and cache_age < SUGGESTIONS_CACHE_TTL_SECONDS:
+        if len(cached_suggestions) >= count:
+            return cached_suggestions[:count]
+
+    source = _resolve_analysis_source(
+        db, current_user, dataset_type=dataset_type, dataset_id=dataset_id, is_clean=is_clean
+    )
+
+    df = load_dataset_dataframe(source)
+    if df.empty:
+        raise error_response(status_code=400, detail="Dataset has no data to query.")
+
+    schema_context = build_schema_context(df)
+    questions, _ = generate_sample_questions(schema_context, count)
+
+    results: list[dict[str, Any]] = []
+    for question in questions:
+        initial: _ChatState = {
+            "question": question,
+            "schema_context": schema_context,
+            "df": df,
+            "history": [],
+            "attempts": 0,
+            "tokens": 0,
+        }
+        try:
+            final: _ChatState = _build_graph().invoke(initial)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Data chat suggestion graph failed")
+            final = {"status": "error", "error": f"{type(exc).__name__}: {exc}", "answer": ""}
+
+        status = final.get("status", "error")
+        if status != "success":
+            continue
+
+        chart = final.get("chart") or {}
+        results.append(
+            {
+                "question": question,
+                "chart_type": chart.get("type") or "table",
+            }
+        )
+
+    if results:
+        if cache_row is None:
+            cache_row = DataChatSuggestionCache(
+                source_dataset_id=dataset_id,
+                source_type=dataset_type,
+                is_clean=is_clean,
+                suggestions=results,
+            )
+            db.add(cache_row)
+        else:
+            cache_row.suggestions = results
+            cache_row.updated_at = datetime.utcnow()
+        db.commit()
+
+    return results
+
+    return results
 
 
 def get_session_messages(

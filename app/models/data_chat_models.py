@@ -25,6 +25,20 @@ class DataChatSession(Base):
     created_by = relationship("User")
 
 
+class DataChatSuggestionCache(Base):
+    """Cached dummy questions + chart types for a dataset, so repeated hits skip the LLM."""
+
+    __tablename__ = "data_chat_suggestion_cache"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    source_dataset_id = Column(Integer, nullable=False, index=True)
+    source_type = Column(String(20), nullable=False, index=True)  # uploaded | merged
+    is_clean = Column(Boolean, nullable=False, default=False)
+    suggestions = Column(JSON, nullable=False)  # [{"question": str, "chart_type": str}, ...]
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
 class DataChatMessage(Base):
     """Every natural-language query and its generated SQL / result are stored here."""
 

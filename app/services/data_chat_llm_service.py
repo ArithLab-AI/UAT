@@ -35,6 +35,18 @@ _SQL_SYSTEM_PROMPT = (
     "short question in 'clarification', and set sql to an empty string."
 )
 
+_SUGGESTIONS_SYSTEM_PROMPT = (
+    "You propose short natural-language questions a business user could ask about a dataset, "
+    "chosen so that answering them would naturally produce a variety of chart types "
+    "(counts/KPIs, category breakdowns, trends over time, part-to-whole splits, comparisons).\n"
+    "Output JSON only: {\"questions\": [\"...\", \"...\"]}.\n"
+    "Rules:\n"
+    "- Only ask questions answerable from the given columns.\n"
+    "- Keep each question under 15 words.\n"
+    "- Make the questions diverse in intent, not variations of the same question.\n"
+    "- Return exactly the requested count."
+)
+
 _SUMMARY_SYSTEM_PROMPT = (
     "You summarise a SQL query result for a business user and choose the best ECharts-style chart.\n"
     "Output JSON only: {\"answer\": \"one or two sentence plain-language answer\", "
@@ -131,6 +143,16 @@ def generate_sql(
 
     content, tokens = _invoke(system, user, label="data-chat-sql")
     return _extract_json(content), tokens
+
+
+def generate_sample_questions(schema_context: str, count: int) -> tuple[list[str], int]:
+    """Returns (list of dummy questions covering varied chart types, tokens_used)."""
+    system = _SUGGESTIONS_SYSTEM_PROMPT
+    user = f"{schema_context}\n\nGenerate exactly {count} questions."
+    content, tokens = _invoke(system, user, label="data-chat-suggestions")
+    payload = _extract_json(content)
+    questions = [str(q).strip() for q in payload.get("questions", []) if str(q).strip()]
+    return questions[:count], tokens
 
 
 def summarize_result(

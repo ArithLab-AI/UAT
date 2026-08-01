@@ -8,7 +8,9 @@ from app.db.database import get_db
 from app.models.auth_models import User
 from app.schemas.data_chat_schema import DataChatQueryRequest
 from app.services.data_chat_service import (
+    DEFAULT_SUGGESTED_QUESTIONS,
     get_session_messages,
+    get_suggested_questions,
     list_sessions,
     run_data_chat_query,
 )
@@ -38,6 +40,27 @@ def query_dataset(
         session_id=payload.session_id,
     )
     return success_response("Query processed", data=data)
+
+
+@router.get("/{dataset_type}/{dataset_id}/suggested-questions")
+def get_suggested_questions_route(
+    dataset_type: DatasetType,
+    dataset_id: int,
+    is_clean: bool = False,
+    count: int = DEFAULT_SUGGESTED_QUESTIONS,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Generate a few dummy questions for a dataset and return each with its answer and chart."""
+    data = get_suggested_questions(
+        db,
+        current_user,
+        dataset_type=dataset_type,
+        dataset_id=dataset_id,
+        is_clean=is_clean,
+        count=count,
+    )
+    return success_response("Suggested questions generated", data=data)
 
 
 @router.get("/{dataset_type}/{dataset_id}/sessions")
