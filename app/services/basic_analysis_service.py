@@ -1,10 +1,18 @@
-"""Computation engine for the 6 "basic" analysis types (Descriptive, Distribution,
-Top N / Bottom N, Time Series, Aggregation / Group By, Correlation).
+"""Computation engine for the 7 basic analysis types defined in the
+Data Analysis Workflow Specification.
+
+Analyses:
+  1. Descriptive              - auto stats table across all numeric columns
+  2. Simple Distribution      - group by X (categorical), aggregate
+  3. Top N                    - rank descending, N max 10
+  4. Bottom N                 - rank ascending, N max 10
+  5. Time Series              - resample X (date) by granularity, aggregate Y
+  6. Advanced Distribution    - group by X, aggregate Y (Y mandatory)
+  7. Correlation              - Pearson only; 2 cols -> scatter; 3+ -> heatmap/pair plot
 
 Reuses the existing dataset-resolution/download plumbing from ``analysis_service``
 and ``data_chat_query_engine`` (dataset -> pandas DataFrame) rather than duplicating
-it. Every computation here is read-only: nothing is written back to those services
-or their tables.
+it. Every computation here is read-only.
 """
 
 from __future__ import annotations
@@ -14,15 +22,9 @@ from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
-from scipy import stats as scipy_stats
 from sqlalchemy.orm import Session
 
-from app.enum.aggregation_type_enum import (
-    AggregationType,
-    CorrelationMethod,
-    SortDirection,
-    TimeGranularity,
-)
+from app.enum.aggregation_type_enum import AggregationType, TimeGranularity
 from app.enum.analysis_chart_config import ANALYSIS_TYPE_CONFIGS, resolve_chart_type
 from app.enum.analysis_type_enum import AnalysisType
 from app.enum.chart_type_enum import ChartType
@@ -32,36 +34,28 @@ from app.services.analysis_service import _resolve_analysis_source
 from app.services.data_chat_query_engine import load_dataset_dataframe
 from app.utils.responses import error_response
 
-MAX_POINTS = 2000
-MAX_GROUPS = 100
-MAX_HEATMAP_COLUMNS = 20
-MAX_TOP_N = 500
 
-_AGG_FUNCS: dict[AggregationType, str] = {
+MAX_POINTS = 2000       # cap for scatter plots
+MAX_GROUPS = 100        # cap for group counts on charts
+MAX_HEATMAP_COLS = 20   # cap for correlation heatmap columns
+
+# Pandas aggregation names for each spec aggregation.
+# COUNT is handled specially (groupby size or column count).
+# PERCENTAGE is handled specially (share of total based on sum or count).
+_PANDAS_AGG: dict[AggregationType, str] = {
     AggregationType.SUM: "sum",
-    AggregationType.AVG: "mean",
+    AggregationType.AVERAGE: "mean",
     AggregationType.MEDIAN: "median",
-    AggregationType.MIN: "min",
-    AggregationType.MAX: "max",
-    AggregationType.STD_DEV: "std",
+    AggregationType.MINIMUM: "min",
+    AggregationType.MAXIMUM: "max",
 }
 
-_PANDAS_PERIOD_FREQ: dict[TimeGranularity, str] = {
-    TimeGranularity.HOURLY: "H",
+_PANDAS_FREQ: dict[TimeGranularity, str] = {
     TimeGranularity.DAILY: "D",
     TimeGranularity.WEEKLY: "W",
-    TimeGranularity.MONTHLY: "M",
-    TimeGranularity.QUARTERLY: "Q",
-    TimeGranularity.YEARLY: "Y",
-}
-
-_PERIODS_PER_YEAR: dict[TimeGranularity, int] = {
-    TimeGranularity.HOURLY: 24 * 365,
-    TimeGranularity.DAILY: 365,
-    TimeGranularity.WEEKLY: 52,
-    TimeGranularity.MONTHLY: 12,
-    TimeGranularity.QUARTERLY: 4,
-    TimeGranularity.YEARLY: 1,
+    TimeGranularity.MONTHLY: "ME",
+    TimeGranularity.QUARTERLY: "QE",
+    TimeGranularity.YEARLY: "YE",
 }
 
 
@@ -108,14 +102,6 @@ def _require_column(df: pd.DataFrame, column: str | None, role_label: str) -> st
     return column
 
 
-def _optional_column(df: pd.DataFrame, column: str | None) -> str | None:
-    if not column:
-        return None
-    if column not in df.columns:
-        raise error_response(status_code=400, detail=f"Column '{column}' was not found in the dataset.")
-    return column
-
-
 def _numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
     return pd.to_numeric(df[column], errors="coerce")
 
@@ -124,546 +110,510 @@ def _datetime_series(df: pd.DataFrame, column: str) -> pd.Series:
     return pd.to_datetime(df[column], errors="coerce")
 
 
-def _groupby_aggregate(
+def _is_numeric_column(df: pd.DataFrame, column: str) -> bool:
+    return pd.api.types.is_numeric_dtype(df[column])
+
+
+def _is_categorical_column(df: pd.DataFrame, column: str) -> bool:
+    dtype = df[column].dtype
+    return dtype == object or str(dtype) in ("string", "str", "category", "bool")
+
+
+def _auto_granularity_freq(dates: pd.Series) -> tuple[str, TimeGranularity]:
+    """Pick sensible pandas frequency and enum granularity from date range."""
+    span_days = (dates.max() - dates.min()).days
+    if span_days <= 60:
+        return "D", TimeGranularity.DAILY
+    if span_days <= 365:
+        return "W", TimeGranularity.WEEKLY
+    if span_days <= 365 * 3:
+        return "ME", TimeGranularity.MONTHLY
+    if span_days <= 365 * 10:
+        return "QE", TimeGranularity.QUARTERLY
+    return "YE", TimeGranularity.YEARLY
+
+
+def _apply_groupby_aggregation(
     df: pd.DataFrame,
     group_col: str,
-    value_col: str,
+    value_col: str | None,
     agg: AggregationType,
-    secondary_col: str | None = None,
 ) -> pd.Series:
-    group_cols = [group_col] if not secondary_col else [group_col, secondary_col]
-    if agg == AggregationType.COUNT:
-        return df.groupby(group_cols).size()
-    if agg == AggregationType.COUNT_DISTINCT:
-        return df.groupby(group_cols)[value_col].nunique()
+    """
+    Apply a spec aggregation on df grouped by group_col.
 
-    working = df[group_cols].copy()
-    working["__value__"] = _numeric_series(df, value_col)
-    grouped = working.groupby(group_cols)["__value__"]
-    func = _AGG_FUNCS.get(agg, "sum")
-    return grouped.agg(func)
+    - value_col=None  -> COUNT of rows per group (used when Y is optional/absent).
+    - agg=COUNT       -> count of rows (or non-null values if value_col given).
+    - agg=PERCENTAGE  -> share of total, based on SUM if value_col given else COUNT.
+    - other aggs      -> standard pandas agg on value_col (numeric).
+    """
+    if agg == AggregationType.PERCENTAGE:
+        if value_col is None:
+            counts = df.groupby(group_col, dropna=False).size()
+            total = counts.sum()
+            return (counts / total * 100) if total > 0 else counts
+        working = df.groupby(group_col, dropna=False)[value_col].sum()
+        total = float(working.sum())
+        return (working / total * 100) if total != 0 else working
 
+    if agg == AggregationType.COUNT or value_col is None:
+        if value_col is None:
+            return df.groupby(group_col, dropna=False).size()
+        return df.groupby(group_col, dropna=False)[value_col].count()
 
-def _box_plot_stats(series: pd.Series, max_outliers: int = 50) -> dict[str, Any]:
-    q1 = float(series.quantile(0.25))
-    q3 = float(series.quantile(0.75))
-    iqr = q3 - q1
-    lower_fence = q1 - 1.5 * iqr
-    upper_fence = q3 + 1.5 * iqr
-    outliers = series[(series < lower_fence) | (series > upper_fence)]
-    non_outliers = series[(series >= lower_fence) & (series <= upper_fence)]
-    return {
-        "min": _round(float(series.min())),
-        "q1": _round(q1),
-        "median": _round(float(series.median())),
-        "q3": _round(q3),
-        "max": _round(float(series.max())),
-        "lower_whisker": _round(float(non_outliers.min())) if not non_outliers.empty else _round(float(series.min())),
-        "upper_whisker": _round(float(non_outliers.max())) if not non_outliers.empty else _round(float(series.max())),
-        "outlier_count": int(len(outliers)),
-        "outliers": [_round(v) for v in outliers.head(max_outliers).tolist()],
-    }
+    pandas_agg = _PANDAS_AGG[agg]
+    numeric = _numeric_series(df, value_col)
+    working = df[[group_col]].copy()
+    working["__value__"] = numeric
+    return working.groupby(group_col, dropna=False)["__value__"].agg(pandas_agg)
 
 
-def _kde_curve(series: pd.Series, num_points: int = 100) -> dict[str, list[float | None]] | None:
-    values = series.to_numpy(dtype=float)
-    if len(values) < 2 or np.allclose(values, values[0]):
-        return None
-    try:
-        kde = scipy_stats.gaussian_kde(values)
-    except Exception:
-        return None
-    xs = np.linspace(values.min(), values.max(), num_points)
-    ys = kde(xs)
-    return {"x": [_round(v) for v in xs.tolist()], "y": [_round(v) for v in ys.tolist()]}
-
-
-def _interpret_correlation(r: float | None) -> str:
+def _correlation_strength(r: float | None) -> str:
     if r is None:
         return "unknown"
     abs_r = abs(r)
     if abs_r < 0.2:
-        return "No correlation"
-    if r < 0:
-        return "Negative"
+        return "no correlation"
     if abs_r >= 0.7:
-        return "Strong positive"
+        return "strong positive" if r > 0 else "strong negative"
     if abs_r >= 0.4:
-        return "Moderate positive"
-    return "Weak"
+        return "moderate positive" if r > 0 else "moderate negative"
+    return "weak positive" if r > 0 else "weak negative"
 
 
 # ---------------------------------------------------------------------------
-# 1. Descriptive
+# 1. Descriptive Analysis
 # ---------------------------------------------------------------------------
-
+# Spec: auto-picks ALL numeric columns. No user column selection.
+# Backend: df.describe().T.reset_index()
+# Output: Column, Count, Mean, Std, Min, 25%, 50%, 75%, Max
+# View: Table only.
 
 def _compute_descriptive(
     df: pd.DataFrame, req: BasicAnalysisRequest, chart_type: ChartType
 ) -> tuple[ChartPayload, dict[str, Any], list[str]]:
-    y_col = _require_column(df, req.y_column, "y")
-    x_col = _optional_column(df, req.x_column)
+    numeric_df = df.select_dtypes(include=[np.number])
+    if numeric_df.shape[1] == 0:
+        raise error_response(status_code=400, detail="No numeric columns found in the dataset.")
+
+    described = numeric_df.describe().T.reset_index().rename(columns={"index": "column"})
+
+    table: list[dict[str, Any]] = []
+    for _, row in described.iterrows():
+        table.append({
+            "column": str(row["column"]),
+            "count": int(row["count"]) if pd.notna(row["count"]) else 0,
+            "mean": _round(row["mean"]),
+            "std": _round(row["std"]),
+            "min": _round(row["min"]),
+            "25%": _round(row["25%"]),
+            "50%": _round(row["50%"]),
+            "75%": _round(row["75%"]),
+            "max": _round(row["max"]),
+        })
+
+    chart = ChartPayload(chart_type=ChartType.TABLE, table=table)
+    summary = {"columns_analyzed": len(table), "total_rows": int(len(df))}
+    return chart, summary, []
+
+
+# ---------------------------------------------------------------------------
+# 2. Simple Distribution
+# ---------------------------------------------------------------------------
+# Spec: X = categorical only. Aggregation on X grouped by X itself.
+# Backend: df.groupby(X)[X].agg(agg_func)
+# Charts: Bar, Line, Pie, Doughnut, Line Area.
+
+def _compute_simple_distribution(
+    df: pd.DataFrame, req: BasicAnalysisRequest, chart_type: ChartType
+) -> tuple[ChartPayload, dict[str, Any], list[str]]:
+    x_col = _require_column(df, req.x_column, "x")
+    if not _is_categorical_column(df, x_col):
+        raise error_response(status_code=400, detail=f"'{x_col}' must be categorical for Simple Distribution.")
+
+    agg = req.aggregation or AggregationType.COUNT
+    # Simple distribution operates on X only; without a numeric Y, only
+    # COUNT and PERCENTAGE make sense - anything else silently degrades to COUNT.
+    if agg not in (AggregationType.COUNT, AggregationType.PERCENTAGE):
+        agg = AggregationType.COUNT
+
+    grouped = _apply_groupby_aggregation(df, x_col, None, agg).dropna().sort_values(ascending=False)
+
     warnings: list[str] = []
-
-    y = _numeric_series(df, y_col).dropna()
-    if y.empty:
-        raise error_response(status_code=400, detail=f"Column '{y_col}' has no numeric values to analyze.")
-
-    stats = {
-        "count": int(y.count()),
-        "sum": _round(y.sum()),
-        "mean": _round(y.mean()),
-        "median": _round(y.median()),
-        "min": _round(y.min()),
-        "max": _round(y.max()),
-        "std_dev": _round(y.std()) if y.count() > 1 else 0.0,
-    }
-
-    if chart_type == ChartType.STATS_TABLE or not x_col:
-        table = [{"metric": key.upper(), "value": value} for key, value in stats.items()]
-        chart = ChartPayload(chart_type=ChartType.STATS_TABLE, table=table)
-        return chart, stats, warnings
-
-    if chart_type == ChartType.BOX_PLOT:
-        chart = ChartPayload(chart_type=chart_type, extra={"box": _box_plot_stats(y)})
-        return chart, stats, warnings
-
-    agg = req.aggregation or AggregationType.AVG
-    grouped = _groupby_aggregate(df, x_col, y_col, agg).dropna().sort_values(ascending=False)
     if len(grouped) > MAX_GROUPS:
         warnings.append(f"Result truncated to top {MAX_GROUPS} groups by value.")
         grouped = grouped.iloc[:MAX_GROUPS]
 
-    labels = [_clean_label(v) for v in grouped.index.tolist()]
+    labels = [_clean_label(k) for k in grouped.index.tolist()]
     values = [_round(v) for v in grouped.tolist()]
+
     chart = ChartPayload(
         chart_type=chart_type,
         labels=labels,
-        series=[{"name": f"{agg.value}({y_col})", "data": values}],
+        series=[{"name": f"{agg.value}({x_col})", "data": values}],
     )
-    return chart, stats, warnings
+    summary = {
+        "x_column": x_col,
+        "aggregation": agg.value,
+        "total_categories": int(len(grouped)),
+    }
+    return chart, summary, warnings
 
 
 # ---------------------------------------------------------------------------
-# 2. Distribution
+# 3 & 4. Top N and Bottom N Analysis
 # ---------------------------------------------------------------------------
+# Spec: X=Categorical (required). Y=Numeric (optional).
+#       If Y not given -> default to Count of X. N max = 10.
+# Backend: df.groupby(X)[Y].agg(agg_func).nlargest(N) / nsmallest(N)
 
-
-def _compute_distribution(
-    df: pd.DataFrame, req: BasicAnalysisRequest, chart_type: ChartType
+def _compute_top_bottom_n(
+    df: pd.DataFrame,
+    req: BasicAnalysisRequest,
+    chart_type: ChartType,
+    direction: str,
 ) -> tuple[ChartPayload, dict[str, Any], list[str]]:
     x_col = _require_column(df, req.x_column, "x")
-    group_col = _optional_column(df, req.group_by_column)
-    warnings: list[str] = []
+    if not _is_categorical_column(df, x_col):
+        raise error_response(status_code=400, detail=f"'{x_col}' must be categorical for Top/Bottom N.")
 
-    x = _numeric_series(df, x_col).dropna()
-    if x.empty:
-        raise error_response(status_code=400, detail=f"Column '{x_col}' has no numeric values to analyze.")
+    y_col = req.y_column if req.y_column else None
+    if y_col is not None:
+        if y_col not in df.columns:
+            raise error_response(status_code=400, detail=f"Column '{y_col}' was not found in the dataset.")
+        if not _is_numeric_column(df, y_col):
+            raise error_response(status_code=400, detail=f"'{y_col}' must be numeric for Top/Bottom N.")
 
-    n = len(x)
-    bin_count = req.bin_count or max(5, min(50, int(math.ceil(math.log2(n) + 1))))
+    agg = req.aggregation or (AggregationType.COUNT if y_col is None else AggregationType.SUM)
+    # Y required for numeric-aggregation types; if Y missing -> force COUNT.
+    if y_col is None and agg not in (AggregationType.COUNT, AggregationType.PERCENTAGE):
+        agg = AggregationType.COUNT
 
-    stats: dict[str, Any] = {
-        "count": int(n),
-        "mean": _round(x.mean()),
-        "median": _round(x.median()),
-        "std_dev": _round(x.std()) if n > 1 else 0.0,
-        "min": _round(x.min()),
-        "max": _round(x.max()),
-        "skewness": _round(float(scipy_stats.skew(x))) if n > 2 else None,
-        "kurtosis": _round(float(scipy_stats.kurtosis(x))) if n > 2 else None,
-        "p25": _round(float(x.quantile(0.25))),
-        "p50": _round(float(x.quantile(0.50))),
-        "p75": _round(float(x.quantile(0.75))),
-        "p90": _round(float(x.quantile(0.90))),
-        "p95": _round(float(x.quantile(0.95))),
-    }
+    grouped = _apply_groupby_aggregation(df, x_col, y_col, agg).dropna()
 
-    if chart_type == ChartType.BOX_PLOT:
-        if group_col:
-            table = []
-            for key, sub in df.groupby(group_col):
-                sub_x = _numeric_series(sub, x_col).dropna()
-                if sub_x.empty:
-                    continue
-                table.append({"group": _clean_label(key), **_box_plot_stats(sub_x)})
-            chart = ChartPayload(chart_type=chart_type, table=table)
-        else:
-            chart = ChartPayload(chart_type=chart_type, extra={"box": _box_plot_stats(x)})
-        return chart, stats, warnings
+    n = min(max(1, int(req.n)), 10)  # spec: N max = 10
+    ranked = grouped.nlargest(n) if direction == "top" else grouped.nsmallest(n)
 
-    if chart_type in (ChartType.DENSITY_KDE, ChartType.VIOLIN_PLOT, ChartType.HISTOGRAM_CURVE):
-        extra: dict[str, Any] = {"density_curve": _kde_curve(x)}
-        if chart_type == ChartType.VIOLIN_PLOT and group_col:
-            groups = []
-            for key, sub in df.groupby(group_col):
-                sub_x = _numeric_series(sub, x_col).dropna()
-                if sub_x.empty:
-                    continue
-                groups.append(
-                    {"group": _clean_label(key), "box": _box_plot_stats(sub_x), "density_curve": _kde_curve(sub_x)}
-                )
-            extra["groups"] = groups
+    ranking = [
+        {"rank": i + 1, "category": _clean_label(k), "value": _round(v)}
+        for i, (k, v) in enumerate(ranked.items())
+    ]
 
-        if chart_type != ChartType.HISTOGRAM_CURVE:
-            chart = ChartPayload(chart_type=chart_type, extra=extra)
-            return chart, stats, warnings
+    labels = [row["category"] for row in ranking]
+    values = [row["value"] for row in ranking]
+    y_label = f"{agg.value}({y_col})" if y_col else f"count({x_col})"
 
-        counts, edges = np.histogram(x, bins=bin_count)
-        chart = ChartPayload(
-            chart_type=chart_type,
-            labels=[_round((edges[i] + edges[i + 1]) / 2) for i in range(len(counts))],
-            series=[{"name": "frequency", "data": [int(c) for c in counts]}],
-            extra={**extra, "bin_edges": [_round(e) for e in edges.tolist()], "bin_count": bin_count},
-        )
-        return chart, stats, warnings
-
-    if chart_type == ChartType.CDF:
-        sorted_vals = np.sort(x.to_numpy())
-        cum_pct = (np.arange(1, len(sorted_vals) + 1) / len(sorted_vals)) * 100
-        step = max(1, len(sorted_vals) // MAX_POINTS)
-        chart = ChartPayload(
-            chart_type=chart_type,
-            labels=[_round(v) for v in sorted_vals[::step].tolist()],
-            series=[{"name": "cumulative_percent", "data": [_round(v) for v in cum_pct[::step].tolist()]}],
-        )
-        return chart, stats, warnings
-
-    # default: HISTOGRAM
-    counts, edges = np.histogram(x, bins=bin_count)
     chart = ChartPayload(
-        chart_type=ChartType.HISTOGRAM,
-        labels=[_round((edges[i] + edges[i + 1]) / 2) for i in range(len(counts))],
-        series=[{"name": "frequency", "data": [int(c) for c in counts]}],
-        extra={"bin_edges": [_round(e) for e in edges.tolist()], "bin_count": bin_count},
+        chart_type=chart_type,
+        labels=labels,
+        series=[{"name": y_label, "data": values}],
+        table=ranking,
     )
-    return chart, stats, warnings
-
-
-# ---------------------------------------------------------------------------
-# 3. Top N / Bottom N
-# ---------------------------------------------------------------------------
+    summary = {
+        "x_column": x_col,
+        "y_column": y_col,
+        "aggregation": agg.value,
+        "direction": direction,
+        "n": n,
+        "total_categories": int(len(grouped)),
+    }
+    return chart, summary, []
 
 
 def _compute_top_n(
     df: pd.DataFrame, req: BasicAnalysisRequest, chart_type: ChartType
 ) -> tuple[ChartPayload, dict[str, Any], list[str]]:
-    x_col = _require_column(df, req.x_column, "x")
-    y_col = _require_column(df, req.y_column, "y")
-    warnings: list[str] = []
+    return _compute_top_bottom_n(df, req, chart_type, direction="top")
 
-    agg = req.aggregation or AggregationType.SUM
-    n = min(req.n, MAX_TOP_N)
-    ascending = req.direction == SortDirection.BOTTOM
 
-    grouped = _groupby_aggregate(df, x_col, y_col, agg).dropna()
-    total = float(grouped.sum())
-    sorted_series = grouped.sort_values(ascending=ascending)
-    top = sorted_series.iloc[:n]
-
-    labels = [_clean_label(v) for v in top.index.tolist()]
-    values = [_round(v) for v in top.tolist()]
-
-    stats = {
-        "total_groups": int(len(grouped)),
-        "n_requested": req.n,
-        "n_returned": int(len(top)),
-        "direction": req.direction.value,
-        "aggregation": agg.value,
-    }
-
-    if chart_type == ChartType.RANKED_TABLE:
-        table = [
-            {"rank": idx + 1, "label": label, "value": value}
-            for idx, (label, value) in enumerate(zip(labels, values))
-        ]
-        chart = ChartPayload(chart_type=chart_type, table=table, labels=labels)
-        return chart, stats, warnings
-
-    if chart_type == ChartType.DONUT_TOP_N_SHARE:
-        donut_labels = list(labels)
-        donut_values = list(values)
-        others_value = _round(total - sum(v for v in values if v is not None))
-        if others_value is not None and others_value > 0:
-            donut_labels.append("Others")
-            donut_values.append(others_value)
-        chart = ChartPayload(
-            chart_type=chart_type,
-            labels=donut_labels,
-            series=[{"name": agg.value, "data": donut_values}],
-        )
-        return chart, stats, warnings
-
-    if chart_type in (ChartType.TREEMAP, ChartType.PODIUM):
-        table = [
-            {"rank": idx + 1, "label": label, "value": value}
-            for idx, (label, value) in enumerate(zip(labels, values))
-        ]
-        chart = ChartPayload(
-            chart_type=chart_type,
-            labels=labels,
-            series=[{"name": agg.value, "data": values}],
-            table=table,
-        )
-        return chart, stats, warnings
-
-    # default: HORIZONTAL_BAR / VERTICAL_BAR
-    chart = ChartPayload(
-        chart_type=chart_type,
-        labels=labels,
-        series=[{"name": f"{agg.value}({y_col})", "data": values}],
-    )
-    return chart, stats, warnings
+def _compute_bottom_n(
+    df: pd.DataFrame, req: BasicAnalysisRequest, chart_type: ChartType
+) -> tuple[ChartPayload, dict[str, Any], list[str]]:
+    return _compute_top_bottom_n(df, req, chart_type, direction="bottom")
 
 
 # ---------------------------------------------------------------------------
-# 4. Time Series
+# 5. Time Series Analysis
 # ---------------------------------------------------------------------------
-
-
-def _apply_time_series_post_agg(
-    values: pd.Series,
-    agg: AggregationType,
-    rolling_window: int,
-    granularity: TimeGranularity,
-) -> pd.Series:
-    if agg == AggregationType.CUMSUM:
-        return values.cumsum()
-    if agg == AggregationType.MOM_PERCENT:
-        return values.pct_change().mul(100)
-    if agg == AggregationType.YOY_PERCENT:
-        return values.pct_change(periods=_PERIODS_PER_YEAR.get(granularity, 12)).mul(100)
-    if agg == AggregationType.ROLLING_AVG:
-        return values.rolling(window=rolling_window, min_periods=1).mean()
-    return values
-
+# Spec: X=Date (required), Y=Numeric (optional).
+#       If Y not selected -> aggregation locked to Count.
+# Backend: df.set_index(X).resample(granularity)[Y].agg(agg_func)
+# Charts: Line, Line Area, Bar, Horizontal Bar, Step Line.
 
 def _compute_time_series(
     df: pd.DataFrame, req: BasicAnalysisRequest, chart_type: ChartType
 ) -> tuple[ChartPayload, dict[str, Any], list[str]]:
     x_col = _require_column(df, req.x_column, "x")
-    y_col = _require_column(df, req.y_column, "y")
-    series_col = _optional_column(df, req.series_column)
-    warnings: list[str] = []
 
-    x = _datetime_series(df, x_col)
-    valid_mask = x.notna()
-    if not valid_mask.any():
-        raise error_response(status_code=400, detail=f"Column '{x_col}' has no parseable dates.")
-    if int((~valid_mask).sum()) > 0:
-        warnings.append(f"{int((~valid_mask).sum())} row(s) with unparseable dates were excluded.")
+    working = df[[x_col] + ([req.y_column] if req.y_column and req.y_column in df.columns else [])].copy()
+    working[x_col] = _datetime_series(working, x_col)
+    working = working.dropna(subset=[x_col])
+    if working.empty:
+        raise error_response(status_code=400, detail=f"No valid dates found in '{x_col}'.")
 
-    working = pd.DataFrame(
-        {"__period__": x[valid_mask].dt.to_period(_PANDAS_PERIOD_FREQ[req.granularity]), "__value__": _numeric_series(df, y_col)[valid_mask]}
-    )
-    if series_col:
-        working["__series__"] = df.loc[valid_mask, series_col].to_numpy()
-
-    agg = req.aggregation or AggregationType.SUM
-    group_cols = ["__period__"] if not series_col else ["__period__", "__series__"]
-    if agg == AggregationType.COUNT:
-        grouped = working.groupby(group_cols).size().rename("__value__").reset_index()
-    elif agg == AggregationType.AVG:
-        grouped = working.groupby(group_cols)["__value__"].mean().reset_index()
+    # Granularity: AUTO -> derive from date range
+    if req.granularity == TimeGranularity.AUTO:
+        freq, used_granularity = _auto_granularity_freq(working[x_col])
     else:
-        grouped = working.groupby(group_cols)["__value__"].sum().reset_index()
+        freq = _PANDAS_FREQ.get(req.granularity)
+        if not freq:
+            raise error_response(status_code=400, detail=f"Unknown granularity: {req.granularity}")
+        used_granularity = req.granularity
 
-    stats = {
-        "granularity": req.granularity.value,
-        "aggregation": agg.value,
-        "periods": int(grouped["__period__"].nunique()),
-    }
+    y_col = req.y_column if req.y_column else None
+    if y_col is not None:
+        if not _is_numeric_column(working, y_col):
+            raise error_response(status_code=400, detail=f"'{y_col}' must be numeric for Time Series.")
 
-    if series_col:
-        pivot = grouped.pivot(index="__period__", columns="__series__", values="__value__").sort_index()
-        if pivot.shape[1] > MAX_GROUPS:
-            top_cols = pivot.sum(axis=0, skipna=True).sort_values(ascending=False).index[:MAX_GROUPS]
-            pivot = pivot[top_cols]
-            warnings.append(f"Series limited to top {MAX_GROUPS} by total value.")
-        if len(pivot) > MAX_POINTS:
-            pivot = pivot.iloc[-MAX_POINTS:]
-            warnings.append(f"Chart truncated to the most recent {MAX_POINTS} periods.")
+    agg = req.aggregation or (AggregationType.COUNT if y_col is None else AggregationType.SUM)
+    if y_col is None and agg not in (AggregationType.COUNT, AggregationType.PERCENTAGE):
+        agg = AggregationType.COUNT
 
-        labels = [str(p) for p in pivot.index.tolist()]
-        series = []
-        for col in pivot.columns:
-            col_values = _apply_time_series_post_agg(pivot[col], agg, req.rolling_window, req.granularity)
-            series.append({"name": _clean_label(col), "data": [_round(v) for v in col_values.tolist()]})
-        chart = ChartPayload(chart_type=chart_type, labels=labels, series=series)
-        return chart, stats, warnings
+    # Resample
+    resampled = working.set_index(x_col).resample(freq)
 
-    single = grouped.set_index("__period__")["__value__"].sort_index()
-    if len(single) > MAX_POINTS:
-        single = single.iloc[-MAX_POINTS:]
-        warnings.append(f"Chart truncated to the most recent {MAX_POINTS} periods.")
-    single = _apply_time_series_post_agg(single, agg, req.rolling_window, req.granularity)
+    if y_col is None:
+        series_values = resampled.size()
+    elif agg == AggregationType.PERCENTAGE:
+        sums = resampled[y_col].sum()
+        total = float(sums.sum())
+        series_values = (sums / total * 100) if total != 0 else sums
+    elif agg == AggregationType.COUNT:
+        series_values = resampled[y_col].count()
+    else:
+        pandas_agg = _PANDAS_AGG[agg]
+        series_values = resampled[y_col].agg(pandas_agg)
 
-    labels = [str(p) for p in single.index.tolist()]
-    values = [_round(v) for v in single.tolist()]
+    series_values = series_values.dropna()
 
-    if chart_type == ChartType.CALENDAR_HEATMAP:
-        table = [{"period": label, "value": value} for label, value in zip(labels, values)]
-        chart = ChartPayload(chart_type=chart_type, labels=labels, series=[{"name": agg.value, "data": values}], table=table)
-        return chart, stats, warnings
+    labels = [ts.strftime("%Y-%m-%d") for ts in series_values.index]
+    values = [_round(v) for v in series_values.tolist()]
+    y_label = f"{agg.value}({y_col})" if y_col else f"count({x_col})"
+
+    # Simple trend detection
+    trend = "flat"
+    if len(values) >= 2 and values[0] is not None and values[-1] is not None and values[0] != 0:
+        change_pct = ((values[-1] - values[0]) / abs(values[0])) * 100
+        if change_pct > 5:
+            trend = "increasing"
+        elif change_pct < -5:
+            trend = "decreasing"
 
     chart = ChartPayload(
         chart_type=chart_type,
         labels=labels,
-        series=[{"name": f"{agg.value}({y_col})", "data": values}],
+        series=[{"name": y_label, "data": values}],
     )
-    return chart, stats, warnings
+    summary = {
+        "x_column": x_col,
+        "y_column": y_col,
+        "aggregation": agg.value,
+        "granularity": used_granularity.value,
+        "trend": trend,
+        "data_points": len(values),
+    }
+    return chart, summary, []
 
 
 # ---------------------------------------------------------------------------
-# 5. Aggregation / Group By
+# 6. Advanced Distribution / Group By
 # ---------------------------------------------------------------------------
+# Spec: X=Categorical (required), Y=Numeric (MANDATORY).
+# Backend: df.groupby(X)[Y].agg(agg_func)
 
-
-def _compute_aggregation(
+def _compute_advanced_distribution(
     df: pd.DataFrame, req: BasicAnalysisRequest, chart_type: ChartType
 ) -> tuple[ChartPayload, dict[str, Any], list[str]]:
     x_col = _require_column(df, req.x_column, "x")
     y_col = _require_column(df, req.y_column, "y")
-    secondary_col = _optional_column(df, req.secondary_group_column)
-    warnings: list[str] = []
+
+    if not _is_categorical_column(df, x_col):
+        raise error_response(status_code=400, detail=f"'{x_col}' must be categorical for Advanced Distribution.")
+    if not _is_numeric_column(df, y_col):
+        raise error_response(status_code=400, detail=f"'{y_col}' must be numeric for Advanced Distribution.")
 
     agg = req.aggregation or AggregationType.SUM
+    grouped = _apply_groupby_aggregation(df, x_col, y_col, agg).dropna().sort_values(ascending=False)
 
-    if secondary_col and chart_type in (ChartType.GROUPED_BAR, ChartType.STACKED_BAR):
-        grouped = _groupby_aggregate(df, x_col, y_col, agg, secondary_col=secondary_col)
-        pivot = grouped.unstack(secondary_col).fillna(0)
-        if pivot.shape[0] > MAX_GROUPS:
-            pivot = pivot.iloc[:MAX_GROUPS]
-            warnings.append(f"Result truncated to first {MAX_GROUPS} groups.")
-        if pivot.shape[1] > MAX_GROUPS:
-            top_cols = pivot.sum(axis=0).sort_values(ascending=False).index[:MAX_GROUPS]
-            pivot = pivot[top_cols]
-            warnings.append(f"Secondary groups limited to top {MAX_GROUPS} by total value.")
-
-        labels = [_clean_label(v) for v in pivot.index.tolist()]
-        series = [
-            {"name": _clean_label(col), "data": [_round(v) for v in pivot[col].tolist()]} for col in pivot.columns
-        ]
-        chart = ChartPayload(chart_type=chart_type, labels=labels, series=series)
-        stats = {"groups": len(labels), "secondary_groups": len(pivot.columns), "aggregation": agg.value}
-        return chart, stats, warnings
-
-    grouped = _groupby_aggregate(df, x_col, y_col, agg).dropna().sort_values(ascending=False)
-    total = float(grouped.sum())
-
-    if agg == AggregationType.PERCENT_OF_TOTAL and total:
-        grouped = (grouped / total) * 100
-
+    warnings: list[str] = []
     if len(grouped) > MAX_GROUPS:
         warnings.append(f"Result truncated to top {MAX_GROUPS} groups by value.")
         grouped = grouped.iloc[:MAX_GROUPS]
 
-    if chart_type in (ChartType.PIE, ChartType.DOUGHNUT) and len(grouped) > 8:
-        warnings.append("More than 8 categories selected — consider Bar/Treemap instead of Pie/Doughnut.")
-
-    labels = [_clean_label(v) for v in grouped.index.tolist()]
+    labels = [_clean_label(k) for k in grouped.index.tolist()]
     values = [_round(v) for v in grouped.tolist()]
-    stats = {"groups": len(labels), "aggregation": agg.value, "grand_total": _round(total)}
 
     chart = ChartPayload(
         chart_type=chart_type,
         labels=labels,
         series=[{"name": f"{agg.value}({y_col})", "data": values}],
     )
-    return chart, stats, warnings
+    summary = {
+        "x_column": x_col,
+        "y_column": y_col,
+        "aggregation": agg.value,
+        "total_groups": int(len(grouped)),
+    }
+    return chart, summary, warnings
 
 
 # ---------------------------------------------------------------------------
-# 6. Correlation
+# 7. Correlation Analysis
 # ---------------------------------------------------------------------------
-
+# Spec: multi-select numeric, min 2 required. Pearson only.
+#   Exactly 2 cols -> Scatter Plot, Scatter + Trend Line.
+#   3 or more cols -> Correlation Heatmap, Pair Plot.
 
 def _compute_correlation(
     df: pd.DataFrame, req: BasicAnalysisRequest, chart_type: ChartType
 ) -> tuple[ChartPayload, dict[str, Any], list[str]]:
-    warnings: list[str] = []
+    cols = req.columns or []
+    if len(cols) < 2:
+        raise error_response(status_code=400, detail="Correlation requires at least 2 numeric columns.")
 
-    if chart_type == ChartType.CORRELATION_HEATMAP:
-        candidate_cols = [c for c in (req.heatmap_columns or df.columns.tolist()) if c in df.columns]
-        if not req.heatmap_columns:
-            candidate_cols = [
-                col for col in candidate_cols if pd.to_numeric(df[col], errors="coerce").notna().mean() >= 0.5
-            ]
-        candidate_cols = candidate_cols[:MAX_HEATMAP_COLUMNS]
-        if len(candidate_cols) < 2:
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise error_response(status_code=400, detail=f"Column(s) not found: {missing}")
+
+    non_numeric = [c for c in cols if not _is_numeric_column(df, c)]
+    if non_numeric:
+        raise error_response(status_code=400, detail=f"Column(s) must be numeric: {non_numeric}")
+
+    warnings: list[str] = []
+    n_cols = len(cols)
+
+    # Case A: Exactly 2 columns -> scatter / scatter + trend line
+    if n_cols == 2:
+        # If caller passed a 3+ col chart type (heatmap/pair_plot) with only 2 cols,
+        # snap to scatter+trend which is the appropriate default.
+        if chart_type not in (ChartType.SCATTER, ChartType.SCATTER_TREND_LINE):
+            chart_type = ChartType.SCATTER_TREND_LINE
+
+        col_x, col_y = cols[0], cols[1]
+        pair = df[[col_x, col_y]].dropna()
+        if len(pair) < 3:
             raise error_response(
-                status_code=400, detail="At least 2 numeric columns are required for a correlation heatmap."
+                status_code=400,
+                detail="Need at least 3 rows with values in both columns.",
             )
 
-        numeric_df = df[candidate_cols].apply(lambda col: pd.to_numeric(col, errors="coerce"))
-        corr_matrix = numeric_df.corr(method=req.correlation_method.value)
-        table = [
-            {"row": row, **{col: _round(corr_matrix.loc[row, col]) for col in candidate_cols}}
-            for row in candidate_cols
+        r = float(pair[col_x].corr(pair[col_y], method="pearson"))
+        r_squared = round(r * r, 4)
+
+        slope, intercept = np.polyfit(pair[col_x].values, pair[col_y].values, 1)
+        trend_line = {
+            "slope": _round(float(slope), 6),
+            "intercept": _round(float(intercept), 6),
+            "start": {
+                "x": _round(float(pair[col_x].min())),
+                "y": _round(float(intercept + slope * pair[col_x].min())),
+            },
+            "end": {
+                "x": _round(float(pair[col_x].max())),
+                "y": _round(float(intercept + slope * pair[col_x].max())),
+            },
+        }
+
+        sample = pair.sample(min(len(pair), MAX_POINTS), random_state=42) if len(pair) > MAX_POINTS else pair
+        if len(pair) > MAX_POINTS:
+            warnings.append(f"Scatter sampled down to {MAX_POINTS} points for performance.")
+
+        points = [
+            {"x": _round(float(row[col_x])), "y": _round(float(row[col_y]))}
+            for _, row in sample.iterrows()
         ]
-        chart = ChartPayload(chart_type=chart_type, labels=candidate_cols, table=table)
-        stats = {"columns": candidate_cols, "method": req.correlation_method.value}
-        return chart, stats, warnings
 
-    x_col = _require_column(df, req.x_column, "x")
-    y_col = _require_column(df, req.y_column, "y")
-    group_col = _optional_column(df, req.group_by_column)
-    size_col = _optional_column(df, req.size_column)
+        extra: dict[str, Any] = {
+            "r": round(r, 4),
+            "r_squared": r_squared,
+            "strength": _correlation_strength(r),
+            "x_column": col_x,
+            "y_column": col_y,
+        }
+        if chart_type == ChartType.SCATTER_TREND_LINE:
+            extra["trend_line"] = trend_line
 
-    x = _numeric_series(df, x_col)
-    y = _numeric_series(df, y_col)
-    mask = x.notna() & y.notna()
-    size_series = _numeric_series(df, size_col) if size_col else None
-    if size_series is not None:
-        mask &= size_series.notna()
+        chart = ChartPayload(chart_type=chart_type, points=points, extra=extra)
+        summary = {
+            "mode": "pairwise",
+            "method": "pearson",
+            "r": round(r, 4),
+            "r_squared": r_squared,
+            "strength": _correlation_strength(r),
+            "n": int(len(pair)),
+        }
+        return chart, summary, warnings
 
-    if int(mask.sum()) < 2:
-        raise error_response(status_code=400, detail="Not enough numeric (x, y) pairs to compute a correlation.")
+    # Case B: 3+ columns -> heatmap / pair plot
+    # If caller passed a 2-col chart type (scatter/scatter_trend_line) as default
+    # because 3+ cols were provided, snap to correlation_heatmap.
+    if chart_type not in (ChartType.CORRELATION_HEATMAP, ChartType.PAIR_PLOT):
+        chart_type = ChartType.CORRELATION_HEATMAP
 
-    x_valid = x[mask]
-    y_valid = y[mask]
-    method = "spearman" if req.correlation_method == CorrelationMethod.SPEARMAN else "pearson"
-    r = _round(float(x_valid.corr(y_valid, method=method)))
-    r_squared = _round(r**2) if r is not None else None
-    interpretation = _interpret_correlation(r)
+    if n_cols > MAX_HEATMAP_COLS:
+        warnings.append(f"Truncated to first {MAX_HEATMAP_COLS} columns for the heatmap.")
+        cols = cols[:MAX_HEATMAP_COLS]
 
-    slope = intercept = None
-    if len(x_valid) >= 2 and float(x_valid.std()) > 0:
-        fit_slope, fit_intercept = np.polyfit(x_valid.to_numpy(), y_valid.to_numpy(), 1)
-        slope, intercept = _round(float(fit_slope)), _round(float(fit_intercept))
+    corr = df[cols].corr(method="pearson").round(4)
 
-    stats: dict[str, Any] = {
-        "r": r,
-        "r_squared": r_squared,
-        "method": req.correlation_method.value,
-        "interpretation": interpretation,
-        "n": int(mask.sum()),
-        "trend_line": {"slope": slope, "intercept": intercept} if slope is not None else None,
+    matrix: list[list[dict[str, Any]]] = []
+    for i, row_col in enumerate(cols):
+        row = []
+        for j, col_col in enumerate(cols):
+            v = corr.iloc[i, j]
+            row.append({
+                "x": col_col,
+                "y": row_col,
+                "value": None if pd.isna(v) else float(v),
+            })
+        matrix.append(row)
+
+    pairs: list[dict[str, Any]] = []
+    for i in range(n_cols):
+        for j in range(i + 1, n_cols):
+            v = corr.iloc[i, j]
+            if pd.isna(v):
+                continue
+            pairs.append({
+                "column_a": cols[i],
+                "column_b": cols[j],
+                "correlation": float(v),
+                "r_squared": round(float(v) * float(v), 4),
+                "strength": _correlation_strength(float(v)),
+            })
+    pairs.sort(key=lambda p: abs(p["correlation"]), reverse=True)
+
+    extra_multi: dict[str, Any] = {
+        "matrix": matrix,
+        "pairs": pairs,
+        "columns": cols,
+        "color_scale": {"min": -1, "max": 1, "midpoint": 0},
     }
 
-    indices = np.where(mask.to_numpy())[0]
-    if len(indices) > MAX_POINTS:
-        rng = np.random.default_rng(42)
-        indices = np.sort(rng.choice(indices, size=MAX_POINTS, replace=False))
-        warnings.append(f"Scatter sampled down to {MAX_POINTS} points for performance.")
+    # Pair plot: include sampled scatter points per column pair
+    if chart_type == ChartType.PAIR_PLOT:
+        pair_plot_data: dict[str, list[dict[str, Any]]] = {}
+        for i in range(n_cols):
+            for j in range(n_cols):
+                if i == j:
+                    continue
+                cx, cy = cols[j], cols[i]
+                pair_df = df[[cx, cy]].dropna()
+                sample = pair_df.sample(min(len(pair_df), 500), random_state=42) if len(pair_df) > 500 else pair_df
+                pair_plot_data[f"{cy}__vs__{cx}"] = [
+                    {"x": _round(float(row[cx])), "y": _round(float(row[cy]))}
+                    for _, row in sample.iterrows()
+                ]
+        extra_multi["pair_plot_data"] = pair_plot_data
 
-    points = []
-    for idx in indices:
-        point: dict[str, Any] = {"x": _round(float(x.iat[idx])), "y": _round(float(y.iat[idx]))}
-        if group_col:
-            point["group"] = _clean_label(df[group_col].iat[idx])
-        if size_series is not None:
-            point["size"] = _round(float(size_series.iat[idx]))
-        points.append(point)
-
-    extra: dict[str, Any] = {}
-    if chart_type == ChartType.SCATTER_TREND_LINE and slope is not None:
-        extra["trend_line"] = {"slope": slope, "intercept": intercept}
-    if chart_type == ChartType.NO_CORRELATION_VIEW and abs(r or 0) >= 0.2:
-        warnings.append("Correlation is not negligible (|r| >= 0.2) — consider Scatter or Scatter + Trend Line.")
-
-    chart = ChartPayload(chart_type=chart_type, points=points, extra=extra)
-    return chart, stats, warnings
+    chart = ChartPayload(chart_type=chart_type, labels=cols, extra=extra_multi)
+    summary = {
+        "mode": "matrix",
+        "method": "pearson",
+        "columns_analyzed": n_cols,
+        "strongest_pair": pairs[0] if pairs else None,
+    }
+    return chart, summary, warnings
 
 
 # ---------------------------------------------------------------------------
@@ -671,13 +621,15 @@ def _compute_correlation(
 # ---------------------------------------------------------------------------
 
 _ANALYSIS_HANDLERS: dict[
-    AnalysisType, Callable[[pd.DataFrame, BasicAnalysisRequest, ChartType], tuple[ChartPayload, dict[str, Any], list[str]]]
+    AnalysisType,
+    Callable[[pd.DataFrame, BasicAnalysisRequest, ChartType], tuple[ChartPayload, dict[str, Any], list[str]]],
 ] = {
     AnalysisType.DESCRIPTIVE: _compute_descriptive,
-    AnalysisType.DISTRIBUTION: _compute_distribution,
-    AnalysisType.TOP_N_BOTTOM_N: _compute_top_n,
+    AnalysisType.SIMPLE_DISTRIBUTION: _compute_simple_distribution,
+    AnalysisType.TOP_N: _compute_top_n,
+    AnalysisType.BOTTOM_N: _compute_bottom_n,
     AnalysisType.TIME_SERIES: _compute_time_series,
-    AnalysisType.AGGREGATION: _compute_aggregation,
+    AnalysisType.ADVANCED_DISTRIBUTION: _compute_advanced_distribution,
     AnalysisType.CORRELATION: _compute_correlation,
 }
 
@@ -696,13 +648,13 @@ def list_analysis_type_metadata() -> list[dict[str, Any]]:
                 "supported_aggregations": list(config.supported_aggregations),
                 "column_requirements": [
                     {
-                        "role": requirement.role,
-                        "required": requirement.required,
-                        "data_type": requirement.data_type,
-                        "label": requirement.label,
-                        "example": requirement.example,
+                        "role": r.role,
+                        "required": r.required,
+                        "data_type": r.data_type,
+                        "label": r.label,
+                        "example": r.example,
                     }
-                    for requirement in config.column_requirements
+                    for r in config.column_requirements
                 ],
             }
         )

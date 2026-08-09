@@ -4,8 +4,6 @@ from pydantic import BaseModel, Field
 
 from app.enum.aggregation_type_enum import (
     AggregationType,
-    CorrelationMethod,
-    SortDirection,
     TimeGranularity,
 )
 from app.enum.analysis_type_enum import AnalysisType
@@ -14,38 +12,51 @@ from app.schemas.common_schema import SuccessResponse
 
 
 class BasicAnalysisRequest(BaseModel):
+    """Basic Analysis request payload — matches the Data Analysis Workflow Specification.
+
+    Which column-role fields are required depends on ``analysis_type``:
+    see ``app.enum.analysis_chart_config.ANALYSIS_TYPE_CONFIGS``.
+    """
+
+    # ── Header (spec: mandatory) ──
+    analysis_name: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="Project name for identification (mandatory per spec).",
+    )
+
+    # ── Source ──
     dataset_id: int
     dataset_type: Literal["uploaded", "merged"]
     is_clean: bool = False
 
+    # ── Analysis selection ──
     analysis_type: AnalysisType
     chart_type: Optional[ChartType] = None
 
-    # Column roles — which ones are required depends on analysis_type
-    # (see app.enum.analysis_chart_config.ANALYSIS_TYPE_CONFIGS).
-    x_column: Optional[str] = None
-    y_column: Optional[str] = None
-    group_by_column: Optional[str] = None
-    secondary_group_column: Optional[str] = None
-    series_column: Optional[str] = None
-    size_column: Optional[str] = None
+    # ── Column roles — used by different analyses ──
+    x_column: Optional[str] = Field(
+        default=None,
+        description="X column (categorical for most, date for time series).",
+    )
+    y_column: Optional[str] = Field(
+        default=None,
+        description="Y column (numeric). Optional for Top/Bottom N and Time Series.",
+    )
+    columns: Optional[list[str]] = Field(
+        default=None,
+        description="For Correlation: 2+ numeric columns.",
+    )
 
+    # ── Aggregation (Simple Distribution, Top/Bottom N, Time Series, Advanced Distribution) ──
     aggregation: Optional[AggregationType] = None
 
-    # Top N / Bottom N
-    n: int = Field(default=10, ge=1, le=1000)
-    direction: SortDirection = SortDirection.TOP
+    # ── Top N / Bottom N (spec: max 10) ──
+    n: int = Field(default=10, ge=1, le=10)
 
-    # Distribution
-    bin_count: Optional[int] = Field(default=None, ge=2, le=200)
-
-    # Time Series
+    # ── Time Series ──
     granularity: TimeGranularity = TimeGranularity.MONTHLY
-    rolling_window: int = Field(default=3, ge=2, le=365)
-
-    # Correlation
-    correlation_method: CorrelationMethod = CorrelationMethod.PEARSON
-    heatmap_columns: Optional[list[str]] = None
 
 
 class ColumnRequirementResponse(BaseModel):

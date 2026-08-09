@@ -1,11 +1,10 @@
 """Static metadata tying each basic AnalysisType to its supported chart types,
 default chart, required column roles, and supported aggregations.
 
-This is a direct code representation of the "Analysis Types Developer Reference"
-doc (Required Data Structure / Supported Chart Types / Supported Aggregations
-tables) for the 6 basic analysis types only. It drives both request validation
-and the ``GET /basic-analysis/types`` metadata endpoint that a frontend uses to
-build the analysis-type / chart-type pickers.
+Direct code representation of the Data Analysis Workflow Specification
+(section 2 — Basic Analysis Module) for the 7 basic analysis types. Drives
+both request validation and the ``GET /basic-analysis/types`` metadata
+endpoint that a frontend uses to build the pickers.
 """
 
 from dataclasses import dataclass
@@ -37,151 +36,174 @@ class AnalysisTypeConfig:
     column_requirements: tuple[ColumnRequirement, ...]
 
 
+# Aggregation set shared by most spec analyses (Simple Dist, Top/Bottom N,
+# Time Series, Advanced Distribution). Spec section 2.
+_SPEC_AGGREGATIONS: tuple[AggregationType, ...] = (
+    AggregationType.COUNT,
+    AggregationType.SUM,
+    AggregationType.AVERAGE,
+    AggregationType.MEDIAN,
+    AggregationType.MINIMUM,
+    AggregationType.MAXIMUM,
+    AggregationType.PERCENTAGE,
+)
+
+
 ANALYSIS_TYPE_CONFIGS: dict[AnalysisType, AnalysisTypeConfig] = {
+    # ── 1. Descriptive Analysis ──────────────────────────────────────────
+    # Spec: auto-picks all numeric columns, no user column selection,
+    # returns table (Count/Mean/Std/Min/25%/50%/75%/Max), view type = Table.
     AnalysisType.DESCRIPTIVE: AnalysisTypeConfig(
         analysis_type=AnalysisType.DESCRIPTIVE,
         label="Descriptive Analysis",
-        tagline="Summarize the basic characteristics of your dataset",
+        tagline="Summary statistics across all numeric columns",
+        default_chart_type=ChartType.TABLE,
+        supported_chart_types=(ChartType.TABLE,),
+        supported_aggregations=(),  # auto — no user aggregation
+        column_requirements=(),  # no user column selection
+    ),
+
+    # ── 2. Simple Distribution Analysis ──────────────────────────────────
+    # Spec: X = categorical only. Groups by X, applies aggregation.
+    # Charts: Bar, Line, Pie, Doughnut, Line Area.
+    AnalysisType.SIMPLE_DISTRIBUTION: AnalysisTypeConfig(
+        analysis_type=AnalysisType.SIMPLE_DISTRIBUTION,
+        label="Simple Distribution Analysis",
+        tagline="Group by a category and see counts, sums, or percentages",
+        default_chart_type=ChartType.BAR,
+        supported_chart_types=(
+            ChartType.BAR,
+            ChartType.LINE,
+            ChartType.PIE,
+            ChartType.DOUGHNUT,
+            ChartType.LINE_AREA,
+        ),
+        supported_aggregations=_SPEC_AGGREGATIONS,
+        column_requirements=(
+            ColumnRequirement("x", True, "categorical", "Category to group by",
+                              "Region, Product, Category"),
+        ),
+    ),
+
+    # ── 3. Top N Analysis ────────────────────────────────────────────────
+    # Spec: X = categorical (required). Y = numeric (optional).
+    # If Y not selected → default to Count of X. Sorted descending, N max = 10.
+    AnalysisType.TOP_N: AnalysisTypeConfig(
+        analysis_type=AnalysisType.TOP_N,
+        label="Top N Analysis",
+        tagline="Rank the highest-performing entities by a metric",
         default_chart_type=ChartType.BAR,
         supported_chart_types=(
             ChartType.BAR,
             ChartType.HORIZONTAL_BAR,
+            ChartType.LINE,
             ChartType.PIE,
             ChartType.DOUGHNUT,
-            ChartType.BOX_PLOT,
-            ChartType.STATS_TABLE,
+            ChartType.LINE_AREA,
         ),
-        supported_aggregations=(
-            AggregationType.COUNT,
-            AggregationType.SUM,
-            AggregationType.AVG,
-            AggregationType.MEDIAN,
-            AggregationType.MIN,
-            AggregationType.MAX,
-            AggregationType.STD_DEV,
-        ),
+        supported_aggregations=_SPEC_AGGREGATIONS,
         column_requirements=(
-            ColumnRequirement("x", False, "categorical", "Group / dimension", "Product Category, Region"),
-            ColumnRequirement("y", True, "numeric", "Measure to analyze", "Sales Amount, Age, Revenue"),
+            ColumnRequirement("x", True, "categorical", "Entity to rank",
+                              "Region, Product, Category"),
+            ColumnRequirement("y", False, "numeric", "Metric to rank by (optional — defaults to Count of X)",
+                              "Sales, Profit"),
         ),
     ),
-    AnalysisType.DISTRIBUTION: AnalysisTypeConfig(
-        analysis_type=AnalysisType.DISTRIBUTION,
-        label="Distribution Analysis",
-        tagline="Understand how values spread across a range",
-        default_chart_type=ChartType.HISTOGRAM,
+
+    # ── 4. Bottom N Analysis ────────────────────────────────────────────
+    # Spec: same as Top N but sorted ascending. N max = 10.
+    AnalysisType.BOTTOM_N: AnalysisTypeConfig(
+        analysis_type=AnalysisType.BOTTOM_N,
+        label="Bottom N Analysis",
+        tagline="Rank the lowest-performing entities by a metric",
+        default_chart_type=ChartType.BAR,
         supported_chart_types=(
-            ChartType.HISTOGRAM,
-            ChartType.BOX_PLOT,
-            ChartType.VIOLIN_PLOT,
-            ChartType.DENSITY_KDE,
-            ChartType.HISTOGRAM_CURVE,
-            ChartType.CDF,
-        ),
-        supported_aggregations=(),
-        column_requirements=(
-            ColumnRequirement("x", True, "numeric", "Value to distribute", "Order Amount, Age, Score"),
-            ColumnRequirement("group_by", False, "categorical", "Split by category", "Product Type, Gender"),
-        ),
-    ),
-    AnalysisType.TOP_N_BOTTOM_N: AnalysisTypeConfig(
-        analysis_type=AnalysisType.TOP_N_BOTTOM_N,
-        label="Top N / Bottom N Analysis",
-        tagline="Rank entities and surface the best and worst performers",
-        default_chart_type=ChartType.HORIZONTAL_BAR,
-        supported_chart_types=(
+            ChartType.BAR,
             ChartType.HORIZONTAL_BAR,
-            ChartType.VERTICAL_BAR,
-            ChartType.RANKED_TABLE,
-            ChartType.PODIUM,
-            ChartType.TREEMAP,
-            ChartType.DONUT_TOP_N_SHARE,
+            ChartType.LINE,
+            ChartType.PIE,
+            ChartType.DOUGHNUT,
+            ChartType.LINE_AREA,
         ),
-        supported_aggregations=(
-            AggregationType.SUM,
-            AggregationType.COUNT,
-            AggregationType.AVG,
-            AggregationType.MAX,
-        ),
+        supported_aggregations=_SPEC_AGGREGATIONS,
         column_requirements=(
-            ColumnRequirement("x", True, "categorical", "Entity to rank", "Product Name, Customer ID, Region"),
-            ColumnRequirement("y", True, "numeric", "Metric to rank by", "Revenue, Units Sold, Profit"),
+            ColumnRequirement("x", True, "categorical", "Entity to rank",
+                              "Region, Product, Category"),
+            ColumnRequirement("y", False, "numeric", "Metric to rank by (optional — defaults to Count of X)",
+                              "Sales, Profit"),
         ),
     ),
+
+    # ── 5. Time Series Analysis ─────────────────────────────────────────
+    # Spec: X = date/datetime (required). Y = numeric (optional).
+    # If Y not selected → aggregation locks to Count.
+    # Charts: Line, Line Area, Bar, Horizontal Bar, Step Line.
     AnalysisType.TIME_SERIES: AnalysisTypeConfig(
         analysis_type=AnalysisType.TIME_SERIES,
         label="Time Series Analysis",
-        tagline="Analyze how a metric changes over time",
+        tagline="Analyze how a metric evolves over time",
         default_chart_type=ChartType.LINE,
         supported_chart_types=(
             ChartType.LINE,
-            ChartType.AREA,
-            ChartType.BAR_PERIOD,
-            ChartType.MULTI_LINE,
-            ChartType.STACKED_AREA_BAR,
-            ChartType.CALENDAR_HEATMAP,
+            ChartType.LINE_AREA,
+            ChartType.BAR,
+            ChartType.HORIZONTAL_BAR,
+            ChartType.STEP_LINE,
         ),
-        supported_aggregations=(
-            AggregationType.SUM,
-            AggregationType.COUNT,
-            AggregationType.AVG,
-            AggregationType.CUMSUM,
-            AggregationType.MOM_PERCENT,
-            AggregationType.YOY_PERCENT,
-            AggregationType.ROLLING_AVG,
-        ),
+        supported_aggregations=_SPEC_AGGREGATIONS,
         column_requirements=(
-            ColumnRequirement("x", True, "date", "Time axis", "Order Date, Created At, Month"),
-            ColumnRequirement("y", True, "numeric", "Metric over time", "Revenue, Users, Page Views"),
-            ColumnRequirement("series", False, "categorical", "Multiple lines", "Region, Product Category"),
+            ColumnRequirement("x", True, "date", "Date/time axis",
+                              "Order Date, Transaction Date, Month"),
+            ColumnRequirement("y", False, "numeric", "Metric over time (optional — defaults to Count)",
+                              "Sales, Revenue, Quantity"),
         ),
     ),
-    AnalysisType.AGGREGATION: AnalysisTypeConfig(
-        analysis_type=AnalysisType.AGGREGATION,
-        label="Aggregation / Group By Analysis",
-        tagline="Slice a metric by one or more categorical dimensions",
+
+    # ── 6. Advanced Distribution Analysis / Group By ─────────────────────
+    # Spec: X = categorical, Y = numeric MANDATORY.
+    AnalysisType.ADVANCED_DISTRIBUTION: AnalysisTypeConfig(
+        analysis_type=AnalysisType.ADVANCED_DISTRIBUTION,
+        label="Advanced Distribution / Group By",
+        tagline="Group by a category and aggregate a numeric measure",
         default_chart_type=ChartType.BAR,
         supported_chart_types=(
             ChartType.BAR,
-            ChartType.GROUPED_BAR,
-            ChartType.STACKED_BAR,
+            ChartType.HORIZONTAL_BAR,
+            ChartType.LINE,
             ChartType.PIE,
             ChartType.DOUGHNUT,
-            ChartType.TREEMAP,
+            ChartType.LINE_AREA,
         ),
-        supported_aggregations=(
-            AggregationType.SUM,
-            AggregationType.COUNT,
-            AggregationType.COUNT_DISTINCT,
-            AggregationType.AVG,
-            AggregationType.MIN,
-            AggregationType.MAX,
-            AggregationType.PERCENT_OF_TOTAL,
-        ),
+        supported_aggregations=_SPEC_AGGREGATIONS,
         column_requirements=(
-            ColumnRequirement("x", True, "categorical", "Grouping dimension", "City, Department, Product"),
-            ColumnRequirement("y", True, "numeric", "Metric to aggregate", "Revenue, Orders, Profit"),
-            ColumnRequirement("secondary_group", False, "categorical", "Second dimension", "Month, Channel"),
+            ColumnRequirement("x", True, "categorical", "Grouping dimension",
+                              "City, Department, Product"),
+            ColumnRequirement("y", True, "numeric", "Metric to aggregate (mandatory)",
+                              "Revenue, Orders, Profit"),
         ),
     ),
+
+    # ── 7. Correlation Analysis ─────────────────────────────────────────
+    # Spec: multi-select numeric, min 2 required.
+    #   Exactly 2 cols → Scatter Plot, Scatter + Trend Line.
+    #   3 or more cols → Correlation Heatmap, Pair Plot.
+    # Method: Pearson only (per spec section 3).
     AnalysisType.CORRELATION: AnalysisTypeConfig(
         analysis_type=AnalysisType.CORRELATION,
         label="Correlation Analysis",
-        tagline="Measure the relationship strength between two numeric variables",
-        default_chart_type=ChartType.SCATTER,
+        tagline="Measure how strongly two or more numeric variables move together",
+        default_chart_type=ChartType.SCATTER_TREND_LINE,
         supported_chart_types=(
             ChartType.SCATTER,
             ChartType.SCATTER_TREND_LINE,
             ChartType.CORRELATION_HEATMAP,
-            ChartType.BUBBLE_CHART,
-            ChartType.NO_CORRELATION_VIEW,
+            ChartType.PAIR_PLOT,
         ),
         supported_aggregations=(),
         column_requirements=(
-            ColumnRequirement("x", True, "numeric", "First variable", "Ad Spend, Temperature"),
-            ColumnRequirement("y", True, "numeric", "Second variable", "Revenue, Ice Cream Sales"),
-            ColumnRequirement("group_by", False, "categorical", "Color-code points by segment", "Region, Product Type"),
-            ColumnRequirement("size", False, "numeric", "Bubble size (Bubble Chart only)", "Deal Count"),
+            ColumnRequirement("columns", True, "numeric",
+                              "2+ numeric columns (2 → scatter; 3+ → heatmap or pair plot)",
+                              "Sales, Profit, Quantity"),
         ),
     ),
 }
@@ -192,7 +214,7 @@ def get_analysis_type_config(analysis_type: AnalysisType) -> AnalysisTypeConfig:
 
 
 def resolve_chart_type(analysis_type: AnalysisType, chart_type: ChartType | None) -> ChartType:
-    """Return the requested chart type if it's valid for this analysis, else the default."""
+    """Return the requested chart type if valid for this analysis, else the default."""
     config = get_analysis_type_config(analysis_type)
     if chart_type is not None and chart_type in config.supported_chart_types:
         return chart_type
