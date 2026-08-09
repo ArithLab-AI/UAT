@@ -2,15 +2,15 @@ from enum import Enum
 
 
 class AnalysisType(str, Enum):
-    """The 6 "basic" analysis types from the Analysis Types Developer Reference doc.
+    """The 7 basic analysis types defined in the Data Analysis Workflow Specification.
 
-    The doc defines 10 analysis types total; Cohort, Funnel, Comparative, and
-    Outlier/Anomaly are "advanced" and intentionally not modeled here.
+    Top N and Bottom N are separate analysis types per the spec.
     """
 
     DESCRIPTIVE = "descriptive"
-    DISTRIBUTION = "distribution"
-    TOP_N_BOTTOM_N = "top_n_bottom_n"
+    SIMPLE_DISTRIBUTION = "simple_distribution"
+    TOP_N = "top_n"
+    BOTTOM_N = "bottom_n"
     TIME_SERIES = "time_series"
-    AGGREGATION = "aggregation"
+    ADVANCED_DISTRIBUTION = "advanced_distribution"
     CORRELATION = "correlation"
