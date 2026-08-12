@@ -32,6 +32,7 @@ from app.services.data_chat_query_engine import (
     SqlValidationError,
     load_dataset_dataframe,
     run_sql,
+    to_user_message,
 )
 from app.utils.responses import error_response
 
@@ -274,14 +275,16 @@ def run_data_chat_query(
         "session_id": session.id,
         "message_id": message.id,
         "status": status,
-        "answer": final.get("answer") or "",
+        "answer": final.get("answer")
+        or (to_user_message(final.get("error")) if status == "error" else ""),
         "sql": final.get("sql") or None,
         "columns": columns,
         "rows": rows,
         "row_count": len(rows),
         "chart_spec": final.get("chart"),
         "attempts": message.attempts,
-        "error": final.get("error"),
+        # Technical error DB/logs me hi rehta hai; client ko plain-English message jaata hai.
+        "error": to_user_message(final.get("error")) if status == "error" else None,
     }
 
 
@@ -404,7 +407,7 @@ def get_session_messages(
             "rows": m.result_preview or [],
             "row_count": m.row_count,
             "status": m.status,
-            "error": m.error_message,
+            "error": to_user_message(m.error_message) if m.status == "error" else None,
             "created_at": m.created_at.isoformat() if m.created_at else None,
         }
         for m in messages
