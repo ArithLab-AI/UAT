@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Any, Optional
 
 import pandas as pd
@@ -72,6 +73,68 @@ _STACKED_CHART_TYPES = {"stacked_bar", "stacked_line", "stacked_area"}
 _TIME_SERIES_CHART_TYPES = {"smooth_line", "area", "stacked_line", "stacked_area"}
 
 
+# Agar user khud bol de "show it as a pie chart", to wahi chart type dena hai — LLM ki
+# apni pasand ya inference se override nahi hona chahiye. Yeh detection question text par
+# deterministic hai, isliye follow-up turns me bhi reliably kaam karta hai.
+_EXPLICIT_CHART_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # Order matters: zyada specific phrases (stacked bar) pehle match hone chahiye. Ambiguous
+    # words (bar, line, area) ke saath chart/graph/plot zaroori hai, warna "product line" jaise
+    # normal sawaal galti se chart type force kar denge.
+    (re.compile(r"\bstacked\s+bar\b", re.I), "stacked_bar"),
+    (re.compile(r"\bstacked\s+area\b", re.I), "stacked_area"),
+    (re.compile(r"\bstacked\s+line\b", re.I), "stacked_line"),
+    (re.compile(r"\b(pie|donut|doughnut)\b", re.I), "doughnut"),
+    (re.compile(r"\bwaterfall\b", re.I), "waterfall"),
+    (re.compile(r"\bheat\s*-?\s*map\b", re.I), "heatmap"),
+    (re.compile(r"\bbubble\b", re.I), "bubble"),
+    (re.compile(r"\bscatter\b", re.I), "scatter"),
+    (re.compile(r"\bcombo\s+(chart|graph)\b|\bbar\s*\+\s*line\b", re.I), "mixed"),
+    (re.compile(r"\b(bar|column)[\s-]*(chart|graph|plot)\b", re.I), "bar"),
+    (re.compile(r"\bline[\s-]*(chart|graph|plot)\b", re.I), "smooth_line"),
+    (re.compile(r"\barea[\s-]*(chart|graph|plot)\b", re.I), "area"),
+    (re.compile(r"\bkpi\b|\bheadline\s+number\b|\bsingle\s+number\b", re.I), "kpi"),
+    (
+        re.compile(r"\b(as|in|to)\s+(a\s+)?table\b|\btable\s+(view|format)\b", re.I),
+        "table",
+    ),
+)
+
+
+def detect_explicit_chart_type(question: str) -> Optional[str]:
+    """Return the chart type the user asked for by name, or None if they didn't ask."""
+    text = question or ""
+    if not text.strip():
+        return None
+    for pattern, chart_type in _EXPLICIT_CHART_PATTERNS:
+        if pattern.search(text):
+            return chart_type
+    return None
+
+
+def _build_forced_doughnut_chart(
+    rows: list[dict[str, Any]],
+    mapping: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Doughnut without the 2-8 slice cap, used only when the user names pie explicitly."""
+    category_column = mapping.get("category")
+    value_column = (mapping.get("value") or [None])[0]
+    if not category_column or not value_column:
+        return None
+
+    bucket: dict[str, float] = {}
+    for row in rows:
+        numeric_value = _coerce_number(row.get(value_column))
+        if numeric_value is None:
+            continue
+        label = _label(row.get(category_column))
+        bucket[label] = bucket.get(label, 0.0) + numeric_value
+
+    items = [{"name": label, "value": value} for label, value in bucket.items()]
+    if len(items) < 2:
+        return None
+    return {"items": items}
+
+
 def normalize_chart_spec(
     question: str,
     columns: list[str],
@@ -84,15 +147,17 @@ def normalize_chart_spec(
     chart_request = raw_chart if isinstance(raw_chart, dict) else {}
 
     requested_type = _normalise_chart_type(chart_request.get("type"))
+    explicit_type = detect_explicit_chart_type(question)
     inferred_type = _infer_chart_type(question, safe_columns, safe_rows, requested_type)
     candidates: list[str] = []
     for candidate in (
+        explicit_type,  # user ne khud chart type maanga hai to wahi pehle try hota hai
         inferred_type if requested_type == "table" else requested_type,
         requested_type,
         inferred_type,
         "table",
     ):
-        if candidate not in candidates:
+        if candidate and candidate not in candidates:
             candidates.append(candidate)
 
     for chart_type in candidates:
@@ -113,6 +178,9 @@ def normalize_chart_spec(
             build_rows = _sort_rows_chronologically(safe_rows, category_column)
 
         built = builder(safe_columns, build_rows, spec["mapping"], spec["options"])
+        if built is None and chart_type == explicit_type == "doughnut":
+            # Explicit pie request: slice-count cap ko relax karte hain (e.g. 12 mahine).
+            built = _build_forced_doughnut_chart(build_rows, spec["mapping"])
         if built is None:
             continue
 
