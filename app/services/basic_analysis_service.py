@@ -111,7 +111,18 @@ def _datetime_series(df: pd.DataFrame, column: str) -> pd.Series:
 
 
 def _is_numeric_column(df: pd.DataFrame, column: str) -> bool:
-    return pd.api.types.is_numeric_dtype(df[column])
+    series = df[column]
+    if pd.api.types.is_numeric_dtype(series):
+        return True
+    # CSV-sourced columns are always loaded as object/string dtype (see
+    # load_dataset_dataframe), so dtype alone can never detect a numeric column here.
+    # Coerce and check how much of the column actually parses as numeric instead.
+    non_null = series.dropna()
+    non_null = non_null[non_null.astype(str).str.strip() != ""]
+    if non_null.empty:
+        return False
+    coerced = pd.to_numeric(non_null, errors="coerce")
+    return (coerced.notna().mean() >= 0.6)
 
 
 def _is_categorical_column(df: pd.DataFrame, column: str) -> bool:
@@ -192,9 +203,11 @@ def _correlation_strength(r: float | None) -> str:
 def _compute_descriptive(
     df: pd.DataFrame, req: BasicAnalysisRequest, chart_type: ChartType
 ) -> tuple[ChartPayload, dict[str, Any], list[str]]:
-    numeric_df = df.select_dtypes(include=[np.number])
-    if numeric_df.shape[1] == 0:
+    numeric_cols = [c for c in df.columns if _is_numeric_column(df, c)]
+    if not numeric_cols:
         raise error_response(status_code=400, detail="No numeric columns found in the dataset.")
+
+    numeric_df = pd.DataFrame({col: _numeric_series(df, col) for col in numeric_cols})
 
     described = numeric_df.describe().T.reset_index().rename(columns={"index": "column"})
 
