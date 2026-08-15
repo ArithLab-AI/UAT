@@ -3,6 +3,7 @@ import os
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Iterable
 
@@ -332,6 +333,15 @@ def _resolve_dataset_source(db: Session, current_user: User, dataset_type: str, 
     )
 
 
+def _sort_timestamp(value: datetime | None) -> float:
+    """None-safe, tz-safe timestamp for comparing "most recently cleaned" candidates."""
+    if value is None:
+        return float("-inf")
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.timestamp()
+
+
 def _resolve_clean_dataset_source(
     db: Session,
     current_user: User,
@@ -339,7 +349,15 @@ def _resolve_clean_dataset_source(
     dataset_id: int,
 ) -> DatasetSource:
     raw_source = _resolve_dataset_source(db, current_user, dataset_type, dataset_id)
-    cleaned_record = (
+
+    # A dataset can be cleaned via two independent pipelines: the AI cleaning workflow
+    # (AICleaningJobDetail, joined to a CleaningJob with ai_cleaning_type=True) or the
+    # manual/rule-based /clean endpoint (CleaningJob only, ai_cleaning_type=False, result
+    # on CleaningJob.s3_cleaned_url). Only checking the AI table here meant manually
+    # cleaned datasets always 404'd with a misleading "Run /ai-cleaning first" — so check
+    # both and use whichever completed most recently, same reconciliation csv_dataset_route.py
+    # already does for the dataset list's is_clean flag.
+    ai_record = (
         db.query(AICleaningJobDetail, CleaningJob)
         .join(CleaningJob, CleaningJob.id == AICleaningJobDetail.job_id)
         .filter(
@@ -349,16 +367,55 @@ def _resolve_clean_dataset_source(
             AICleaningJobDetail.cleaned_storage_key.isnot(None),
             CleaningJob.ai_cleaning_type.is_(True),
         )
-        .order_by(AICleaningJobDetail.updated_at.desc())
+        .order_by(AICleaningJobDetail.updated_at.desc(), AICleaningJobDetail.created_at.desc())
         .first()
     )
-    if cleaned_record is None:
+    ai_timestamp = float("-inf")
+    if ai_record is not None:
+        detail, job = ai_record
+        ai_timestamp = _sort_timestamp(detail.updated_at or detail.created_at or job.completed_at or job.created_at)
+
+    # CleaningJob has no dataset_type/user column, so disambiguate the same way
+    # csv_dataset_route.py does: match on source_dataset_id + the original file name of the
+    # dataset the caller already proved they own via raw_source above.
+    manual_job = (
+        db.query(CleaningJob)
+        .filter(
+            CleaningJob.ai_cleaning_type.is_not(True),
+            CleaningJob.status == "completed",
+            CleaningJob.source_dataset_id == dataset_id,
+            CleaningJob.original_filename == raw_source.file_name,
+            CleaningJob.s3_cleaned_url.isnot(None),
+            CleaningJob.output_filename.isnot(None),
+        )
+        .order_by(CleaningJob.completed_at.desc(), CleaningJob.created_at.desc())
+        .first()
+    )
+    manual_timestamp = (
+        _sort_timestamp(manual_job.completed_at or manual_job.created_at) if manual_job is not None else float("-inf")
+    )
+
+    if ai_record is None and manual_job is None:
         raise error_response(
             status_code=404,
-            detail="AI cleaned data not found for the provided dataset. Run /ai-cleaning first.",
+            detail="Cleaned data not found for the provided dataset. Clean it first (manual or AI cleaning).",
         )
 
-    detail, job = cleaned_record
+    if manual_timestamp > ai_timestamp:
+        cleaned_file_name = manual_job.output_filename or f"cleaned_{raw_source.file_name}"
+        return DatasetSource(
+            dataset_id=raw_source.dataset_id,
+            dataset_type=raw_source.dataset_type,
+            is_clean=True,
+            dataset_name=raw_source.dataset_name,
+            file_name=cleaned_file_name,
+            raw_file_name=raw_source.file_name,
+            table_name=f"{raw_source.table_name}_clean",
+            storage_key=f"cleaned/{manual_job.id}/{manual_job.output_filename}",
+            ai_cleaning_job_id=None,
+        )
+
+    detail, job = ai_record
     cleaned_file_name = job.output_filename or detail.source_file_name or f"{detail.job_id}_cleaned.csv"
     return DatasetSource(
         dataset_id=raw_source.dataset_id,
