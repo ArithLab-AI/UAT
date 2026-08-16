@@ -492,6 +492,16 @@ def _compute_correlation(
     if non_numeric:
         raise error_response(status_code=400, detail=f"Column(s) must be numeric: {non_numeric}")
 
+    # Coerce once: df columns are always loaded as object/string dtype (see
+    # load_dataset_dataframe), so np.polyfit/.corr() need real numeric dtypes here, not raw
+    # strings — operating on df directly raised an unhandled TypeError from np.polyfit.
+    numeric_df = pd.DataFrame({col: _numeric_series(df, col) for col in cols})
+    # A source value like "inf"/"Infinity" or an overflowing literal (e.g. "1e400") coerces
+    # to +/-inf rather than NaN, and dropna() does not remove inf. np.polyfit then fails the
+    # SVD it relies on internally (numpy.linalg.LinAlgError) — an unhandled exception that
+    # surfaced as a raw 500. Treat +/-inf as missing, same as any other unusable value.
+    numeric_df = numeric_df.replace([np.inf, -np.inf], np.nan)
+
     warnings: list[str] = []
     n_cols = len(cols)
 
@@ -503,7 +513,7 @@ def _compute_correlation(
             chart_type = ChartType.SCATTER_TREND_LINE
 
         col_x, col_y = cols[0], cols[1]
-        pair = df[[col_x, col_y]].dropna()
+        pair = numeric_df[[col_x, col_y]].dropna()
         if len(pair) < 3:
             raise error_response(
                 status_code=400,
@@ -567,7 +577,7 @@ def _compute_correlation(
         warnings.append(f"Truncated to first {MAX_HEATMAP_COLS} columns for the heatmap.")
         cols = cols[:MAX_HEATMAP_COLS]
 
-    corr = df[cols].corr(method="pearson").round(4)
+    corr = numeric_df[cols].corr(method="pearson").round(4)
 
     matrix: list[list[dict[str, Any]]] = []
     for i, row_col in enumerate(cols):
@@ -611,7 +621,7 @@ def _compute_correlation(
                 if i == j:
                     continue
                 cx, cy = cols[j], cols[i]
-                pair_df = df[[cx, cy]].dropna()
+                pair_df = numeric_df[[cx, cy]].dropna()
                 sample = pair_df.sample(min(len(pair_df), 500), random_state=42) if len(pair_df) > 500 else pair_df
                 pair_plot_data[f"{cy}__vs__{cx}"] = [
                     {"x": _round(float(row[cx])), "y": _round(float(row[cy]))}
