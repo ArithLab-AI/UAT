@@ -7,6 +7,7 @@ argon2-cffi
 python-dotenv
 pydantic[email]
 python-jose
+google-auth>=2.0.0
 xlrd
 pandas>=2.1.0
 fastapi==0.115.0

@@ -13,6 +13,9 @@ class User(Base):
     first_name = Column(String, nullable=True)
     last_name = Column(String, nullable=True)
     password = Column(String, nullable=True)
+    # The stable Google account identifier (the ID-token `sub` claim).  Email
+    # addresses can change, so they must not be used as the provider identifier.
+    google_subject = Column(String, unique=True, index=True, nullable=True)
     user_role = Column(Integer,nullable=False,
         server_default=str(DEFAULT_USER_ROLE),
     )

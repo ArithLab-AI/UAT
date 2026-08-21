@@ -13,6 +13,13 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: Optional[int] = None
     REFRESH_TOKEN_EXPIRE_DAYS: Optional[int] = None
     OTP_EXPIRE_MINUTES: Optional[int] = None
+    # OAuth 2.0 web-client ID used to validate Google ID tokens submitted by the
+    # browser. Keep this server-side configuration separate from the client UI.
+    GOOGLE_CLIENT_ID: Optional[str] = None
+    # Retained for OAuth authorization-code flows and to allow standard Google
+    # OAuth environment files. The current ID-token login endpoint does not
+    # send this value to clients or use it for token verification.
+    GOOGLE_CLIENT_SECRET: Optional[str] = None
     
     SMTP_EMAIL: Optional[str] = None
     SMTP_PASSWORD: Optional[str] = None

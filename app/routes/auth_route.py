@@ -1,5 +1,9 @@
 import secrets
 import logging
+import re
+from google.auth import exceptions as google_auth_exceptions
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token
 from app.models.ai_cleaning_models import AICleaningJobDetail
 from app.models.analysis_models import AnalysisSuggestion, DatasetAnalysis
 from app.models import auth_models
@@ -9,6 +13,7 @@ from app.models.subscription_models import UserSubscription, UserUploadStorageUs
 from app.schemas import auth_schema
 from fastapi import APIRouter, Depends, status
 from jose import jwt, JWTError
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from app.auth import auth
@@ -26,6 +31,31 @@ from app.utils.responses import error_response, success_response
 security = HTTPBearer(auto_error=False)
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 logger = logging.getLogger(__name__)
+
+
+def _token_response(user: auth_models.User, message: str) -> dict:
+    """Return the API's standard token envelope for an authenticated user."""
+    access_token = auth.create_access_token({"sub": user.email})
+    refresh_token = auth.create_refresh_token({"sub": user.email})
+    return success_response(
+        message,
+        data={
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+        },
+    )
+
+
+def _google_username(email: str, db: Session) -> str:
+    """Return a readable, unused local username for a first-time Google user."""
+    base = re.sub(r"[^a-zA-Z0-9_.-]", "", email.split("@", 1)[0]) or "google_user"
+    candidate = base
+    suffix = 1
+    while db.query(auth_models.User.id).filter(auth_models.User.username == candidate).first():
+        suffix += 1
+        candidate = f"{base}{suffix}"
+    return candidate
 
 @router.post("/register", response_model=auth_schema.UserSuccessResponse, status_code=201)
 def register(payload: auth_schema.Register, db: Session = Depends(get_db)):
@@ -130,6 +160,62 @@ def login(payload: auth_schema.Login, db: Session = Depends(get_db)):
             "token_type": "bearer",
         },
     )
+
+@router.post("/google", response_model=auth_schema.TokenSuccessResponse)
+def google_login(payload: auth_schema.GoogleLogin, db: Session = Depends(get_db)):
+    """Exchange a verified Google Identity Services credential for API tokens."""
+    if not settings.GOOGLE_CLIENT_ID:
+        logger.error("Google login requested but GOOGLE_CLIENT_ID is not configured")
+        raise error_response(status_code=503, detail="Google login is not configured")
+
+    try:
+        google_user = id_token.verify_oauth2_token(
+            payload.credential,
+            google_requests.Request(),
+            settings.GOOGLE_CLIENT_ID,
+        )
+    except ValueError:
+        logger.warning("Google login failed: invalid ID token")
+        raise error_response(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Google credential")
+    except google_auth_exceptions.TransportError:
+        logger.exception("Google login failed: Google token verification service is unavailable")
+        raise error_response(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google login is temporarily unavailable",
+        )
+
+    if not google_user.get("email_verified") or not google_user.get("email") or not google_user.get("sub"):
+        logger.warning("Google login failed: account has no verified email")
+        raise error_response(status_code=status.HTTP_401_UNAUTHORIZED, detail="Google account email is not verified")
+
+    email = str(google_user["email"]).lower()
+    subject = str(google_user["sub"])
+    user = db.query(auth_models.User).filter(auth_models.User.google_subject == subject).first()
+    if not user:
+        # A verified Google email may safely link a previously password-created account.
+        user = db.query(auth_models.User).filter(
+            func.lower(auth_models.User.email) == email
+        ).first()
+        if user:
+            user.google_subject = subject
+        else:
+            user = auth_models.User(
+                email=email,
+                username=_google_username(email, db),
+                first_name=google_user.get("given_name"),
+                last_name=google_user.get("family_name"),
+                google_subject=subject,
+                user_role=FREE_USER,
+                is_verified=True,
+            )
+            db.add(user)
+            db.flush()
+
+    user.last_login = datetime.utcnow()
+    ensure_default_free_subscription(db, user.id)
+    db.commit()
+    logger.info("Google login successful user_id=%s email=%s", user.id, user.email)
+    return _token_response(user, "Google login successful")
 
 @router.post("/refresh", response_model=auth_schema.TokenSuccessResponse)
 def refresh_token(payload: auth_schema.RefreshToken, db: Session = Depends(get_db)):
