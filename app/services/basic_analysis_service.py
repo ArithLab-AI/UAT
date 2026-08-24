@@ -1,4 +1,4 @@
-"""Computation engine for the 7 basic analysis types defined in the
+"""Computation engine for the basic analysis types defined in the
 Data Analysis Workflow Specification.
 
 Analyses:
@@ -9,6 +9,10 @@ Analyses:
   5. Time Series              - resample X (date) by granularity, aggregate Y
   6. Advanced Distribution    - group by X, aggregate Y (Y mandatory)
   7. Correlation              - Pearson only; 2 cols -> scatter; 3+ -> heatmap/pair plot
+  8. Predictive Regression    - train a regression model, report fit metrics + feature
+                                 importance (see predictive_regression_service.py)
+  9. Geospatial & Location    - aggregate a metric per location / lat-long point
+                                 (see geospatial_analysis_service.py)
 
 Reuses the existing dataset-resolution/download plumbing from ``analysis_service``
 and ``data_chat_query_engine`` (dataset -> pandas DataFrame) rather than duplicating
@@ -17,7 +21,6 @@ it. Every computation here is read-only.
 
 from __future__ import annotations
 
-import math
 from typing import Any, Callable
 
 import numpy as np
@@ -31,24 +34,26 @@ from app.enum.chart_type_enum import ChartType
 from app.models.auth_models import User
 from app.schemas.basic_analysis_schema import BasicAnalysisRequest, ChartPayload
 from app.services.analysis_service import _resolve_analysis_source
+from app.services.basic_analysis_helpers import (
+    PANDAS_AGG as _PANDAS_AGG,
+    apply_groupby_aggregation as _apply_groupby_aggregation,
+    clean_label as _clean_label,
+    datetime_series as _datetime_series,
+    is_categorical_column as _is_categorical_column,
+    is_numeric_column as _is_numeric_column,
+    numeric_series as _numeric_series,
+    require_column as _require_column,
+    round_value as _round,
+)
 from app.services.data_chat_query_engine import load_dataset_dataframe
+from app.services.geospatial_analysis_service import _compute_geospatial
+from app.services.predictive_regression_service import _compute_predictive_regression
 from app.utils.responses import error_response
 
 
 MAX_POINTS = 2000       # cap for scatter plots
 MAX_GROUPS = 100        # cap for group counts on charts
 MAX_HEATMAP_COLS = 20   # cap for correlation heatmap columns
-
-# Pandas aggregation names for each spec aggregation.
-# COUNT is handled specially (groupby size or column count).
-# PERCENTAGE is handled specially (share of total based on sum or count).
-_PANDAS_AGG: dict[AggregationType, str] = {
-    AggregationType.SUM: "sum",
-    AggregationType.AVERAGE: "mean",
-    AggregationType.MEDIAN: "median",
-    AggregationType.MINIMUM: "min",
-    AggregationType.MAXIMUM: "max",
-}
 
 _PANDAS_FREQ: dict[TimeGranularity, str] = {
     TimeGranularity.DAILY: "D",
@@ -62,72 +67,10 @@ _PANDAS_FREQ: dict[TimeGranularity, str] = {
 # ---------------------------------------------------------------------------
 # Small shared helpers
 # ---------------------------------------------------------------------------
-
-
-def _round(value: Any, ndigits: int = 4) -> float | None:
-    if value is None:
-        return None
-    try:
-        as_float = float(value)
-    except (TypeError, ValueError):
-        return None
-    if math.isnan(as_float) or math.isinf(as_float):
-        return None
-    return round(as_float, ndigits)
-
-
-def _clean_label(value: Any) -> Any:
-    if value is None:
-        return None
-    if isinstance(value, float) and math.isnan(value):
-        return None
-    if isinstance(value, np.integer):
-        return int(value)
-    if isinstance(value, np.floating):
-        as_float = float(value)
-        return None if math.isnan(as_float) else as_float
-    if isinstance(value, (pd.Timestamp, pd.Period)):
-        return str(value)
-    return value
-
-
-def _require_column(df: pd.DataFrame, column: str | None, role_label: str) -> str:
-    if not column:
-        raise error_response(
-            status_code=400,
-            detail=f"'{role_label}' column is required for this analysis type.",
-        )
-    if column not in df.columns:
-        raise error_response(status_code=400, detail=f"Column '{column}' was not found in the dataset.")
-    return column
-
-
-def _numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
-    return pd.to_numeric(df[column], errors="coerce")
-
-
-def _datetime_series(df: pd.DataFrame, column: str) -> pd.Series:
-    return pd.to_datetime(df[column], errors="coerce")
-
-
-def _is_numeric_column(df: pd.DataFrame, column: str) -> bool:
-    series = df[column]
-    if pd.api.types.is_numeric_dtype(series):
-        return True
-    # CSV-sourced columns are always loaded as object/string dtype (see
-    # load_dataset_dataframe), so dtype alone can never detect a numeric column here.
-    # Coerce and check how much of the column actually parses as numeric instead.
-    non_null = series.dropna()
-    non_null = non_null[non_null.astype(str).str.strip() != ""]
-    if non_null.empty:
-        return False
-    coerced = pd.to_numeric(non_null, errors="coerce")
-    return (coerced.notna().mean() >= 0.6)
-
-
-def _is_categorical_column(df: pd.DataFrame, column: str) -> bool:
-    dtype = df[column].dtype
-    return dtype == object or str(dtype) in ("string", "str", "category", "bool")
+# _round / _clean_label / _require_column / _numeric_series / _datetime_series /
+# _is_numeric_column / _is_categorical_column / _apply_groupby_aggregation / _PANDAS_AGG
+# now live in basic_analysis_helpers.py (imported above) so predictive_regression_service
+# and geospatial_analysis_service can reuse them without importing this module.
 
 
 def _auto_granularity_freq(dates: pd.Series) -> tuple[str, TimeGranularity]:
@@ -142,41 +85,6 @@ def _auto_granularity_freq(dates: pd.Series) -> tuple[str, TimeGranularity]:
     if span_days <= 365 * 10:
         return "QE", TimeGranularity.QUARTERLY
     return "YE", TimeGranularity.YEARLY
-
-
-def _apply_groupby_aggregation(
-    df: pd.DataFrame,
-    group_col: str,
-    value_col: str | None,
-    agg: AggregationType,
-) -> pd.Series:
-    """
-    Apply a spec aggregation on df grouped by group_col.
-
-    - value_col=None  -> COUNT of rows per group (used when Y is optional/absent).
-    - agg=COUNT       -> count of rows (or non-null values if value_col given).
-    - agg=PERCENTAGE  -> share of total, based on SUM if value_col given else COUNT.
-    - other aggs      -> standard pandas agg on value_col (numeric).
-    """
-    if agg == AggregationType.PERCENTAGE:
-        if value_col is None:
-            counts = df.groupby(group_col, dropna=False).size()
-            total = counts.sum()
-            return (counts / total * 100) if total > 0 else counts
-        working = df.groupby(group_col, dropna=False)[value_col].sum()
-        total = float(working.sum())
-        return (working / total * 100) if total != 0 else working
-
-    if agg == AggregationType.COUNT or value_col is None:
-        if value_col is None:
-            return df.groupby(group_col, dropna=False).size()
-        return df.groupby(group_col, dropna=False)[value_col].count()
-
-    pandas_agg = _PANDAS_AGG[agg]
-    numeric = _numeric_series(df, value_col)
-    working = df[[group_col]].copy()
-    working["__value__"] = numeric
-    return working.groupby(group_col, dropna=False)["__value__"].agg(pandas_agg)
 
 
 def _correlation_strength(r: float | None) -> str:
@@ -320,7 +228,6 @@ def _compute_top_bottom_n(
         chart_type=chart_type,
         labels=labels,
         series=[{"name": y_label, "data": values}],
-        table=ranking,
     )
     summary = {
         "x_column": x_col,
@@ -329,6 +236,7 @@ def _compute_top_bottom_n(
         "direction": direction,
         "n": n,
         "total_categories": int(len(grouped)),
+        "ranking": ranking,
     }
     return chart, summary, []
 
@@ -654,6 +562,8 @@ _ANALYSIS_HANDLERS: dict[
     AnalysisType.TIME_SERIES: _compute_time_series,
     AnalysisType.ADVANCED_DISTRIBUTION: _compute_advanced_distribution,
     AnalysisType.CORRELATION: _compute_correlation,
+    AnalysisType.PREDICTIVE_REGRESSION: _compute_predictive_regression,
+    AnalysisType.GEOSPATIAL: _compute_geospatial,
 }
 
 

@@ -2,9 +2,11 @@
 default chart, required column roles, and supported aggregations.
 
 Direct code representation of the Data Analysis Workflow Specification
-(section 2 — Basic Analysis Module) for the 7 basic analysis types. Drives
-both request validation and the ``GET /basic-analysis/types`` metadata
-endpoint that a frontend uses to build the pickers.
+(section 2 — Basic Analysis Module) for the analysis types exposed under
+``/basic-analysis``, including the heavier Predictive Regression and
+Geospatial & Location analyses. Drives both request validation and the
+``GET /basic-analysis/types`` metadata endpoint that a frontend uses to
+build the pickers.
 """
 
 from dataclasses import dataclass
@@ -48,6 +50,17 @@ _SPEC_AGGREGATIONS: tuple[AggregationType, ...] = (
     AggregationType.PERCENTAGE,
 )
 
+# Geospatial & Location Analysis aggregation set (spec Step 5) — same as
+# _SPEC_AGGREGATIONS minus PERCENTAGE, which isn't offered for this analysis.
+_GEO_AGGREGATIONS: tuple[AggregationType, ...] = (
+    AggregationType.SUM,
+    AggregationType.AVERAGE,
+    AggregationType.COUNT,
+    AggregationType.MEDIAN,
+    AggregationType.MINIMUM,
+    AggregationType.MAXIMUM,
+)
+
 
 ANALYSIS_TYPE_CONFIGS: dict[AnalysisType, AnalysisTypeConfig] = {
     # ── 1. Descriptive Analysis ──────────────────────────────────────────
@@ -88,6 +101,7 @@ ANALYSIS_TYPE_CONFIGS: dict[AnalysisType, AnalysisTypeConfig] = {
     # ── 3. Top N Analysis ────────────────────────────────────────────────
     # Spec: X = categorical (required). Y = numeric (optional).
     # If Y not selected → default to Count of X. Sorted descending, N max = 10.
+    # Charts: Bar, Column, Line, Line Area only — no table view.
     AnalysisType.TOP_N: AnalysisTypeConfig(
         analysis_type=AnalysisType.TOP_N,
         label="Top N Analysis",
@@ -95,10 +109,8 @@ ANALYSIS_TYPE_CONFIGS: dict[AnalysisType, AnalysisTypeConfig] = {
         default_chart_type=ChartType.BAR,
         supported_chart_types=(
             ChartType.BAR,
-            ChartType.HORIZONTAL_BAR,
+            ChartType.COLUMN,
             ChartType.LINE,
-            ChartType.PIE,
-            ChartType.DOUGHNUT,
             ChartType.LINE_AREA,
         ),
         supported_aggregations=_SPEC_AGGREGATIONS,
@@ -112,6 +124,7 @@ ANALYSIS_TYPE_CONFIGS: dict[AnalysisType, AnalysisTypeConfig] = {
 
     # ── 4. Bottom N Analysis ────────────────────────────────────────────
     # Spec: same as Top N but sorted ascending. N max = 10.
+    # Charts: Bar, Column, Line, Line Area only — no table view.
     AnalysisType.BOTTOM_N: AnalysisTypeConfig(
         analysis_type=AnalysisType.BOTTOM_N,
         label="Bottom N Analysis",
@@ -119,10 +132,8 @@ ANALYSIS_TYPE_CONFIGS: dict[AnalysisType, AnalysisTypeConfig] = {
         default_chart_type=ChartType.BAR,
         supported_chart_types=(
             ChartType.BAR,
-            ChartType.HORIZONTAL_BAR,
+            ChartType.COLUMN,
             ChartType.LINE,
-            ChartType.PIE,
-            ChartType.DOUGHNUT,
             ChartType.LINE_AREA,
         ),
         supported_aggregations=_SPEC_AGGREGATIONS,
@@ -204,6 +215,54 @@ ANALYSIS_TYPE_CONFIGS: dict[AnalysisType, AnalysisTypeConfig] = {
             ColumnRequirement("columns", True, "numeric",
                               "2+ numeric columns (2 → scatter; 3+ → heatmap or pair plot)",
                               "Sales, Profit, Quantity"),
+        ),
+    ),
+
+    # ── 8. Predictive Regression Analysis ────────────────────────────────
+    # Target = numeric (required). Predictors = numeric & categorical, multi-select
+    # (required). Model + train/test split are request-level choices, not columns.
+    AnalysisType.PREDICTIVE_REGRESSION: AnalysisTypeConfig(
+        analysis_type=AnalysisType.PREDICTIVE_REGRESSION,
+        label="Predictive Regression Analysis",
+        tagline="Forecast a continuous value and see which features drive it",
+        default_chart_type=ChartType.ACTUAL_VS_PREDICTED_SCATTER,
+        supported_chart_types=(
+            ChartType.ACTUAL_VS_PREDICTED_SCATTER,
+            ChartType.FEATURE_IMPORTANCE_BAR,
+        ),
+        supported_aggregations=(),
+        column_requirements=(
+            ColumnRequirement("target", True, "numeric", "Target column to predict (Y-axis)",
+                              "Revenue, Sales, Profit"),
+            ColumnRequirement("predictors", True, "any",
+                              "Predictor / feature columns, numeric & categorical (X-axis)",
+                              "Region, Discount, Quantity, Category"),
+        ),
+    ),
+
+    # ── 9. Geospatial & Location Analysis ────────────────────────────────
+    # Location = geographic column(s): City/State/Country/Zip, or a Latitude +
+    # Longitude pair. Metric = numeric (optional — defaults to Count of records).
+    AnalysisType.GEOSPATIAL: AnalysisTypeConfig(
+        analysis_type=AnalysisType.GEOSPATIAL,
+        label="Geospatial & Location Analysis",
+        tagline="Map and analyze a metric across geographic locations",
+        default_chart_type=ChartType.CHOROPLETH_MAP,
+        supported_chart_types=(
+            ChartType.CHOROPLETH_MAP,
+            ChartType.PIN_MAP,
+            ChartType.HEATMAP_MAP,
+            ChartType.BUBBLE_MAP,
+        ),
+        supported_aggregations=_GEO_AGGREGATIONS,
+        column_requirements=(
+            ColumnRequirement("location", True, "geographic",
+                              "Location column (City, State, Country, Zip Code, or Latitude — "
+                              "pair with a Longitude column via location_column_2)",
+                              "City, State, Zip Code, Latitude"),
+            ColumnRequirement("metric", False, "numeric",
+                              "Metric to aggregate (optional — defaults to Count of records)",
+                              "Sales, Revenue, Orders, Active Users"),
         ),
     ),
 }
