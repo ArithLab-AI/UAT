@@ -46,6 +46,86 @@ class SqlValidationError(ValueError):
     """Raised when the generated SQL is not a safe, single read-only query."""
 
 
+GENERIC_USER_ERROR = (
+    "I couldn't answer that question from this dataset. "
+    "Try rephrasing it, or naming the exact column you're interested in."
+)
+
+# Technical failures ko client-facing plain English me convert karte hain. Raw exception
+# text (CatalogException, BinderException, generated SQL) sirf logs + DB me rehta hai.
+_USER_ERROR_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"referenced column|column .*not found|does not have a column", re.I),
+        "I couldn't find that column in this dataset. "
+        "Please check the column name and try again.",
+    ),
+    (
+        re.compile(r"scalar function|table function|aggregate function|function with name", re.I),
+        "I couldn't work out how to calculate that from this dataset. "
+        "Try asking it a simpler way.",
+    ),
+    (
+        re.compile(
+            r"conversion error|could not convert|cast|invalid input syntax|"
+            r"date/time field|invalid date|unable to parse",
+            re.I,
+        ),
+        "Some values in that column aren't stored in the format this question needs "
+        "(for example dates or numbers saved as text). Try cleaning the column first, "
+        "then ask again.",
+    ),
+    (
+        re.compile(r"division by zero", re.I),
+        "That calculation divides by zero for some rows, so I couldn't produce a result.",
+    ),
+    (
+        re.compile(r"out of memory|memory limit|exceeds.*limit", re.I),
+        "That question needs more data than I can process at once. "
+        "Try narrowing it down with a filter or a smaller date range.",
+    ),
+    (
+        re.compile(r"syntax error|parser error|binder error", re.I),
+        "I couldn't turn that question into a valid query. "
+        "Try rephrasing it in simpler terms.",
+    ),
+    (
+        re.compile(r"read-only|not allowed|multiple sql statements|empty sql", re.I),
+        "I can only read and summarise your data, not change it. "
+        "Please ask a question about what's in the dataset.",
+    ),
+)
+
+
+def to_user_message(error: BaseException | str | None) -> str:
+    """Map a technical error (exception or its stringified form) to a client-safe message."""
+    if error is None:
+        return GENERIC_USER_ERROR
+
+    if isinstance(error, QueryTimeoutError):
+        return str(error)  # already written for end users
+    if isinstance(error, SqlValidationError):
+        return (
+            "I can only read and summarise your data, not change it. "
+            "Please ask a question about what's in the dataset."
+        )
+
+    text = str(error)
+    if not text.strip():
+        return GENERIC_USER_ERROR
+
+    if "QueryTimeoutError" in text:
+        return (
+            f"That question took longer than {settings.UAT_DATA_CHAT_TIMEOUT_SECONDS}s "
+            "and was cancelled. Please narrow it down (e.g. add filters or a smaller range)."
+        )
+
+    for pattern, message in _USER_ERROR_RULES:
+        if pattern.search(text):
+            return message
+
+    return GENERIC_USER_ERROR
+
+
 def load_dataset_dataframe(source: DatasetSource) -> pd.DataFrame:
     """Download the dataset CSV from object storage and return the full DataFrame."""
     chunksize = _analysis_chunksize()

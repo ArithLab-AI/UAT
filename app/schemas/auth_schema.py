@@ -28,6 +28,11 @@ class Login(BaseModel):
     email: EmailStr
     password: str
 
+class GoogleLogin(BaseModel):
+    # Credential returned by Google Identity Services after the user selects an
+    # account. It is a signed Google ID token, not an access token.
+    credential: str = Field(min_length=1)
+
 
 class RequestOTP(BaseModel):
     email: EmailStr
