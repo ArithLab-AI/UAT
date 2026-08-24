@@ -8,6 +8,7 @@ from app.enum.aggregation_type_enum import (
 )
 from app.enum.analysis_type_enum import AnalysisType
 from app.enum.chart_type_enum import ChartType
+from app.enum.regression_enum import RegressionModelType, TrainTestSplitType
 from app.schemas.common_schema import SuccessResponse
 
 
@@ -49,7 +50,8 @@ class BasicAnalysisRequest(BaseModel):
         description="For Correlation: 2+ numeric columns.",
     )
 
-    # ── Aggregation (Simple Distribution, Top/Bottom N, Time Series, Advanced Distribution) ──
+    # ── Aggregation (Simple Distribution, Top/Bottom N, Time Series, Advanced
+    #    Distribution, Geospatial) ──
     aggregation: Optional[AggregationType] = None
 
     # ── Top N / Bottom N (spec: max 10) ──
@@ -57,6 +59,44 @@ class BasicAnalysisRequest(BaseModel):
 
     # ── Time Series ──
     granularity: TimeGranularity = TimeGranularity.MONTHLY
+
+    # ── Predictive Regression ──
+    target_column: Optional[str] = Field(
+        default=None,
+        description="Target/Y column to predict (numeric). Required for Predictive Regression.",
+    )
+    predictor_columns: Optional[list[str]] = Field(
+        default=None,
+        description="Predictor/feature columns (numeric & categorical). Required for "
+        "Predictive Regression.",
+    )
+    regression_model: RegressionModelType = Field(
+        default=RegressionModelType.AUTO_ML,
+        description="Regression model to train for Predictive Regression.",
+    )
+    train_test_split: TrainTestSplitType = Field(
+        default=TrainTestSplitType.SPLIT_80_20,
+        description="Train/test split strategy for Predictive Regression.",
+    )
+
+    # ── Geospatial & Location ──
+    location_column: Optional[str] = Field(
+        default=None,
+        description="Location column: City/State/Country/Zip Code, or a Latitude column "
+        "when paired with location_column_2. Required for Geospatial analysis.",
+    )
+    location_column_2: Optional[str] = Field(
+        default=None,
+        description="Longitude column — only set this alongside location_column when the "
+        "dataset stores latitude/longitude as two separate numeric columns.",
+    )
+    metric_column: Optional[str] = Field(
+        default=None,
+        description="Metric column to aggregate for Geospatial analysis (numeric, optional "
+        "— defaults to Count of records).",
+    )
+    # Map visualization type reuses chart_type above (CHOROPLETH_MAP / PIN_MAP /
+    # HEATMAP_MAP / BUBBLE_MAP) rather than a separate field.
 
 
 class ColumnRequirementResponse(BaseModel):

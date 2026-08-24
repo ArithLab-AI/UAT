@@ -21,7 +21,7 @@ router = APIRouter(prefix="/basic-analysis", tags=["Basic Analysis"])
     response_model_exclude_none=True,
 )
 def get_analysis_types():
-    """List the 7 supported basic analysis types with their default/supported chart
+    """List the supported basic analysis types with their default/supported chart
     types, supported aggregations, and required column roles — everything a UI
     needs to render the analysis-type and chart-type pickers."""
     data = list_analysis_type_metadata()
@@ -38,7 +38,7 @@ def run_analysis(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Run one of the 7 basic analysis types against a dataset and return a
+    """Run one of the supported basic analysis types against a dataset and return a
     chart-ready payload for the selected (or default) chart type."""
     data = run_basic_analysis(db, current_user=current_user, request=payload)
     return success_response("Analysis completed successfully", data=data)
