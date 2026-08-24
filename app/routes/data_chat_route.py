@@ -39,7 +39,16 @@ def query_dataset(
         is_clean=payload.is_clean,
         session_id=payload.session_id,
     )
-    return success_response("Query processed", data=data)
+    # Shape wahi rehta hai; sirf message ab result ko reflect karta hai taaki UI toast me
+    # technical text ke bajaye plain-English wajah dikhe.
+    status = data.get("status")
+    if status == "success":
+        message = "Query processed"
+    elif status == "clarify":
+        message = str(data.get("answer") or "Please clarify your question")
+    else:
+        message = str(data.get("error") or data.get("answer") or "Query could not be processed")
+    return success_response(message, data=data)
 
 
 @router.get("/{dataset_type}/{dataset_id}/suggested-questions")

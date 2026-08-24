@@ -165,13 +165,25 @@ def summarize_result(
     question: str,
     columns: list[str],
     rows: list[dict[str, Any]],
+    total_rows: int | None = None,
 ) -> tuple[dict[str, Any], int]:
-    """Returns ({answer, chart}, tokens_used)."""
+    """Returns ({answer, chart}, tokens_used).
+
+    ``total_rows`` is the real number of rows the query matched; ``rows`` may be capped.
+    The model must see the real total, otherwise it reports the capped count as the answer.
+    """
     sample = rows[:SUMMARY_SAMPLE_ROWS]
+    matched_rows = len(rows) if total_rows is None else int(total_rows)
+    truncation_note = (
+        f"\nOnly the first {len(rows)} of {matched_rows} matching rows were kept; "
+        f"{matched_rows} is the true total, use it in the answer."
+        if matched_rows > len(rows)
+        else ""
+    )
     user = (
         f"Question: {question}\n"
         f"Result columns: {columns}\n"
-        f"Result rows ({len(rows)} total, showing {len(sample)}):\n"
+        f"Result rows ({matched_rows} total, showing {len(sample)}):{truncation_note}\n"
         f"{json.dumps(sample, ensure_ascii=False, default=str)}"
     )
     content, tokens = _invoke(_SUMMARY_SYSTEM_PROMPT, user, label="data-chat-summary")

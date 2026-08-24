@@ -41,6 +41,27 @@ def http_exception_response(exc: HTTPException) -> JSONResponse:
     )
 
 
+def unexpected_error_response(
+    *,
+    status_code: int = 500,
+    message: str = "Something went wrong while processing your request. Please try again.",
+) -> JSONResponse:
+    """Fallback for unhandled errors.
+
+    Starlette otherwise replies with the plain text "Internal Server Error", which the UI
+    tries to parse as JSON and shows as "Unexpected token 'I' ... is not valid JSON".
+    Same body shape as the other error responses, so the frontend needs no change.
+    """
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status_code": status_code,
+            "fields": [],
+            "message": message,
+        },
+    )
+
+
 def validation_error_response(
     exc: RequestValidationError,
     *,

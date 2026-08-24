@@ -71,6 +71,18 @@ _AXIS_CHART_TYPES = {
 }
 _STACKED_CHART_TYPES = {"stacked_bar", "stacked_line", "stacked_area"}
 _TIME_SERIES_CHART_TYPES = {"smooth_line", "area", "stacked_line", "stacked_area"}
+# Axis charts ki tarah inko bhi ek categorical dimension chahiye, warna builder None return
+# karke table par gir jata hai.
+_CATEGORY_CHART_TYPES = {"doughnut", "heatmap"}
+_SINGLE_VALUE_CHART_TYPES = {
+    "kpi",
+    "doughnut",
+    "waterfall",
+    "stacked_bar",
+    "stacked_line",
+    "stacked_area",
+    "heatmap",
+}
 
 
 # Agar user khud bol de "show it as a pie chart", to wahi chart type dena hai — LLM ki
@@ -294,9 +306,14 @@ def _resolve_mapping(
         category = time_columns[0] if time_columns else None
     if chart_type in _AXIS_CHART_TYPES and not category:
         category = (time_columns or dimension_columns or columns[:1] or [None])[0]
+    # "Ise pie chart bana do" jaise follow-up par LLM aksar x=null bhejta hai. Us case me
+    # category khud result se nikal lete hain, warna doughnut/heatmap build hi nahi hota aur
+    # response me table chala jata hai.
+    if chart_type in _CATEGORY_CHART_TYPES and not category:
+        category = (dimension_columns or columns[:1] or [None])[0]
 
     value_columns = raw_y
-    if chart_type in {"kpi", "doughnut", "waterfall", "stacked_bar", "stacked_line", "stacked_area", "heatmap"}:
+    if chart_type in _SINGLE_VALUE_CHART_TYPES:
         value_columns = value_columns[:1]
     if chart_type == "mixed":
         value_columns = value_columns[:2]
@@ -311,6 +328,8 @@ def _resolve_mapping(
             value_columns = numeric_columns[:1] or columns[:1]
         else:
             value_columns = numeric_columns[:1] if chart_type in _STACKED_CHART_TYPES else numeric_columns[:2]
+    if chart_type in _SINGLE_VALUE_CHART_TYPES:
+        value_columns = value_columns[:1]
 
     series = raw_series if raw_series in dimension_columns else None
     if chart_type in _STACKED_CHART_TYPES and not series:
@@ -335,7 +354,7 @@ def _resolve_mapping(
             remaining = [column for column in numeric_columns if column not in {x_value, *(y_values or [])}]
             size = remaining[0] if remaining else None
 
-    if chart_type == "heatmap" and category and not x_value:
+    if chart_type in _CATEGORY_CHART_TYPES and category and not x_value:
         x_value = category
     if chart_type == "kpi" and not y_values:
         y_values = value_columns[:1]

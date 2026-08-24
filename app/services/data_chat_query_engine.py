@@ -9,10 +9,14 @@ the row data is not stored in live SQL tables.
 
 from __future__ import annotations
 
+import math
 import re
 import threading
+from datetime import date, datetime, time, timedelta
+from decimal import Decimal
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from app.config.config import settings
@@ -162,8 +166,52 @@ def validate_sql(sql: str) -> str:
     return cleaned
 
 
-def run_sql(df: pd.DataFrame, sql: str) -> tuple[list[str], list[dict[str, Any]]]:
-    """Execute validated SQL against the DataFrame using DuckDB. Returns (columns, rows)."""
+def _to_jsonable(value: Any) -> Any:
+    """Convert a DuckDB/pandas scalar into a plain JSON-safe Python value.
+
+    DuckDB results carry numpy ints/bools, Decimals and Timestamps. Those are not JSON
+    serialisable, so without this both the JSON columns on ``data_chat_messages`` and the
+    FastAPI response encoder raise — which reaches the UI as a plain-text 500 instead of a
+    readable error.
+    """
+    if value is None or value is pd.NaT:
+        return None
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        return None if math.isnan(value) or math.isinf(value) else value
+    if isinstance(value, (str, int)):
+        return value
+    if isinstance(value, Decimal):
+        number = float(value)
+        return None if math.isnan(number) or math.isinf(number) else number
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, timedelta):
+        return str(value)
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", errors="replace")
+    if isinstance(value, (list, tuple, set, np.ndarray)):
+        return [_to_jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _to_jsonable(item) for key, item in value.items()}
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return str(value)
+
+
+def run_sql(df: pd.DataFrame, sql: str) -> tuple[list[str], list[dict[str, Any]], int]:
+    """Execute validated SQL against the DataFrame using DuckDB.
+
+    Returns (columns, rows, total_row_count) where ``rows`` is capped at MAX_RESULT_ROWS but
+    ``total_row_count`` is the real number of rows the query matched. The caller needs the
+    uncapped count, otherwise a question like "how many records are there" reports 1000.
+    """
     try:
         import duckdb
     except ImportError as exc:  # pragma: no cover - dependency guard
@@ -208,11 +256,15 @@ def run_sql(df: pd.DataFrame, sql: str) -> tuple[list[str], list[dict[str, Any]]
         watchdog.cancel()
         con.close()
 
-    if len(result_df) > MAX_RESULT_ROWS:
+    total_row_count = int(len(result_df))
+    if total_row_count > MAX_RESULT_ROWS:
         result_df = result_df.head(MAX_RESULT_ROWS)
 
     # Make values JSON-serialisable.
     result_df = result_df.astype(object).where(pd.notnull(result_df), None)
     columns = [str(col) for col in result_df.columns]
-    rows = result_df.to_dict(orient="records")
-    return columns, rows
+    rows = [
+        {str(column): _to_jsonable(value) for column, value in row.items()}
+        for row in result_df.to_dict(orient="records")
+    ]
+    return columns, rows, total_row_count
