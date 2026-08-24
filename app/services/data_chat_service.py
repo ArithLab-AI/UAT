@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from app.db.database import Base, engine
 from app.models.auth_models import User
 from app.models.data_chat_models import DataChatMessage, DataChatSession, DataChatSuggestionCache
-from app.services.data_chat_chart_service import normalize_chart_spec
+from app.services.data_chat_chart_service import detect_explicit_chart_type, normalize_chart_spec
 from app.services.analysis_service import DatasetSource, _resolve_analysis_source
 from app.services.data_chat_llm_service import (
     build_schema_context,
@@ -63,12 +63,29 @@ class _ChatState(TypedDict, total=False):
     sql: str
     columns: list[str]
     rows: list[dict[str, Any]]
+    total_rows: int
     error: Optional[str]
     attempts: int
     status: str  # success | error | clarify
     answer: str
     chart: Optional[dict[str, Any]]
     tokens: int
+
+
+def _previous_sql_for_chart_change(state: _ChatState) -> str:
+    """SQL of the last successful turn, but only when this turn is just a chart-type change.
+
+    "Ise pie chart bana do" jaise follow-ups me naya SQL banane ki zaroorat nahi hai. Agar LLM
+    phir bhi clarification maange ya khaali SQL de, to pichla SQL dobara chala dete hain warna
+    user ko chart ke bajaye clarification milta hai.
+    """
+    if not detect_explicit_chart_type(state.get("question", "")):
+        return ""
+    for entry in reversed(state.get("history") or []):
+        previous_sql = str(entry.get("sql") or "").strip()
+        if previous_sql:
+            return previous_sql
+    return ""
 
 
 def _node_generate_sql(state: _ChatState) -> _ChatState:
@@ -81,22 +98,31 @@ def _node_generate_sql(state: _ChatState) -> _ChatState:
     state["tokens"] = state.get("tokens", 0) + tokens
     state["attempts"] = state.get("attempts", 0) + 1
 
+    generated_sql = str(payload.get("sql") or "").strip()
+    if payload.get("needs_clarification") or not generated_sql:
+        fallback_sql = _previous_sql_for_chart_change(state)
+        if fallback_sql:
+            state["sql"] = fallback_sql
+            state["error"] = None
+            return state
+
     if payload.get("needs_clarification"):
         state["status"] = "clarify"
         state["answer"] = str(payload.get("clarification") or "Could you clarify your question?")
         state["sql"] = ""
         return state
 
-    state["sql"] = str(payload.get("sql") or "").strip()
+    state["sql"] = generated_sql
     state["error"] = None
     return state
 
 
 def _node_execute(state: _ChatState) -> _ChatState:
     try:
-        columns, rows = run_sql(state["df"], state["sql"])
+        columns, rows, total_rows = run_sql(state["df"], state["sql"])
         state["columns"] = columns
         state["rows"] = rows
+        state["total_rows"] = total_rows
         state["error"] = None
         state["status"] = "success"
     except (SqlValidationError, Exception) as exc:  # noqa: BLE001 - feed error back to the LLM
@@ -105,10 +131,32 @@ def _node_execute(state: _ChatState) -> _ChatState:
     return state
 
 
+def _fallback_answer(state: _ChatState) -> str:
+    """Plain answer built from the result itself, for when the summariser is unavailable."""
+    rows = state.get("rows") or []
+    columns = state.get("columns") or []
+    total_rows = state.get("total_rows")
+    total_rows = len(rows) if total_rows is None else int(total_rows)
+    if not rows:
+        return "No rows matched that question."
+    if total_rows == 1 and len(columns) == 1:
+        return f"{columns[0]}: {rows[0].get(columns[0])}"
+    return f"Found {total_rows} matching row(s)."
+
+
 def _node_summarize(state: _ChatState) -> _ChatState:
-    payload, tokens = summarize_result(state["question"], state["columns"], state["rows"])
+    try:
+        payload, tokens = summarize_result(
+            state["question"],
+            state["columns"],
+            state["rows"],
+            total_rows=state.get("total_rows"),
+        )
+    except Exception:  # noqa: BLE001 - SQL already ran; show the data instead of failing
+        logger.exception("Data chat summary failed; falling back to the raw result")
+        payload, tokens = {}, 0
     state["tokens"] = state.get("tokens", 0) + tokens
-    state["answer"] = str(payload.get("answer") or "Here are the results.")
+    state["answer"] = str(payload.get("answer") or _fallback_answer(state))
     state["chart"] = normalize_chart_spec(
         state["question"],
         state.get("columns", []) or [],
@@ -240,7 +288,8 @@ def run_data_chat_query(
         final = {
             "status": "error",
             "error": f"{type(exc).__name__}: {exc}",
-            "answer": "Sorry, I could not process that question.",
+            # answer set nahi karte: neeche to_user_message() se plain-English wajah milti hai,
+            # generic "could not process" ke bajaye.
             "attempts": initial.get("attempts", 1) or 1,
             "tokens": initial.get("tokens", 0),
         }
@@ -248,6 +297,8 @@ def run_data_chat_query(
     status = final.get("status", "error")
     columns = final.get("columns", []) or []
     rows = final.get("rows", []) or []
+    total_rows = final.get("total_rows")
+    total_rows = len(rows) if total_rows is None else int(total_rows)
 
     message = DataChatMessage(
         session_id=session.id,
@@ -280,7 +331,11 @@ def run_data_chat_query(
         "sql": final.get("sql") or None,
         "columns": columns,
         "rows": rows,
+        # row_count pehle jaisa hi hai: kitni rows response me bheji gayi (MAX_RESULT_ROWS par
+        # capped). Query se match hui asli rows alag field me jaati hain, taaki frontend ka
+        # existing behaviour na badle.
         "row_count": len(rows),
+        "total_row_count": total_rows,
         "chart_spec": final.get("chart"),
         "attempts": message.attempts,
         # Technical error DB/logs me hi rehta hai; client ko plain-English message jaata hai.
@@ -401,7 +456,8 @@ def get_session_messages(
         {
             "message_id": m.id,
             "question": m.nl_query,
-            "answer": m.assistant_text,
+            "answer": m.assistant_text
+            or (to_user_message(m.error_message) if m.status == "error" else None),
             "sql": m.generated_sql,
             "chart_spec": m.chart_spec,
             "rows": m.result_preview or [],

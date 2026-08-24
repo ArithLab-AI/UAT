@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from app.routes.auth_route import router as auth_router
@@ -18,7 +20,11 @@ from app.utils.auth_schema_setup import ensure_auth_schema
 from app.utils.csv_dataset_setup import ensure_csv_dataset_schema
 from app.utils.file_upload_schema_setup import ensure_file_upload_schema
 from app.utils.object_storage import get_object_storage_service
-from app.utils.responses import http_exception_response, validation_error_response
+from app.utils.responses import (
+    http_exception_response,
+    unexpected_error_response,
+    validation_error_response,
+)
 from app.utils.subs_plan_seed import seed_subscription_plans
 from app.utils.ai_cleaning_schema_setup import ensure_ai_cleaning_schema
 from app.utils.ai_cleaning_job_reaper import reap_stale_ai_cleaning_jobs
@@ -27,6 +33,8 @@ from app.services.file_retention_service import (
     start_file_retention_scheduler,
     stop_file_retention_scheduler,
 )
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Authentication API")
 
@@ -51,6 +59,13 @@ async def request_validation_exception_handler(request: Request, exc: RequestVal
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     return http_exception_response(exc)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    # Technical detail sirf logs me; client ko hamesha JSON error body milti hai.
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return unexpected_error_response()
 
 
 @app.on_event("startup")
