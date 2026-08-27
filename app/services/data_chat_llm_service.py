@@ -19,6 +19,7 @@ from app.utils.token_usage import TokenUsageLogger, _extract_usage
 MAX_SAMPLE_VALUES = 6
 LOW_CARDINALITY_LIMIT = 25
 SUMMARY_SAMPLE_ROWS = 20
+INSIGHT_SAMPLE_ROWS = 30
 
 _SQL_SYSTEM_PROMPT = (
     "You are an expert data analyst that translates a natural-language question into a single "
@@ -31,6 +32,12 @@ _SQL_SYSTEM_PROMPT = (
     "columns exactly. Map synonyms (revenue->amount/price, customer->name, etc.) to real columns.\n"
     "- For aggregations, GROUP BY the right dimension and ORDER BY the metric. Add LIMIT for 'top N'.\n"
     "- Cast text columns to appropriate types when doing math (TRY_CAST(\"col\" AS DOUBLE)).\n"
+    "- Dates and times usually arrive as text. Convert one with TRY_CAST(\"col\" AS TIMESTAMP) "
+    "or TRY_CAST(\"col\" AS DATE). Never write TIMESTAMP \"col\" or DATE \"col\": that form "
+    "introduces a literal and is a syntax error when applied to a column.\n"
+    "- To group by day use CAST(TRY_CAST(\"col\" AS TIMESTAMP) AS DATE); for a wider bucket use "
+    "date_trunc('month', TRY_CAST(\"col\" AS TIMESTAMP)). Extract parts with "
+    "EXTRACT(YEAR FROM TRY_CAST(\"col\" AS TIMESTAMP)).\n"
     "- If the question only asks to change how the previous answer is displayed (e.g. 'show it as a "
     "pie chart', 'make this a bar graph', 'as a table'), do NOT ask for clarification: re-use the "
     "most recent SQL from the conversation exactly as it is.\n"
@@ -71,6 +78,52 @@ _SUMMARY_SYSTEM_PROMPT = (
     "- If a chart would be misleading, return table."
 )
 
+
+_INSIGHT_SYSTEM_PROMPT = (
+    "You explain a data result to someone with no background in statistics -- a shop owner, a "
+    "teacher, a manager. You are given the question, the result rows, and a block of statistics "
+    "that has ALREADY been calculated from those rows.\n"
+    "Output JSON only: {\"summary\": \"...\", \"key_findings\": [\"...\"], "
+    "\"highs_and_lows\": [\"...\"], \"correlations\": [\"...\"], "
+    "\"possible_reasons\": [\"...\"], \"caveats\": [\"...\"]}.\n"
+    "HARD RULES:\n"
+    "- Never invent, re-calculate or round a number. Every figure you mention must appear "
+    "verbatim in the supplied statistics or rows. If a number is not given, describe the pattern "
+    "in words instead.\n"
+    "- Do no arithmetic of your own, not even a subtraction that looks trivial. To describe the "
+    "gap between the highest and lowest value of a measure, quote that measure's supplied "
+    "'range'. To describe a share, quote the supplied 'share_of_total_pct'. If the number you "
+    "want was not supplied, say 'far higher' or 'roughly double' in words rather than computing "
+    "it.\n"
+    "- Separate fact from guess. Findings state what the data shows. 'possible_reasons' holds "
+    "explanations the data cannot prove, and every one of them must start with a hedge such as "
+    "'This could be because' or 'One likely reason is'.\n"
+    "- Correlation is not causation. When two columns move together, say they move together and "
+    "offer causes only under possible_reasons.\n"
+    "WRITING STYLE:\n"
+    "- Short everyday sentences. No jargon. If you must use a term like 'median' or "
+    "'correlation', explain it in the same sentence in plain words.\n"
+    "- Write numbers as digits with thousands separators (985,000), never spelled out in "
+    "words. Percentages as plain digits such as 34%. Adding separators to a supplied "
+    "number is fine; changing its value is not.\n"
+    "- Never attach a currency symbol or a unit that the data did not state. If a column is "
+    "just called revenue, write 985,000, not $985,000.\n"
+    "- Address the reader as 'you'. Never mention SQL, queries, columns as 'fields', or the model.\n"
+    "CONTENT:\n"
+    "- summary: 2 to 4 sentences answering what this result actually shows overall.\n"
+    "- key_findings: 3 to 6 concrete observations, each one sentence, each tied to a real number.\n"
+    "- highs_and_lows: name the highest and lowest performers and say how far apart they are, and "
+    "whether the gap is large compared with the rest.\n"
+    "- correlations: for each supplied pair, say in plain words what moving together means here. "
+    "Return an empty list if no pairs were supplied.\n"
+    "- possible_reasons: 2 to 4 hedged, plausible business explanations for why the high values "
+    "are high and the low ones are low.\n"
+    "- caveats: anything that should stop the reader over-trusting this -- a lopsided mix of "
+    "values, a metric that cannot be compared fairly, a category doing the work for the rest. "
+    "Do NOT write a caveat about the row count, the sample being small, or the result being cut "
+    "short; those are added separately and yours would repeat them. Empty list if none.\n"
+    "- Any list may be empty when the data genuinely does not support it. Never pad."
+)
 
 class _TokenCapture(BaseCallbackHandler):
     """Records total tokens for a single LLM call on the instance."""
@@ -187,4 +240,38 @@ def summarize_result(
         f"{json.dumps(sample, ensure_ascii=False, default=str)}"
     )
     content, tokens = _invoke(_SUMMARY_SYSTEM_PROMPT, user, label="data-chat-summary")
+    return _extract_json(content), tokens
+
+
+def generate_insight(
+    question: str,
+    columns: list[str],
+    rows: list[dict[str, Any]],
+    statistics: dict[str, Any],
+    total_rows: int | None = None,
+) -> tuple[dict[str, Any], int]:
+    """Returns ({summary, key_findings, highs_and_lows, correlations, possible_reasons, caveats}, tokens).
+
+    ``statistics`` comes from data_chat_insight_service and is already computed from the
+    real values. The model narrates it; it is told not to produce numbers of its own.
+    """
+    sample = rows[:INSIGHT_SAMPLE_ROWS]
+    matched_rows = len(rows) if total_rows is None else int(total_rows)
+    # The caller appends a truncation caveat itself, so the model is only told the
+    # scope of what it is looking at -- otherwise both add one and they read as duplicates.
+    truncation_note = (
+        f"\nOnly {len(rows)} of {matched_rows} matching rows were analysed."
+        if matched_rows > len(rows)
+        else ""
+    )
+    user = (
+        f"Question the user asked: {question}\n"
+        f"Result columns: {columns}\n"
+        f"Rows matched: {matched_rows}{truncation_note}\n\n"
+        f"Statistics already calculated from the full result (use these numbers, do not redo them):\n"
+        f"{json.dumps(statistics, ensure_ascii=False, default=str)}\n\n"
+        f"Sample of the rows (first {len(sample)}):\n"
+        f"{json.dumps(sample, ensure_ascii=False, default=str)}"
+    )
+    content, tokens = _invoke(_INSIGHT_SYSTEM_PROMPT, user, label="data-chat-insight")
     return _extract_json(content), tokens

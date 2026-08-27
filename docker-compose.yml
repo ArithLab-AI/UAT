@@ -45,20 +45,46 @@
 
 
 
-services:
-  db:
-    image: postgres:15
-    container_name: postgres_db
-    restart: always
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
+# services:
+#   db:
+#     image: postgres:15
+#     container_name: postgres_db
+#     restart: always
+#     environment:
+#       POSTGRES_USER: ${POSTGRES_USER}
+#       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+#       POSTGRES_DB: ${POSTGRES_DB}
+#     ports:
+#       - "5432:5432"
+#     volumes:
+#       - postgres_data:/var/lib/postgresql/data
 
+#   app:
+#     build:
+#       context: .
+#       dockerfile: Dockerfile
+#     container_name: analys_pro
+#     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --log-level debug --reload
+#     restart: always
+#     depends_on:
+#       - db
+#     env_file:
+#       - .env
+#     environment:
+#       DATABASE_HOST: db
+#     ports:
+#       - "8000:8000"
+#     volumes:
+#       - ./:/app
+
+# volumes:
+#   postgres_data:
+
+
+
+
+#dallo isko mat chnage krna koi bhi gaurav and harshit baas comment krna aur apna upar wala uncomment
+services:
   app:
     build:
       context: .
@@ -66,16 +92,11 @@ services:
     container_name: analys_pro
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --log-level debug --reload
     restart: always
-    depends_on:
-      - db
     env_file:
       - .env
     environment:
-      DATABASE_HOST: db
+      DATABASE_HOST: host.docker.internal
     ports:
       - "8000:8000"
     volumes:
       - ./:/app
-
-volumes:
-  postgres_data:

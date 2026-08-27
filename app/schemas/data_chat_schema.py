@@ -7,6 +7,8 @@ class DataChatQueryRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
     session_id: Optional[str] = None
     is_clean: bool = False
+    # Costs one extra LLM call per query; send false to skip the detailed insight.
+    include_insight: bool = True
 
 
 class ChartMapping(BaseModel):
@@ -49,5 +51,6 @@ class DataChatQueryResponse(BaseModel):
     rows: list[dict[str, Any]] = Field(default_factory=list)
     row_count: int = 0
     chart_spec: Optional[ChartSpec] = None
+    insight: Optional[dict[str, Any]] = None
     attempts: int = 1
     error: Optional[str] = None

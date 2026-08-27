@@ -1,7 +1,7 @@
 """Natural-language data chat orchestration.
 
 Flow (LangGraph state machine):
-    generate_sql -> execute -> (on SQL error, feed error back and retry, max N) -> summarize
+    generate_sql -> execute -> (on SQL error, feed error back and retry, max N) -> summarize -> insight
 
 Everything is scoped to a single dataset. Every query + generated SQL + result is
 persisted to ``data_chat_messages`` so the full history is queryable.
@@ -21,8 +21,13 @@ from app.models.auth_models import User
 from app.models.data_chat_models import DataChatMessage, DataChatSession, DataChatSuggestionCache
 from app.services.data_chat_chart_service import detect_explicit_chart_type, normalize_chart_spec
 from app.services.analysis_service import DatasetSource, _resolve_analysis_source
+from app.services.data_chat_insight_service import (
+    build_fallback_insight,
+    compute_result_statistics,
+)
 from app.services.data_chat_llm_service import (
     build_schema_context,
+    generate_insight,
     generate_sample_questions,
     generate_sql,
     summarize_result,
@@ -69,6 +74,8 @@ class _ChatState(TypedDict, total=False):
     status: str  # success | error | clarify
     answer: str
     chart: Optional[dict[str, Any]]
+    insight: Optional[dict[str, Any]]
+    want_insight: bool
     tokens: int
 
 
@@ -166,6 +173,132 @@ def _node_summarize(state: _ChatState) -> _ChatState:
     return state
 
 
+
+_INSIGHT_NARRATIVE_KEYS = (
+    "summary",
+    "key_findings",
+    "highs_and_lows",
+    "correlations",
+    "possible_reasons",
+    "caveats",
+)
+
+
+def _coerce_insight_narrative(payload: Any) -> dict[str, Any] | None:
+    """Keep only the expected narrative keys, with list fields forced to lists of text.
+
+    The model occasionally returns a bare string where a list belongs; wrapping it
+    keeps the response shape stable for the frontend.
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    narrative: dict[str, Any] = {}
+    for key in _INSIGHT_NARRATIVE_KEYS:
+        value = payload.get(key)
+        if key == "summary":
+            narrative[key] = str(value or "").strip()
+            continue
+        if isinstance(value, str):
+            entries = [value.strip()] if value.strip() else []
+        elif isinstance(value, list):
+            entries = [str(item).strip() for item in value if str(item).strip()]
+        else:
+            entries = []
+        narrative[key] = entries
+
+    if not narrative["summary"] and not any(narrative[key] for key in _INSIGHT_NARRATIVE_KEYS[1:]):
+        return None
+    return narrative
+
+
+
+# Small samples and truncated results are facts about the data, so they are appended
+# in code rather than left to the model, which does not reliably volunteer them.
+SMALL_RESULT_ROWS = 5
+WEAK_CORRELATION_SAMPLE = 10
+# The model keeps volunteering its own sampling caveat even when told not to, because the
+# truncation is right there in its context. Dropping those by hand is more reliable than
+# rewording the prompt again, and only applies once we have added the authoritative one.
+_SAMPLING_CAVEAT_TERMS = ("sample", "sampled", "row", "rows", "analysed", "analyzed")
+
+
+def _mandatory_caveats(statistics: dict[str, Any]) -> list[str]:
+    caveats: list[str] = []
+    rows_analysed = int(statistics.get("rows_analysed") or 0)
+    rows_matched = int(statistics.get("rows_matched") or rows_analysed)
+
+    if statistics.get("sampled"):
+        caveats.append(
+            f"Only {rows_analysed:,} of {rows_matched:,} matching rows were analysed, "
+            "so these figures describe part of the data, not all of it."
+        )
+    elif 0 < rows_analysed < SMALL_RESULT_ROWS:
+        caveats.append(
+            f"This is based on just {rows_analysed} row(s), which is too few to show a reliable pattern."
+        )
+
+    correlations = statistics.get("correlations") or []
+    smallest_sample = min(
+        (int(pair.get("sample_size") or 0) for pair in correlations),
+        default=None,
+    )
+    if smallest_sample is not None and smallest_sample < WEAK_CORRELATION_SAMPLE:
+        caveats.append(
+            f"The relationships between columns were measured on as few as {smallest_sample} "
+            "data points, so treat them as a hint rather than proof."
+        )
+    return caveats
+
+
+def _node_insight(state: _ChatState) -> _ChatState:
+    """Attach a detailed, plain-language reading of the result.
+
+    Statistics are computed from the rows first, so the numbers hold even when the
+    LLM is unavailable -- in that case a rule-based narrative is used instead of
+    dropping the field.
+    """
+    columns = state.get("columns", []) or []
+    rows = state.get("rows", []) or []
+    if not state.get("want_insight", True) or not rows:
+        state["insight"] = None
+        return state
+
+    statistics = compute_result_statistics(columns, rows, total_rows=state.get("total_rows"))
+
+    narrative: dict[str, Any] | None = None
+    try:
+        payload, tokens = generate_insight(
+            state["question"],
+            columns,
+            rows,
+            statistics,
+            total_rows=state.get("total_rows"),
+        )
+        state["tokens"] = state.get("tokens", 0) + tokens
+        narrative = _coerce_insight_narrative(payload)
+    except Exception:  # noqa: BLE001 - the answer already exists; insight must not fail the turn
+        logger.exception("Data chat insight generation failed; falling back to computed statistics")
+
+    generated_by = "llm"
+    if narrative is None:
+        narrative = build_fallback_insight(statistics)
+        generated_by = "rules"
+
+    required = _mandatory_caveats(statistics)
+    existing = [note for note in (narrative.get("caveats") or []) if note not in required]
+    if required:
+        existing = [
+            note
+            for note in existing
+            if not any(term in note.lower() for term in _SAMPLING_CAVEAT_TERMS)
+        ]
+    narrative["caveats"] = required + existing
+
+    state["insight"] = {**narrative, "statistics": statistics, "generated_by": generated_by}
+    return state
+
+
 def _route_after_sql(state: _ChatState) -> str:
     return "clarify" if state.get("status") == "clarify" else "execute"
 
@@ -186,6 +319,7 @@ def _build_graph():
     graph.add_node("generate_sql", _node_generate_sql)
     graph.add_node("execute", _node_execute)
     graph.add_node("summarize", _node_summarize)
+    graph.add_node("insight", _node_insight)
 
     graph.set_entry_point("generate_sql")
     graph.add_conditional_edges(
@@ -196,7 +330,8 @@ def _build_graph():
         _route_after_execute,
         {"summarize": "summarize", "retry": "generate_sql", "fail": END},
     )
-    graph.add_edge("summarize", END)
+    graph.add_edge("summarize", "insight")
+    graph.add_edge("insight", END)
     return graph.compile()
 
 
@@ -256,6 +391,7 @@ def run_data_chat_query(
     question: str,
     is_clean: bool,
     session_id: Optional[str],
+    include_insight: bool = True,
 ) -> dict[str, Any]:
     ensure_data_chat_tables()
 
@@ -279,6 +415,7 @@ def run_data_chat_query(
         "history": history,
         "attempts": 0,
         "tokens": 0,
+        "want_insight": include_insight,
     }
 
     try:
@@ -337,6 +474,9 @@ def run_data_chat_query(
         "row_count": len(rows),
         "total_row_count": total_rows,
         "chart_spec": final.get("chart"),
+        # Detailed plain-language reading of the result: narrative plus the statistics
+        # it was written from. None when the turn returned no rows or insight was skipped.
+        "insight": final.get("insight"),
         "attempts": message.attempts,
         # Technical error DB/logs me hi rehta hai; client ko plain-English message jaata hai.
         "error": to_user_message(final.get("error")) if status == "error" else None,
@@ -394,6 +534,9 @@ def get_suggested_questions(
             "history": [],
             "attempts": 0,
             "tokens": 0,
+            # Suggestions only need the chart type, so skip the insight LLM call that
+            # would otherwise run once per suggested question.
+            "want_insight": False,
         }
         try:
             final: _ChatState = _build_graph().invoke(initial)

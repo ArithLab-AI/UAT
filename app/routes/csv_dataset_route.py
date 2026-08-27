@@ -5,11 +5,13 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 
 from fastapi import APIRouter, Body, Depends, Query, Request
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.config.deps import get_current_user
 from app.db.database import get_db
 from app.models.ai_cleaning_models import AICleaningJobDetail
+from app.models.analysis_models import AnalysisSuggestion, DatasetAnalysis
 from app.models.auth_models import User
 from app.models.cleaning_models import CleaningJob
 from app.models.csv_dataset_models import CsvMergedDataset, CsvUploadedDataset
@@ -320,6 +322,71 @@ def _build_dataset_clean_state_map(
             )
 
     return clean_state_map
+
+
+def _build_dataset_fully_clean_map(
+    db: Session,
+    *,
+    current_user: User,
+    uploaded_datasets: list[CsvUploadedDataset],
+    merged_datasets: list[CsvMergedDataset],
+) -> dict[tuple[str, int], bool]:
+    """Map each dataset to whether its most recent analysis found zero issues.
+
+    True only when an analysis has actually run for the dataset and that latest run
+    produced no suggestion rows. A dataset that was never analysed stays False --
+    "no suggestions stored" and "never analysed" look identical in the tables, and
+    reporting an unanalysed file as fully clean would be wrong.
+    """
+    fully_clean_map: dict[tuple[str, int], bool] = {
+        ("uploaded", dataset.id): False for dataset in uploaded_datasets
+    }
+    fully_clean_map.update(
+        {("merged", dataset.id): False for dataset in merged_datasets}
+    )
+
+    dataset_ids = sorted(
+        {dataset.id for dataset in uploaded_datasets}
+        | {dataset.id for dataset in merged_datasets}
+    )
+    if not dataset_ids:
+        return fully_clean_map
+
+    analyses = (
+        db.query(
+            DatasetAnalysis.id,
+            DatasetAnalysis.source_type,
+            DatasetAnalysis.source_dataset_id,
+        )
+        .filter(
+            DatasetAnalysis.created_by_user_id == current_user.id,
+            DatasetAnalysis.source_dataset_id.in_(dataset_ids),
+        )
+        .order_by(DatasetAnalysis.updated_at.desc(), DatasetAnalysis.created_at.desc())
+        .all()
+    )
+
+    # Rows arrive newest-first, so the first hit per dataset is its latest analysis.
+    latest_analysis_ids: dict[tuple[str, int], str] = {}
+    for analysis_id, source_type, source_dataset_id in analyses:
+        dataset_key = ((source_type or "").strip(), source_dataset_id)
+        if dataset_key in fully_clean_map and dataset_key not in latest_analysis_ids:
+            latest_analysis_ids[dataset_key] = analysis_id
+
+    if not latest_analysis_ids:
+        return fully_clean_map
+
+    suggestion_counts = dict(
+        db.query(AnalysisSuggestion.analysis_id, func.count(AnalysisSuggestion.id))
+        .filter(AnalysisSuggestion.analysis_id.in_(list(latest_analysis_ids.values())))
+        .group_by(AnalysisSuggestion.analysis_id)
+        .all()
+    )
+    for dataset_key, analysis_id in latest_analysis_ids.items():
+        fully_clean_map[dataset_key] = suggestion_counts.get(analysis_id, 0) == 0
+
+    return fully_clean_map
+
 
 def _normalize_search_query(search: str | None) -> str | None:
     if search is None:
@@ -835,6 +902,12 @@ def list_csv_datasets(
         uploaded_datasets=uploaded_datasets,
         merged_datasets=merged_datasets,
     )
+    fully_clean_map = _build_dataset_fully_clean_map(
+        db,
+        current_user=current_user,
+        uploaded_datasets=uploaded_datasets,
+        merged_datasets=merged_datasets,
+    )
     datasets = []
     for dataset_type, dataset in paginated_datasets:
         if dataset_type == "uploaded":
@@ -845,6 +918,7 @@ def list_csv_datasets(
                         clean_state_map.get(("uploaded", dataset.id)),
                     ),
                     "dataset_type": "uploaded",
+                    "is_fully_clean": fully_clean_map.get(("uploaded", dataset.id), False),
                 }
             )
         else:
@@ -856,6 +930,7 @@ def list_csv_datasets(
                         clean_state_map.get(("merged", dataset.id)),
                     ),
                     "dataset_type": "merged",
+                    "is_fully_clean": fully_clean_map.get(("merged", dataset.id), False),
                 }
             )
 
