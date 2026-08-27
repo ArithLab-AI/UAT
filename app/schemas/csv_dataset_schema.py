@@ -92,9 +92,13 @@ class PaginationMetaResponse(BaseModel):
 
 class CsvDatasetListUploadedResponse(CsvUploadedDatasetResponse):
     dataset_type: Literal["uploaded"]
+    # True only when the dataset's latest analysis run returned zero suggestions.
+    # Never analysed stays False -- see _build_dataset_fully_clean_map.
+    is_fully_clean: bool = False
 
 class CsvDatasetListMergedResponse(CsvMergedDatasetResponse):
     dataset_type: Literal["merged"]
+    is_fully_clean: bool = False
 
 class CsvDatasetListResponse(BaseModel):
     datasets: list[CsvDatasetListUploadedResponse | CsvDatasetListMergedResponse]

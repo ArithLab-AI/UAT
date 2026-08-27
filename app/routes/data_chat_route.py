@@ -38,6 +38,7 @@ def query_dataset(
         question=payload.question,
         is_clean=payload.is_clean,
         session_id=payload.session_id,
+        include_insight=payload.include_insight,
     )
     # Shape wahi rehta hai; sirf message ab result ko reflect karta hai taaki UI toast me
     # technical text ke bajaye plain-English wajah dikhe.
