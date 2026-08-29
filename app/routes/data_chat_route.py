@@ -9,6 +9,7 @@ from app.models.auth_models import User
 from app.schemas.data_chat_schema import DataChatQueryRequest
 from app.services.data_chat_service import (
     DEFAULT_SUGGESTED_QUESTIONS,
+    delete_session,
     get_session_messages,
     get_suggested_questions,
     list_sessions,
@@ -82,6 +83,17 @@ def get_sessions(
 ):
     data = list_sessions(db, current_user, dataset_type=dataset_type, dataset_id=dataset_id)
     return success_response("Sessions fetched", data=data)
+
+
+@router.delete("/sessions/{session_id}")
+def delete_session_route(
+    session_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete a chat session along with all of its messages."""
+    data = delete_session(db, current_user, session_id)
+    return success_response("Session deleted", data=data)
 
 
 @router.get("/sessions/{session_id}/messages")

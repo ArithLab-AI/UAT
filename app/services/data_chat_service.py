@@ -10,10 +10,12 @@ persisted to ``data_chat_messages`` so the full history is queryable.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 from functools import lru_cache
 from typing import Any, Optional, TypedDict
 
+from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
 from app.db.database import Base, engine
@@ -58,6 +60,16 @@ def ensure_data_chat_tables() -> None:
             DataChatSuggestionCache.__table__,
         ],
     )
+    # create_all only creates missing tables, never adds a column to one that already
+    # exists, so a database created before `insight` needs the column added by hand.
+    inspector = inspect(engine)
+    if not inspector.has_table("data_chat_messages"):
+        return
+    existing = {column["name"] for column in inspector.get_columns("data_chat_messages")}
+    if "insight" not in existing:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE data_chat_messages ADD COLUMN insight JSON"))
+        logger.info("Added data_chat_messages.insight column")
 
 
 class _ChatState(TypedDict, total=False):
@@ -95,6 +107,57 @@ def _previous_sql_for_chart_change(state: _ChatState) -> str:
     return ""
 
 
+
+# The model's own clarification text is kept only when it actually asks the user something
+# useful. Two kinds get replaced: text that leaks internals ("regarding the previous SQL
+# query"), and empty filler ("what information are you looking for?") that tells the user
+# nothing they did not already know.
+_CLARIFICATION_JARGON = re.compile(
+    r"\bsql\b|\bschema\b|\bdataset table\b|previous query|generated query", re.I
+)
+_CLARIFICATION_FILLER = re.compile(
+    r"what (specific |kind of |sort of )?(information|analysis|data|insight|detail)"
+    r"|what (would|do) you (like|want)"
+    r"|could you (please )?(clarify|specify|elaborate|provide)"
+    r"|what are you looking for"
+    r"|please (clarify|specify)",
+    re.I,
+)
+MAX_CLARIFICATION_COLUMNS = 8
+
+
+def _fallback_clarification(state: _ChatState) -> str:
+    """Generic ask-again message, naming this dataset's own columns.
+
+    Listing the real columns turns a dead end into something actionable: the user can
+    see what there is to ask about instead of guessing.
+    """
+    frame = state.get("df")
+    columns = [str(column) for column in getattr(frame, "columns", [])]
+    if not columns:
+        return (
+            "I couldn't tell what you're asking about. Please clarify a bit more - rephrase "
+            "your question and name what you would like to see from this dataset."
+        )
+
+    shown = columns[:MAX_CLARIFICATION_COLUMNS]
+    listed = ", ".join(shown)
+    if len(columns) > len(shown):
+        listed += f", and {len(columns) - len(shown)} more"
+    return (
+        "I couldn't tell what you're asking about. Please clarify a bit more - rephrase your "
+        "question and name what you want from the data, for example a count, a total, or a "
+        f"comparison across one of these columns: {listed}."
+    )
+
+
+def _clarification_text(payload: dict[str, Any], state: _ChatState) -> str:
+    text = str(payload.get("clarification") or "").strip()
+    if not text or _CLARIFICATION_JARGON.search(text) or _CLARIFICATION_FILLER.search(text):
+        return _fallback_clarification(state)
+    return text
+
+
 def _node_generate_sql(state: _ChatState) -> _ChatState:
     payload, tokens = generate_sql(
         state["question"],
@@ -115,7 +178,7 @@ def _node_generate_sql(state: _ChatState) -> _ChatState:
 
     if payload.get("needs_clarification"):
         state["status"] = "clarify"
-        state["answer"] = str(payload.get("clarification") or "Could you clarify your question?")
+        state["answer"] = _clarification_text(payload, state)
         state["sql"] = ""
         return state
 
@@ -174,14 +237,39 @@ def _node_summarize(state: _ChatState) -> _ChatState:
 
 
 
-_INSIGHT_NARRATIVE_KEYS = (
-    "summary",
-    "key_findings",
-    "highs_and_lows",
-    "correlations",
-    "possible_reasons",
+# The six sections the insight is reported in. executive_summary is prose; the rest are
+# lists of one-line points so the frontend can render each section on its own.
+_INSIGHT_TEXT_KEYS = ("executive_summary",)
+_INSIGHT_LIST_KEYS = (
+    "data_observations",
+    "important_patterns",
+    "comparative_analysis",
+    "correlation_insights",
+    "actionable_recommendations",
     "caveats",
 )
+_INSIGHT_NARRATIVE_KEYS = _INSIGHT_TEXT_KEYS + _INSIGHT_LIST_KEYS
+
+
+_INSIGHT_TEXT_FIELDS = ("explanation", "text", "point", "insight", "description", "summary")
+
+
+def _narrative_line(item: Any) -> str:
+    """Coerce one list entry to a sentence.
+
+    The model sometimes echoes a whole statistics object instead of writing prose. Rather
+    than stringifying the dict into the response, pull the sentence out of it.
+    """
+    if isinstance(item, dict):
+        for field in _INSIGHT_TEXT_FIELDS:
+            value = item.get(field)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        # No known field: fall back to the longest string in the object, which is the
+        # narrative whenever there is one at all.
+        strings = [value.strip() for value in item.values() if isinstance(value, str) and value.strip()]
+        return max(strings, key=len) if strings else ""
+    return str(item).strip()
 
 
 def _coerce_insight_narrative(payload: Any) -> dict[str, Any] | None:
@@ -194,20 +282,19 @@ def _coerce_insight_narrative(payload: Any) -> dict[str, Any] | None:
         return None
 
     narrative: dict[str, Any] = {}
-    for key in _INSIGHT_NARRATIVE_KEYS:
+    for key in _INSIGHT_TEXT_KEYS:
+        narrative[key] = str(payload.get(key) or "").strip()
+    for key in _INSIGHT_LIST_KEYS:
         value = payload.get(key)
-        if key == "summary":
-            narrative[key] = str(value or "").strip()
-            continue
         if isinstance(value, str):
             entries = [value.strip()] if value.strip() else []
         elif isinstance(value, list):
-            entries = [str(item).strip() for item in value if str(item).strip()]
+            entries = [line for line in (_narrative_line(item) for item in value) if line]
         else:
             entries = []
         narrative[key] = entries
 
-    if not narrative["summary"] and not any(narrative[key] for key in _INSIGHT_NARRATIVE_KEYS[1:]):
+    if not any(narrative[key] for key in _INSIGHT_NARRATIVE_KEYS):
         return None
     return narrative
 
@@ -252,11 +339,11 @@ def _mandatory_caveats(statistics: dict[str, Any]) -> list[str]:
 
 
 def _node_insight(state: _ChatState) -> _ChatState:
-    """Attach a detailed, plain-language reading of the result.
+    """Attach a detailed, plain-language reading of the result, in six sections.
 
-    Statistics are computed from the rows first, so the numbers hold even when the
-    LLM is unavailable -- in that case a rule-based narrative is used instead of
-    dropping the field.
+    Statistics are computed from the rows first and passed to the model to quote, so
+    the numbers hold even when the LLM is unavailable -- in that case a rule-based
+    narrative is built from the same figures instead of dropping the field.
     """
     columns = state.get("columns", []) or []
     rows = state.get("rows", []) or []
@@ -295,7 +382,9 @@ def _node_insight(state: _ChatState) -> _ChatState:
         ]
     narrative["caveats"] = required + existing
 
-    state["insight"] = {**narrative, "statistics": statistics, "generated_by": generated_by}
+    # Statistics are what the narrative is written from, but the client only needs the
+    # narrative, so they stay server-side.
+    state["insight"] = {**narrative, "generated_by": generated_by}
     return state
 
 
@@ -446,6 +535,7 @@ def run_data_chat_query(
         generated_sql=final.get("sql") or None,
         assistant_text=final.get("answer"),
         chart_spec=final.get("chart"),
+        insight=final.get("insight"),
         result_preview=rows[:MAX_PREVIEW_ROWS] if rows else None,
         row_count=len(rows),
         status=status,
@@ -474,8 +564,8 @@ def run_data_chat_query(
         "row_count": len(rows),
         "total_row_count": total_rows,
         "chart_spec": final.get("chart"),
-        # Detailed plain-language reading of the result: narrative plus the statistics
-        # it was written from. None when the turn returned no rows or insight was skipped.
+        # Six-section plain-language reading of the result. None when the turn returned
+        # no rows or insight was skipped.
         "insight": final.get("insight"),
         "attempts": message.attempts,
         # Technical error DB/logs me hi rehta hai; client ko plain-English message jaata hai.
@@ -603,6 +693,7 @@ def get_session_messages(
             or (to_user_message(m.error_message) if m.status == "error" else None),
             "sql": m.generated_sql,
             "chart_spec": m.chart_spec,
+            "insight": m.insight,
             "rows": m.result_preview or [],
             "row_count": m.row_count,
             "status": m.status,
@@ -611,6 +702,44 @@ def get_session_messages(
         }
         for m in messages
     ]
+
+
+
+def delete_session(db: Session, current_user: User, session_id: str) -> dict[str, Any]:
+    """Delete one chat session and every message in it.
+
+    Messages are removed explicitly rather than relying on the FK cascade, so the delete
+    behaves the same on a database whose data_chat_messages table pre-dates that
+    constraint. Ownership is checked first: another user's session reads as not found.
+    """
+    ensure_data_chat_tables()
+
+    session = (
+        db.query(DataChatSession)
+        .filter(
+            DataChatSession.id == session_id,
+            DataChatSession.created_by_user_id == current_user.id,
+        )
+        .first()
+    )
+    if session is None:
+        raise error_response(status_code=404, detail="Chat session not found")
+
+    deleted_messages = (
+        db.query(DataChatMessage)
+        .filter(DataChatMessage.session_id == session_id)
+        .delete(synchronize_session=False)
+    )
+    db.delete(session)
+    db.commit()
+
+    logger.info(
+        "Deleted data chat session_id=%s with %s message(s) for user_id=%s",
+        session_id,
+        deleted_messages,
+        current_user.id,
+    )
+    return {"session_id": session_id, "deleted_messages": int(deleted_messages or 0)}
 
 
 def list_sessions(
