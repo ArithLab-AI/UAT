@@ -35,17 +35,17 @@ IDENTIFIER_DENSITY_RATIO = 0.9
 IDENTIFIER_MAX_SPREAD_RATIO = 0.1
 IDENTIFIER_MIN_ROWS = 5
 MIN_ROWS_FOR_CORRELATION = 3
-MIN_ABS_CORRELATION = 0.3
+MIN_ABS_CORRELATION = 0.1
 MAX_CORRELATION_PAIRS = 10
 MAX_HIGHLIGHTS_PER_METRIC = 3
+MAX_CROSS_CATEGORY_LINKS = 3
+MAX_CATEGORY_COLUMNS_PAIRED = 4
 MAX_METRICS_PROFILED = 6
 MAX_OUTLIERS_PER_METRIC = 5
 
 _STRENGTH_BANDS = (
-    (0.8, "very strong"),
-    (0.6, "strong"),
-    (0.4, "moderate"),
-    (0.2, "weak"),
+    (0.7, "strong"),
+    (0.3, "moderate"),
 )
 
 
@@ -65,6 +65,19 @@ def _clean_float(value: Any) -> float | int | None:
     return int(rounded) if float(rounded).is_integer() else rounded
 
 
+def _clean_percent(value: Any) -> float | int | None:
+    """Percentages are read, not recomputed, so one decimal is enough.
+
+    Four decimals on a share ("34.2371%") reads as false precision in a sentence the
+    narrative quotes verbatim.
+    """
+    percent = _clean_float(value)
+    if percent is None:
+        return None
+    rounded = round(float(percent), 1)
+    return int(rounded) if float(rounded).is_integer() else rounded
+
+
 def _format_number(value: Any) -> str:
     """Render a stat the way a reader expects: 42,000 rather than 42000.0."""
     if value is None:
@@ -81,9 +94,9 @@ def _format_number(value: Any) -> str:
 def _strength_label(coefficient: float) -> str:
     magnitude = abs(coefficient)
     for threshold, label in _STRENGTH_BANDS:
-        if magnitude >= threshold:
+        if magnitude > threshold:
             return label
-    return "negligible"
+    return "weak"
 
 
 def _looks_like_identifier(numeric: pd.Series, row_count: int) -> bool:
@@ -209,7 +222,7 @@ def _highlights(
                     "value": value,
                     "type": kind,
                     "share_of_total_pct": (
-                        _clean_float(value / total * 100) if total and value is not None else None
+                        _clean_percent(value / total * 100) if total and value is not None else None
                     ),
                 }
             )
@@ -278,6 +291,8 @@ def _correlations(frame: pd.DataFrame, measures: list[str]) -> list[dict[str, An
                     "coefficient": coefficient,
                     "direction": "positive" if coefficient > 0 else "negative",
                     "strength": _strength_label(coefficient),
+                    # r squared: the share of one column's variation the other accounts for.
+                    "variance_explained_pct": _clean_percent(coefficient * coefficient * 100),
                     "sample_size": int(numeric_frame[[left, right]].dropna().shape[0]),
                 }
             )
@@ -296,12 +311,98 @@ def _category_breakdown(frame: pd.DataFrame, label_column: str) -> dict[str, Any
         "column": label_column,
         "distinct_values": int(counts.size),
         "most_common": [
-            {"value": str(value), "count": int(count), "share_pct": _clean_float(count / total * 100)}
+            {"value": str(value), "count": int(count), "share_pct": _clean_percent(count / total * 100)}
             for value, count in top.items()
         ],
         # High concentration is itself the explanation for a lopsided result.
-        "top_3_share_pct": _clean_float(float(top.sum()) / total * 100),
+        "top_3_share_pct": _clean_percent(float(top.sum()) / total * 100),
     }
+
+
+def _distribution(
+    frame: pd.DataFrame,
+    measure: str,
+    label_column: str | None,
+) -> dict[str, Any] | None:
+    """Top vs bottom performer for one measure, with the gap expressed as a multiple.
+
+    Answers "is this dominated by one category or fairly balanced" and "how many times
+    bigger is the leader" without the reader doing any arithmetic.
+    """
+    numeric = pd.to_numeric(frame[measure], errors="coerce")
+    valid = frame.loc[numeric.notna()].copy()
+    if valid.empty:
+        return None
+
+    valid["__value"] = numeric.loc[numeric.notna()]
+    total = float(valid["__value"].sum())
+    ordered = valid.sort_values("__value", ascending=False)
+    top_row = ordered.iloc[0]
+    bottom_row = ordered.iloc[-1]
+
+    def _entry(row: pd.Series) -> dict[str, Any]:
+        value = _clean_float(row["__value"])
+        return {
+            "label": str(row[label_column]) if label_column else "(unlabelled)",
+            "value": value,
+            "share_pct": _clean_percent(value / total * 100) if total and value is not None else None,
+        }
+
+    top = _entry(top_row)
+    bottom = _entry(bottom_row)
+    ratio = None
+    if bottom["value"]:
+        ratio = _clean_float(abs(top["value"] / bottom["value"]))
+
+    top_share = top["share_pct"]
+    return {
+        "metric": measure,
+        "distinct_labels": int(valid[label_column].nunique()) if label_column else len(valid),
+        "total": _clean_float(total),
+        "top": top,
+        "bottom": bottom,
+        "ratio_top_to_bottom": ratio,
+        # A single category holding more than half the total is the pattern worth naming.
+        "dominated_by_one": bool(top_share is not None and top_share > 50),
+    }
+
+
+def _cross_category_links(
+    frame: pd.DataFrame,
+    label_columns: list[str],
+) -> list[dict[str, Any]]:
+    """Value pairs from two different categorical columns that occur together most often.
+
+    Needs at least two categorical columns, so an already-aggregated result grouped by a
+    single dimension produces nothing -- correctly, since there is no pair to relate.
+    """
+    usable = label_columns[:MAX_CATEGORY_COLUMNS_PAIRED]
+    if len(usable) < 2 or frame.empty:
+        return []
+
+    total = len(frame)
+    links: list[dict[str, Any]] = []
+    for index, left in enumerate(usable):
+        for right in usable[index + 1:]:
+            pair = frame[[left, right]].dropna()
+            if pair.empty:
+                continue
+            counts = pair.astype(str).groupby([left, right]).size()
+            if counts.empty:
+                continue
+            left_value, right_value = counts.idxmax()
+            count = int(counts.max())
+            links.append(
+                {
+                    "columns": [left, right],
+                    "values": [str(left_value), str(right_value)],
+                    "co_occurrence_count": count,
+                    "co_occurrence_pct": _clean_percent(count / total * 100),
+                }
+            )
+
+    links.sort(key=lambda item: item["co_occurrence_pct"] or 0, reverse=True)
+    return links[:MAX_CROSS_CATEGORY_LINKS]
 
 
 def compute_result_statistics(
@@ -319,6 +420,8 @@ def compute_result_statistics(
         "highlights": [],
         "outliers": [],
         "correlations": [],
+        "distributions": [],
+        "cross_category_links": [],
         "breakdown": None,
     }
     if not rows:
@@ -347,73 +450,130 @@ def compute_result_statistics(
     for measure in profiled:
         base["highlights"].extend(_highlights(frame, measure, label_column))
         base["outliers"].extend(_outliers(frame, measure, label_column))
+        distribution = _distribution(frame, measure, label_column)
+        if distribution is not None:
+            base["distributions"].append(distribution)
 
     base["correlations"] = _correlations(frame, measures)
+    base["cross_category_links"] = _cross_category_links(frame, labels)
     if label_column:
         base["breakdown"] = _category_breakdown(frame, label_column)
     return base
 
 
 def build_fallback_insight(statistics: dict[str, Any]) -> dict[str, Any]:
-    """Plain-language insight assembled from the numbers alone.
+    """The same six sections, assembled from the numbers alone.
 
-    Used when the LLM is unavailable or returns nothing, so the field is still
-    genuinely useful instead of empty.
+    Used when the LLM is unavailable or returns nothing, so the field stays genuinely
+    useful instead of empty. Every sentence here is filled from a computed value.
     """
-    findings: list[str] = []
     measures = statistics.get("measures") or []
-    highlights = statistics.get("highlights") or []
+    distributions = statistics.get("distributions") or []
     correlations = statistics.get("correlations") or []
-    breakdown = statistics.get("breakdown") or None
+    links = statistics.get("cross_category_links") or []
+    breakdown = statistics.get("breakdown") or {}
 
-    for profile in measures[:3]:
-        column = profile["column"]
-        findings.append(
-            f"{column} ranges from {_format_number(profile['min'])} to "
+    primary = distributions[0] if distributions else None
+    metric = primary["metric"] if primary else (measures[0]["column"] if measures else None)
+
+    executive_summary = ""
+    if primary:
+        executive_summary = (
+            f"{metric} varies across {primary['distinct_labels']} categories, "
+            f"with {primary['top']['label']} leading at {_format_number(primary['top']['value'])}."
+        )
+    elif measures:
+        profile = measures[0]
+        executive_summary = (
+            f"{profile['column']} ranges from {_format_number(profile['min'])} to "
+            f"{_format_number(profile['max'])}, averaging {_format_number(profile['mean'])}."
+        )
+    else:
+        executive_summary = (
+            f"This result has {statistics.get('rows_analysed', 0)} row(s) and no numeric "
+            "column to measure, so only the categories can be described."
+        )
+
+    observations: list[str] = []
+    if primary:
+        top, bottom = primary["top"], primary["bottom"]
+        observations.append(
+            f"{top['label']} has the highest {metric} ({_format_number(top['value'])}), "
+            f"{_format_number(top['share_pct'])}% of the total."
+        )
+        observations.append(
+            f"{bottom['label']} has the lowest {metric} ({_format_number(bottom['value'])}), "
+            f"{_format_number(bottom['share_pct'])}% of the total."
+        )
+        observations.append(f"There are {primary['distinct_labels']} distinct categories.")
+    for profile in measures[:2]:
+        observations.append(
+            f"{profile['column']} ranges from {_format_number(profile['min'])} to "
             f"{_format_number(profile['max'])}, averaging {_format_number(profile['mean'])} "
             f"(middle value {_format_number(profile['median'])})."
         )
 
-    highs = [item for item in highlights if item["type"] == "high"][:2]
-    lows = [item for item in highlights if item["type"] == "low"][:2]
-    for item in highs:
-        share = (
-            f", which is {_format_number(item['share_of_total_pct'])}% of the total"
-            if item["share_of_total_pct"]
-            else ""
+    patterns: list[str] = []
+    if primary:
+        patterns.append(
+            f"The spread of {metric} is dominated by a single category, "
+            f"{primary['top']['label']}."
+            if primary["dominated_by_one"]
+            else f"The spread of {metric} is relatively balanced across categories."
         )
-        findings.append(
-            f"Highest {item['metric']}: {item['label']} at {_format_number(item['value'])}{share}."
-        )
-    for item in lows:
-        findings.append(
-            f"Lowest {item['metric']}: {item['label']} at {_format_number(item['value'])}."
-        )
-
-    for pair in correlations[:3]:
-        left, right = pair["columns"]
-        movement = "rises" if pair["direction"] == "positive" else "falls"
-        findings.append(
-            f"{left} and {right} show a {pair['strength']} {pair['direction']} relationship "
-            f"(r = {pair['coefficient']}): as {left} goes up, {right} usually {movement}."
-        )
-
-    if breakdown and breakdown.get("top_3_share_pct") is not None:
-        findings.append(
+    if breakdown.get("top_3_share_pct") is not None:
+        patterns.append(
             f"The top 3 values of {breakdown['column']} account for "
             f"{_format_number(breakdown['top_3_share_pct'])}% of all rows."
         )
 
-    summary = (
-        f"Looked at {statistics.get('rows_analysed', 0)} row(s) of results."
-        if findings
-        else "There was not enough data in this result to describe a pattern."
-    )
+    comparative: list[str] = []
+    if primary and primary.get("ratio_top_to_bottom"):
+        comparative.append(
+            f"{primary['top']['label']} is about "
+            f"{_format_number(primary['ratio_top_to_bottom'])} times the "
+            f"{metric} of {primary['bottom']['label']}."
+        )
+
+    correlation_insights: list[str] = []
+    for pair in correlations[:3]:
+        left, right = pair["columns"]
+        movement = "rises" if pair["direction"] == "positive" else "falls"
+        correlation_insights.append(
+            f"{left} and {right} show a {pair['strength']} {pair['direction']} relationship "
+            f"(r = {pair['coefficient']}): as {left} goes up, {right} usually {movement}. "
+            f"Changes in {left} account for about "
+            f"{_format_number(pair['variance_explained_pct'])}% of the variation in {right}."
+        )
+    for link in links[:2]:
+        left_column, right_column = link["columns"]
+        left_value, right_value = link["values"]
+        correlation_insights.append(
+            f"{left_value} ({left_column}) most often appears together with "
+            f"{right_value} ({right_column}), in "
+            f"{_format_number(link['co_occurrence_pct'])}% of rows."
+        )
+
+    recommendations: list[str] = []
+    if primary:
+        recommendations.append(
+            f"Look at {primary['top']['label']} first, since it carries the largest share of {metric}."
+        )
+        recommendations.append(
+            f"Check why {primary['bottom']['label']} is lowest before deciding whether it needs action."
+        )
+    if correlations:
+        left, right = correlations[0]["columns"]
+        recommendations.append(
+            f"Investigate the link between {left} and {right} before treating either as a lever."
+        )
+
     return {
-        "summary": summary,
-        "key_findings": findings,
-        "highs_and_lows": [],
-        "correlations": [],
-        "possible_reasons": [],
+        "executive_summary": executive_summary,
+        "data_observations": observations,
+        "important_patterns": patterns,
+        "comparative_analysis": comparative,
+        "correlation_insights": correlation_insights,
+        "actionable_recommendations": recommendations,
         "caveats": ["This description was generated from the numbers only, without an AI narrative."],
     }

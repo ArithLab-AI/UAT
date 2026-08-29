@@ -20,6 +20,7 @@ CHART_SELECTION_GUIDE = """
 - waterfall: sequential positive/negative deltas from a starting point to an ending state.
 - mixed: same x-axis with exactly two numeric measures that should be shown as bar + line on dual y-axes.
 - doughnut: part-to-whole with 2 to 5 slices, never more than 8 slices.
+- pie: same part-to-whole shape as doughnut but drawn solid, with no hole in the middle.
 - scatter: raw x/y numeric points.
 - bubble: raw x/y numeric points plus a third numeric size value.
 - heatmap: two categorical axes plus one numeric intensity value.
@@ -39,6 +40,7 @@ SUPPORTED_CHART_TYPES = {
     "waterfall",
     "mixed",
     "doughnut",
+    "pie",
     "scatter",
     "bubble",
     "heatmap",
@@ -46,7 +48,6 @@ SUPPORTED_CHART_TYPES = {
 
 _CHART_TYPE_ALIASES = {
     "line": "smooth_line",
-    "pie": "doughnut",
     "correlation": "bubble",
     "basic_bar": "bar",
     "basic_area": "area",
@@ -56,6 +57,8 @@ _CHART_TYPE_ALIASES = {
     "stacked_area_chart": "stacked_area",
     "mixed_line_bar_chart": "mixed",
     "doughnut_chart": "doughnut",
+    "donut": "doughnut",
+    "pie_chart": "pie",
     "kpi_card": "kpi",
 }
 
@@ -73,10 +76,11 @@ _STACKED_CHART_TYPES = {"stacked_bar", "stacked_line", "stacked_area"}
 _TIME_SERIES_CHART_TYPES = {"smooth_line", "area", "stacked_line", "stacked_area"}
 # Axis charts ki tarah inko bhi ek categorical dimension chahiye, warna builder None return
 # karke table par gir jata hai.
-_CATEGORY_CHART_TYPES = {"doughnut", "heatmap"}
+_CATEGORY_CHART_TYPES = {"doughnut", "pie", "heatmap"}
 _SINGLE_VALUE_CHART_TYPES = {
     "kpi",
     "doughnut",
+    "pie",
     "waterfall",
     "stacked_bar",
     "stacked_line",
@@ -95,7 +99,10 @@ _EXPLICIT_CHART_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bstacked\s+bar\b", re.I), "stacked_bar"),
     (re.compile(r"\bstacked\s+area\b", re.I), "stacked_area"),
     (re.compile(r"\bstacked\s+line\b", re.I), "stacked_line"),
-    (re.compile(r"\b(pie|donut|doughnut)\b", re.I), "doughnut"),
+    # "pie" and "doughnut" are asked for separately, so they must not collapse into one
+    # type: a user who says pie expects a solid circle, not a ring.
+    (re.compile(r"\b(donut|doughnut)\b", re.I), "doughnut"),
+    (re.compile(r"\bpie\b", re.I), "pie"),
     (re.compile(r"\bwaterfall\b", re.I), "waterfall"),
     (re.compile(r"\bheat\s*-?\s*map\b", re.I), "heatmap"),
     (re.compile(r"\bbubble\b", re.I), "bubble"),
@@ -127,7 +134,7 @@ def _build_forced_doughnut_chart(
     rows: list[dict[str, Any]],
     mapping: dict[str, Any],
 ) -> Optional[dict[str, Any]]:
-    """Doughnut without the 2-8 slice cap, used only when the user names pie explicitly."""
+    """Slices without the 2-8 cap, used only when the user names pie or doughnut explicitly."""
     category_column = mapping.get("category")
     value_column = (mapping.get("value") or [None])[0]
     if not category_column or not value_column:
@@ -190,8 +197,8 @@ def normalize_chart_spec(
             build_rows = _sort_rows_chronologically(safe_rows, category_column)
 
         built = builder(safe_columns, build_rows, spec["mapping"], spec["options"])
-        if built is None and chart_type == explicit_type == "doughnut":
-            # Explicit pie request: slice-count cap ko relax karte hain (e.g. 12 mahine).
+        if built is None and chart_type == explicit_type and chart_type in {"doughnut", "pie"}:
+            # Explicit pie/doughnut request: slice-count cap ko relax karte hain (e.g. 12 mahine).
             built = _build_forced_doughnut_chart(build_rows, spec["mapping"])
         if built is None:
             continue
@@ -250,10 +257,10 @@ def _infer_chart_type(
     dimension_columns = [column for column in columns if column not in numeric_columns]
     time_columns = [column for column in dimension_columns if _is_time_like(column, rows)]
 
-    if requested_type == "doughnut" and dimension_columns and len(numeric_columns) == 1:
+    if requested_type in {"doughnut", "pie"} and dimension_columns and len(numeric_columns) == 1:
         category_count = len(_ordered_labels(rows, dimension_columns[0]))
         if 1 < category_count <= 8:
-            return "doughnut"
+            return requested_type
 
     question_lower = (question or "").lower()
     wants_part_to_whole = any(token in question_lower for token in ("share", "split", "breakdown", "part"))
@@ -386,7 +393,8 @@ def _default_options(
         "smooth": chart_type == "smooth_line",
         "stack": "Total" if chart_type in {"stacked_bar", "stacked_line", "stacked_area", "waterfall"} else None,
         "dual_axis": chart_type == "mixed",
-        "radius": ["40%", "70%"] if chart_type == "doughnut" else None,
+        # A doughnut keeps an inner hole; a pie is drawn solid from the centre out.
+        "radius": {"doughnut": ["40%", "70%"], "pie": ["0%", "70%"]}.get(chart_type),
         "item_border_radius": 10 if chart_type == "doughnut" else None,
         "helper_series_name": "baseline" if chart_type == "waterfall" else None,
         "delta_series_name": "delta" if chart_type == "waterfall" else None,
@@ -644,12 +652,13 @@ def _build_mixed_chart(
     }
 
 
-def _build_doughnut_chart(
+def _build_part_to_whole_chart(
     columns: list[str],
     rows: list[dict[str, Any]],
     mapping: dict[str, Any],
     options: dict[str, Any],
 ) -> Optional[dict[str, Any]]:
+    """Slice payload shared by doughnut and pie; only the rendered radius differs."""
     del columns, options
     category_column = mapping.get("category")
     value_column = (mapping.get("value") or [None])[0]
@@ -669,6 +678,10 @@ def _build_doughnut_chart(
     if not (1 < len(items) <= 8):
         return None
     return {"items": items}
+
+
+_build_doughnut_chart = _build_part_to_whole_chart
+_build_pie_chart = _build_part_to_whole_chart
 
 
 def _build_scatter_chart(
@@ -926,6 +939,7 @@ _CHART_BUILDERS = {
     "waterfall": _build_waterfall_chart,
     "mixed": _build_mixed_chart,
     "doughnut": _build_doughnut_chart,
+    "pie": _build_pie_chart,
     "scatter": _build_scatter_chart,
     "bubble": _build_bubble_chart,
     "heatmap": _build_heatmap_chart,

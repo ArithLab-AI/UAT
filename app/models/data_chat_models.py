@@ -59,6 +59,9 @@ class DataChatMessage(Base):
     generated_sql = Column(Text, nullable=True)
     assistant_text = Column(Text, nullable=True)
     chart_spec = Column(JSON, nullable=True)
+    # Six-section narrative for this turn, stored so reopening a session shows the same
+    # insight the user saw live instead of only the one-line answer.
+    insight = Column(JSON, nullable=True)
     result_preview = Column(JSON, nullable=True)  # capped list of result rows for history
     row_count = Column(Integer, nullable=True)
     status = Column(String(20), nullable=False, default="success")  # success | error | clarify
