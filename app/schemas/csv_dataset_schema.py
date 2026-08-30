@@ -1,7 +1,35 @@
 from datetime import datetime
 from typing import Literal
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.schemas.common_schema import SuccessResponse
+
+class CsvDatasetColumnResponse(BaseModel):
+    name: str
+    type: Literal["integer", "float", "boolean", "date", "string"] | None = None
+
+
+class CsvDatasetColumnDetailResponse(CsvDatasetColumnResponse):
+    """Shape of every column when a dataset is fetched with ``is_detail=true``."""
+
+    display_type: Literal["Numerical", "Categorical", "Datetime"]
+    missing_count: int
+    missing_percentage: float
+    unique_count: int
+    unique_percentage: float
+    sample: list[str]
+
+
+class CsvDatasetColumnsResponse(BaseModel):
+    """Whole payload of a dataset fetched with ``is_detail=true``: its columns, nothing else.
+
+    Extra keys are forbidden so this never quietly matches — and strips — a full dataset
+    payload that failed to validate as one, in the response-model union it shares with them.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    columns: list[CsvDatasetColumnDetailResponse | CsvDatasetColumnResponse]
+
 
 class CsvDatasetSummaryResponse(BaseModel):
     id: int
@@ -13,7 +41,7 @@ class CsvDatasetSummaryResponse(BaseModel):
     clean_file_url: str | None = None
     file_size: int
     total_rows: int
-    columns: list[str]
+    columns: list[CsvDatasetColumnDetailResponse | CsvDatasetColumnResponse]
     created_at: datetime
 
     class Config:
@@ -230,7 +258,9 @@ CsvUploadedDatasetListSuccessResponse = SuccessResponse[
 ]
 CsvUploadedDatasetSuccessResponse = SuccessResponse[CsvUploadedDatasetResponse]
 CsvMergedDatasetSuccessResponse = SuccessResponse[CsvMergedDatasetResponse]
-CsvDatasetItemResponse = CsvDatasetListUploadedResponse | CsvDatasetListMergedResponse
+CsvDatasetItemResponse = (
+    CsvDatasetListUploadedResponse | CsvDatasetListMergedResponse | CsvDatasetColumnsResponse
+)
 CsvDatasetItemSuccessResponse = SuccessResponse[CsvDatasetItemResponse]
 CsvDatasetListSuccessResponse = SuccessResponse[CsvDatasetListResponse]
 MergeSuggestionsSuccessResponse = SuccessResponse[MergeSuggestionsResponse]

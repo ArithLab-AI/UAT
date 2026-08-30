@@ -16,6 +16,8 @@ DATE_OUTPUT_FORMAT = os.getenv("UAT_ANALYSIS_DATE_OUTPUT_FORMAT", "%Y-%m-%d")
 MAX_PROFILE_COLUMNS = 12
 MAX_BAD_EXAMPLES = 3
 MAX_SAMPLE_ROWS = 5
+# Rows read when inferring a dataset's per-column datatype; a sample is enough there.
+COLUMN_TYPE_SAMPLE_ROWS = 1000
 ACCEPTED_PLACEHOLDER_TOKENS = {
     token.strip().lower()
     for token in {NULL_OUTPUT_TOKEN}
@@ -453,6 +455,43 @@ def _infer_expected_validation_type(column_name: str, stats: dict[str, Any], non
     if float_ratio >= 0.6 or (has_float_name_hint and float_ratio >= FLOAT_NAME_HINT_MIN_RATIO):
         return "float"
     return "string"
+
+
+# Broad, user-facing bucket each inferred datatype belongs to.
+COLUMN_TYPE_LABELS = {
+    "integer": "Numerical",
+    "float": "Numerical",
+    "date": "Datetime",
+    "boolean": "Categorical",
+    "string": "Categorical",
+}
+
+
+def column_type_label(column_type: str | None) -> str:
+    """Return the display bucket ("Numerical", "Datetime" or "Categorical") for a datatype."""
+    return COLUMN_TYPE_LABELS.get(column_type or "", "Categorical")
+
+
+def infer_column_data_types(df: pd.DataFrame, display_names: list[str] | None = None) -> list[str]:
+    """Return one datatype per column, in column order.
+
+    Uses the same value-driven rules the dataset profile applies to a column's expected
+    type ("integer", "float", "boolean", "date" or "string"), exposed on its own so dataset
+    responses can report a type per column without building a whole profile.
+    ``display_names`` carries the user-facing column names when the frame holds normalized
+    internal ones, because the rules also read column-name hints.
+    """
+    sample = df.head(COLUMN_TYPE_SAMPLE_ROWS)
+    names = display_names if display_names is not None else [str(column) for column in df.columns]
+    column_types: list[str] = []
+    for position, column in enumerate(sample.columns):
+        column_name = str(names[position]) if position < len(names) else str(column)
+        stats = _init_column_stats(column_name)
+        _update_column_stats(stats, sample[column])
+        column_types.append(
+            _infer_expected_validation_type(column_name, stats, stats["non_null_count"])
+        )
+    return column_types
 
 
 def _update_column_stats(stats: dict[str, Any], series: pd.Series) -> None:

@@ -29,6 +29,9 @@ def ensure_csv_dataset_schema(engine) -> None:
                         "WHERE internal_columns IS NULL"
                     )
                 )
+        if "column_types" not in uploaded_columns:
+            with engine.begin() as connection:
+                connection.execute(text("ALTER TABLE csv_uploaded_datasets ADD COLUMN column_types JSON"))
         if "file_size" not in uploaded_columns:
             with engine.begin() as connection:
                 connection.execute(
@@ -86,6 +89,9 @@ def ensure_csv_dataset_schema(engine) -> None:
                         "WHERE internal_columns IS NULL"
                     )
                 )
+        if "column_types" not in merged_columns:
+            with engine.begin() as connection:
+                connection.execute(text("ALTER TABLE csv_merged_datasets ADD COLUMN column_types JSON"))
         if "storage_key" not in merged_columns:
             with engine.begin() as connection:
                 connection.execute(text("ALTER TABLE csv_merged_datasets ADD COLUMN storage_key VARCHAR"))
