@@ -18,6 +18,11 @@ from app.models.csv_dataset_models import (
     CsvMergedDataset,
     CsvUploadedDataset,
 )
+from app.services.analysis_profile_service import (
+    COLUMN_TYPE_SAMPLE_ROWS,
+    column_type_label,
+    infer_column_data_types,
+)
 from app.utils.object_storage import get_object_storage_service
 from app.utils.responses import error_response
 
@@ -145,6 +150,7 @@ def _fetch_dataset_rows(
     table_name: str,
     columns: list[str],
     storage_key: str | None = None,
+    limit: int | None = None,
 ) -> list[dict]:
     storage_service = get_object_storage_service()
     if not storage_service.enabled:
@@ -164,10 +170,126 @@ def _fetch_dataset_rows(
 
         with temp_path.open("r", newline="", encoding="utf-8-sig") as csv_file:
             reader = csv.DictReader(csv_file)
-            return [
-                {column: row.get(column) for column in columns}
-                for row in reader
-            ]
+            rows: list[dict] = []
+            for row in reader:
+                rows.append({column: row.get(column) for column in columns})
+                if limit is not None and len(rows) >= limit:
+                    break
+            return rows
+
+
+def build_column_types(
+    columns: list[str],
+    internal_columns: list[str],
+    rows: list[dict],
+) -> list[str]:
+    """Infer one datatype per column from the dataset's own values, in ``columns`` order."""
+    sample = rows[:COLUMN_TYPE_SAMPLE_ROWS]
+    if not sample:
+        return ["string"] * len(columns)
+    frame = pd.DataFrame(sample, columns=internal_columns)
+    return infer_column_data_types(frame, columns)
+
+
+def resolve_dataset_column_types(dataset) -> list[str] | None:
+    """Column types for a dataset, read back from its stored file when they were never saved.
+
+    Datasets created before column types were stored carry none, so they are inferred from a
+    sample of the stored rows. Returns ``None`` when that file can't be read, so the dataset
+    can still be served without types instead of the request failing.
+    """
+    stored_types = dataset.column_types
+    columns = list(dataset.columns or [])
+    if stored_types and len(stored_types) == len(columns):
+        return list(stored_types)
+
+    try:
+        rows = _fetch_dataset_rows(
+            table_name=dataset.table_name,
+            columns=dataset.internal_columns,
+            storage_key=dataset.storage_key,
+            limit=COLUMN_TYPE_SAMPLE_ROWS,
+        )
+    except Exception:
+        return None
+
+    return build_column_types(columns, dataset.internal_columns, rows)
+
+
+# Distinct values shown per column in the detailed dataset view.
+COLUMN_DETAIL_SAMPLE_VALUES = 3
+
+
+def _percentage(count: int, total: int) -> float:
+    if not total:
+        return 0.0
+    return round(count / total * 100, 2)
+
+
+def _column_value_stats(series: pd.Series, total_rows: int) -> dict:
+    """Missing/unique counts and a short value sample for one column.
+
+    Blank strings count as missing alongside real nulls, because a CSV has no other way of
+    spelling an empty cell.
+    """
+    values = series.astype("string").fillna("").str.strip()
+    present_values = values[values != ""]
+    unique_values = present_values.drop_duplicates()
+    missing_count = total_rows - int(present_values.size)
+
+    return {
+        "missing_count": missing_count,
+        "missing_percentage": _percentage(missing_count, total_rows),
+        "unique_count": int(unique_values.size),
+        "unique_percentage": _percentage(int(unique_values.size), total_rows),
+        "sample": unique_values.head(COLUMN_DETAIL_SAMPLE_VALUES).tolist(),
+    }
+
+
+def build_dataset_column_details(dataset) -> list[dict] | None:
+    """Per-column details for a dataset: datatype, missing values, unique values and a sample.
+
+    Reads every stored row (unique counts need the whole column), so it is only worth doing
+    when the caller explicitly asks for the detailed view. Returns ``None`` when the stored
+    file can't be read, so the dataset can still be served without the details.
+    """
+    columns = list(dataset.columns or [])
+    internal_columns = list(dataset.internal_columns or columns)
+
+    try:
+        rows = _fetch_dataset_rows(
+            table_name=dataset.table_name,
+            columns=internal_columns,
+            storage_key=dataset.storage_key,
+        )
+    except Exception:
+        return None
+
+    frame = pd.DataFrame(rows, columns=internal_columns)
+    total_rows = len(frame)
+
+    column_types = list(dataset.column_types or [])
+    if len(column_types) != len(columns):
+        column_types = infer_column_data_types(frame, columns)
+
+    details: list[dict] = []
+    for index, column in enumerate(columns):
+        column_type = column_types[index] if index < len(column_types) else None
+        internal_column = internal_columns[index] if index < len(internal_columns) else column
+        series = (
+            frame[internal_column]
+            if internal_column in frame.columns
+            else pd.Series([None] * total_rows, dtype=object)
+        )
+        details.append(
+            {
+                "name": column,
+                "type": column_type,
+                "display_type": column_type_label(column_type),
+                **_column_value_stats(series, total_rows),
+            }
+        )
+    return details
 
 
 def _delete_dataset_rows(*, table_name: str, storage_key: str | None = None) -> None:
@@ -732,6 +854,7 @@ def _build_merged_dataset_record(
     source_datasets: list[CsvUploadedDataset],
     columns: list[str],
     internal_columns: list[str],
+    rows: list[dict],
     total_rows: int,
 ) -> CsvMergedDataset:
     return CsvMergedDataset(
@@ -762,6 +885,7 @@ def _build_merged_dataset_record(
         ],
         columns=columns,
         internal_columns=internal_columns,
+        column_types=build_column_types(columns, internal_columns, rows),
         total_rows=total_rows,
     )
 
@@ -797,6 +921,7 @@ def create_uploaded_dataset(
         total_rows=len(rows),
         columns=columns,
         internal_columns=internal_columns,
+        column_types=build_column_types(columns, internal_columns, rows),
         created_at=datetime.utcnow(),
     )
     db.add(dataset)
@@ -858,6 +983,7 @@ def merge_uploaded_datasets(
         source_datasets=source_datasets,
         columns=list(source_datasets[0].columns),
         internal_columns=ordered_columns,
+        rows=merged_rows,
         total_rows=len(merged_rows),
     )
     db.add(merged_dataset)
@@ -952,6 +1078,7 @@ def _join_uploaded_datasets(
         source_datasets=source_datasets,
         columns=output_columns,
         internal_columns=output_internal_columns,
+        rows=merged_rows,
         total_rows=len(merged_rows),
     )
     db.add(merged_dataset)

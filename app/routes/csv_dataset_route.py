@@ -30,6 +30,7 @@ from app.schemas.csv_dataset_schema import (
 )
 from app.schemas.common_schema import MessageSuccessResponse
 from app.services.csv_service import (
+    build_dataset_column_details,
     build_dataset_name,
     count_user_active_datasets,
     create_uploaded_dataset,
@@ -38,6 +39,7 @@ from app.services.csv_service import (
     ParsedUpload,
     PendingSheetSelection,
     parse_csv_upload,
+    resolve_dataset_column_types,
 )
 from app.services.excel_sheet_service import process_temporary_upload_selection
 from app.services.merge_service import (
@@ -146,6 +148,52 @@ def _clean_file_url(clean_state: dict) -> str | None:
     return get_object_storage_service().presigned_download_url(raw_url) or raw_url
 
 
+def _serialize_dataset_columns(columns, column_types) -> list[dict]:
+    """Pair every column name with its inferred datatype.
+
+    ``type`` is null only for datasets stored before column types were saved and whose file
+    could not be read back to infer them."""
+    column_types = list(column_types or [])
+    return [
+        {
+            "name": column,
+            "type": column_types[index] if index < len(column_types) else None,
+        }
+        for index, column in enumerate(columns or [])
+    ]
+
+
+def _ensure_dataset_column_types(db: Session, dataset) -> None:
+    """Backfill and store the column types of a dataset saved before they were recorded."""
+    if dataset.column_types and len(dataset.column_types) == len(dataset.columns or []):
+        return
+
+    column_types = resolve_dataset_column_types(dataset)
+    if not column_types:
+        return
+
+    dataset.column_types = column_types
+    db.commit()
+
+
+def _dataset_columns_response(db: Session, dataset):
+    """Detailed view of a dataset: only its columns, each with its own stats."""
+    column_details = build_dataset_column_details(dataset)
+    if not column_details:
+        return success_response(
+            "Dataset fetched successfully",
+            data={"columns": _serialize_dataset_columns(dataset.columns, dataset.column_types)},
+        )
+
+    # The details were inferred from every stored row, so keep them for datasets saved
+    # before column types were recorded instead of reading the file again later.
+    if not dataset.column_types:
+        dataset.column_types = [column["type"] for column in column_details]
+        db.commit()
+
+    return success_response("Dataset fetched successfully", data={"columns": column_details})
+
+
 def _serialize_uploaded_dataset(uploaded_dataset, clean_state=None):
     clean_state = clean_state or {}
     return {
@@ -160,7 +208,9 @@ def _serialize_uploaded_dataset(uploaded_dataset, clean_state=None):
         "clean_file_url": _clean_file_url(clean_state),
         "file_size": uploaded_dataset.file_size,
         "total_rows": uploaded_dataset.total_rows,
-        "columns": uploaded_dataset.columns,
+        "columns": _serialize_dataset_columns(
+            uploaded_dataset.columns, uploaded_dataset.column_types
+        ),
         "is_retention": uploaded_dataset.is_retention,
         "retention_until": uploaded_dataset.retention_until,
         "retention_at": uploaded_dataset.retention_at,
@@ -201,7 +251,9 @@ def _serialize_merged_dataset(merged_dataset, source_dataset_map=None, clean_sta
         "clean_file_url": _clean_file_url(clean_state),
         "file_size": merged_dataset.file_size,
         "total_rows": merged_dataset.total_rows,
-        "columns": merged_dataset.columns,
+        "columns": _serialize_dataset_columns(
+            merged_dataset.columns, merged_dataset.column_types
+        ),
         "created_at": merged_dataset.created_at,
         "source_datasets": source_datasets,
     }
@@ -950,6 +1002,14 @@ def get_csv_dataset(
         ...,
         description="Whether dataset_id refers to an uploaded or a merged dataset.",
     ),
+    is_detail: bool = Query(
+        False,
+        description=(
+            "Return only the dataset's columns, each with its datatype, missing values, unique "
+            "values and a short value sample. Reads the stored rows, so it is slower than the "
+            "default response."
+        ),
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -965,6 +1025,10 @@ def get_csv_dataset(
         if not dataset:
             raise error_response(status_code=404, detail="Uploaded dataset not found")
 
+        if is_detail:
+            return _dataset_columns_response(db, dataset)
+
+        _ensure_dataset_column_types(db, dataset)
         clean_state_map = _build_dataset_clean_state_map(
             db,
             current_user=current_user,
@@ -990,6 +1054,10 @@ def get_csv_dataset(
     if not dataset:
         raise error_response(status_code=404, detail="Merged dataset not found")
 
+    if is_detail:
+        return _dataset_columns_response(db, dataset)
+
+    _ensure_dataset_column_types(db, dataset)
     source_dataset_ids = sorted(
         {item["id"] for item in (dataset.source_datasets_metadata or [])}
     )
