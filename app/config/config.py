@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_SECRET: Optional[str] = None
     # The production page that hosts the Google sign-in UI.  The API verifies
     # the credential submitted from this page at POST /auth/google.
-    FRONTEND_LOGIN_URL: str = "https://www.arithlab.ai/login"
+    FRONTEND_LOGIN_URL: str = "https://www.arithlab.ai/"
     
     SMTP_EMAIL: Optional[str] = None
     SMTP_PASSWORD: Optional[str] = None
