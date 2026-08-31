@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     # OAuth environment files. The current ID-token login endpoint does not
     # send this value to clients or use it for token verification.
     GOOGLE_CLIENT_SECRET: Optional[str] = None
+    # The production page that hosts the Google sign-in UI.  The API verifies
+    # the credential submitted from this page at POST /auth/google.
+    FRONTEND_LOGIN_URL: str = "https://www.arithlab.ai/login"
     
     SMTP_EMAIL: Optional[str] = None
     SMTP_PASSWORD: Optional[str] = None
