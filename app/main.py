@@ -1,6 +1,8 @@
 import logging
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from urllib.parse import urlparse
 from fastapi.exceptions import RequestValidationError
 from app.routes.auth_route import router as auth_router
 from app.routes.csv_dataset_route import router as csv_dataset_router
@@ -37,6 +39,17 @@ from app.services.file_retention_service import (
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Authentication API")
+
+# CORS origins cannot include a path.  The Google sign-in page is configured as
+# https://www.arithlab.ai/, so allow its browser origin to call /auth/google.
+frontend_login_origin = urlparse(settings.FRONTEND_LOGIN_URL).scheme + "://" + urlparse(settings.FRONTEND_LOGIN_URL).netloc
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[frontend_login_origin],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(health_router)
 app.include_router(auth_router)
