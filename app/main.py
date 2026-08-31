@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Authentication API")
 
 # CORS origins cannot include a path.  The Google sign-in page is configured as
-# https://www.arithlab.ai/, so allow its browser origin to call /auth/google.
+# https://www.arithlab.ai, so allow its browser origin to call /auth/google.
 frontend_login_origin = urlparse(settings.FRONTEND_LOGIN_URL).scheme + "://" + urlparse(settings.FRONTEND_LOGIN_URL).netloc
 app.add_middleware(
     CORSMiddleware,
