@@ -5,6 +5,7 @@ import os
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
+from collections.abc import Iterable, Sequence
 from typing import Any
 from datetime import date, datetime, time
 from pathlib import Path, PureWindowsPath
@@ -27,14 +28,34 @@ from app.utils.object_storage import get_object_storage_service
 from app.utils.responses import error_response
 
 
+# Uploads are streamed to disk in chunks so a large file never sits in memory as one object.
+UPLOAD_CHUNK_SIZE = 1024 * 1024
+
+# Rows scanned to locate the header. Matches the window used by ``_detect_header_row_index``.
+HEADER_SCAN_ROWS = 25
+
+
 @dataclass(frozen=True)
 class ParsedUpload:
+    """A parsed upload, carried as a staged file rather than as rows.
+
+    ``staged_path`` is a normalized CSV ready to be handed to object storage as-is, so no
+    upload format ever materializes its rows. ``sample_rows`` is capped at
+    ``COLUMN_TYPE_SAMPLE_ROWS`` because column type inference is the only thing left here
+    that needs row values.
+    """
+
     file_name: str
     file_size: int
     columns: list[str]
     internal_columns: list[str]
-    rows: list[dict]
+    total_rows: int
+    sample_rows: list[dict]
+    staged_path: Path
     sheet_name: str | None = None
+
+    def cleanup(self) -> None:
+        self.staged_path.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -143,6 +164,148 @@ def _upload_rows_to_object_storage(
         file_size = os.path.getsize(temp_path)
         file_url = storage_service.upload_file(str(temp_path), storage_key)
     return storage_key, file_url, file_size
+
+
+def _upload_csv_file_to_object_storage(
+    *,
+    table_name: str,
+    file_path: Path,
+) -> tuple[str, str, int]:
+    """Upload an already normalized CSV file without reading it back into memory."""
+    storage_service = get_object_storage_service()
+    if not storage_service.enabled:
+        raise error_response(
+            status_code=500,
+            detail="AWS S3 bucket is not configured for CSV dataset storage",
+        )
+
+    storage_key = _csv_dataset_storage_key(table_name)
+    file_size = os.path.getsize(file_path)
+    file_url = storage_service.upload_file(str(file_path), storage_key)
+    return storage_key, file_url, file_size
+
+
+async def _spool_upload_to_temp_file(
+    file: UploadFile,
+    *,
+    prefix: str,
+    suffix: str,
+) -> tuple[Path, int]:
+    """Copy an upload to disk a chunk at a time, so its size never drives memory use."""
+    temp_file = tempfile.NamedTemporaryFile(prefix=prefix, suffix=suffix, delete=False)
+    temp_path = Path(temp_file.name)
+    total_size = 0
+    try:
+        with temp_file:
+            while True:
+                chunk = await file.read(UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                temp_file.write(chunk)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    return temp_path, total_size
+
+
+def new_staged_csv_path() -> Path:
+    """Path for a normalized CSV that outlives the call writing it; the caller cleans it up."""
+    staged_file = tempfile.NamedTemporaryFile(prefix="csv_staged_", suffix=".csv", delete=False)
+    staged_file.close()
+    return Path(staged_file.name)
+
+
+def stream_rows_to_normalized_file(
+    file_name: str,
+    source_rows: Iterable[Sequence[Any] | None],
+    dest_path: Path,
+    *,
+    missing_value: Any = None,
+    max_data_rows: int | None = None,
+    max_data_rows_detail: str | None = None,
+) -> tuple[list[str], list[str], int, list[dict]]:
+    """Detect the header, then normalize every following row straight out to ``dest_path``.
+
+    ``source_rows`` is consumed lazily, so a caller handing over a CSV reader or a read-only
+    worksheet never has to hold the sheet. Only the header scan window and the column type
+    sample stay resident, which is what keeps peak memory flat no matter how large the upload
+    is. Header detection and value normalization are unchanged from the in-memory path -- both
+    only ever needed a prefix of the rows, which is what makes the streaming equivalent.
+    """
+    row_iterator = iter(source_rows)
+
+    header_scan_rows: list[list[Any]] = []
+    for row in row_iterator:
+        header_scan_rows.append(list(row or []))
+        if len(header_scan_rows) >= HEADER_SCAN_ROWS:
+            break
+
+    if not header_scan_rows:
+        raise error_response(
+            status_code=400,
+            detail=f"{file_name} does not contain a header row",
+        )
+
+    header_index = _detect_header_row_index(header_scan_rows)
+    original_columns, internal_columns = _normalize_columns(
+        file_name,
+        header_scan_rows[header_index],
+    )
+
+    total_rows = 0
+    sample_rows: list[dict] = []
+    # Leading blank and annotation rows are dropped, exactly as the in-memory path did. The
+    # flag carries that skip past the scan window for files padded beyond it.
+    skipping_leading_rows = True
+
+    with dest_path.open("w", newline="", encoding="utf-8") as dest_file:
+        writer = csv.DictWriter(dest_file, fieldnames=internal_columns)
+        writer.writeheader()
+
+        def write_row(values: list[Any]) -> None:
+            nonlocal total_rows, skipping_leading_rows
+            if skipping_leading_rows:
+                if _is_empty_upload_row(values) or _is_header_annotation_row(values):
+                    return
+                skipping_leading_rows = False
+            if max_data_rows is not None and total_rows >= max_data_rows:
+                raise error_response(status_code=400, detail=max_data_rows_detail)
+            row = _build_row_from_values(internal_columns, values, missing_value=missing_value)
+            writer.writerow(row)
+            if len(sample_rows) < COLUMN_TYPE_SAMPLE_ROWS:
+                sample_rows.append(row)
+            total_rows += 1
+
+        for values in header_scan_rows[header_index + 1 :]:
+            write_row(values)
+        for row in row_iterator:
+            write_row(list(row or []))
+
+    return original_columns, internal_columns, total_rows, sample_rows
+
+
+def _stream_csv_to_normalized_file(
+    file_name: str,
+    source_path: Path,
+    dest_path: Path,
+) -> tuple[list[str], list[str], int, list[dict]]:
+    """Stream a CSV upload into its normalized form, sniffing the dialect from the first 4KB."""
+    try:
+        with source_path.open("r", newline="", encoding="utf-8-sig") as source_file:
+            dialect = _get_csv_dialect(source_file.read(4096))
+            source_file.seek(0)
+            return stream_rows_to_normalized_file(
+                file_name,
+                csv.reader(source_file, dialect=dialect),
+                dest_path,
+                missing_value="",
+            )
+    except UnicodeDecodeError as exc:
+        raise error_response(
+            status_code=400,
+            detail=f"{file_name} must be UTF-8 encoded",
+        ) from exc
 
 
 def _fetch_dataset_rows(
@@ -405,28 +568,6 @@ def _get_csv_dialect(text_content: str):
         return csv.excel
 
 
-def _parse_csv_content(file_name: str, content: bytes) -> tuple[list[str], list[str], list[dict]]:
-    try:
-        text_content = content.decode("utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise error_response(
-            status_code=400,
-            detail=f"{file_name} must be UTF-8 encoded",
-        ) from exc
-
-    csv_reader = csv.reader(io.StringIO(text_content), dialect=_get_csv_dialect(text_content))
-    original_columns, internal_columns, data_rows = _split_rows_by_detected_header(
-        file_name,
-        [list(row or []) for row in csv_reader],
-    )
-
-    rows = []
-    for row in data_rows:
-        rows.append(_build_row_from_values(internal_columns, row, missing_value=""))
-
-    return original_columns, internal_columns, rows
-
-
 def _parse_xlsx_content(file_name: str, content: bytes) -> tuple[list[str], list[str], list[dict]]:
     try:
         workbook = openpyxl.load_workbook(
@@ -484,18 +625,6 @@ def _parse_xls_content(file_name: str, content: bytes) -> tuple[list[str], list[
     return original_columns, internal_columns, rows
 
 
-@contextmanager
-def _temporary_upload_file(file_name: str, content: bytes):
-    suffix = Path(file_name).suffix.lower()
-    temp_file = tempfile.NamedTemporaryFile(prefix="csv_upload_", suffix=suffix, delete=False)
-    try:
-        temp_file.write(content)
-        temp_file.close()
-        yield Path(temp_file.name)
-    finally:
-        Path(temp_file.name).unlink(missing_ok=True)
-
-
 async def parse_csv_upload(file: UploadFile, *, user_id: int) -> ParsedUpload | PendingSheetSelection:
     if not file.filename:
         raise error_response(status_code=400, detail="Uploaded file must have a name")
@@ -510,30 +639,49 @@ async def parse_csv_upload(file: UploadFile, *, user_id: int) -> ParsedUpload | 
         )
 
     try:
-        content = await file.read()
-        if not content:
+        source_path, file_size = await _spool_upload_to_temp_file(
+            file,
+            prefix="csv_upload_",
+            suffix=suffix,
+        )
+    finally:
+        await file.close()
+
+    try:
+        if not file_size:
             raise error_response(status_code=400, detail=f"{file_name} is empty")
-        file_size = len(content)
 
         if suffix == ".csv":
-            original_columns, internal_columns, rows = await run_in_threadpool(
-                _parse_csv_content, file_name, content
-            )
+            staged_path = new_staged_csv_path()
+            try:
+                (
+                    original_columns,
+                    internal_columns,
+                    total_rows,
+                    sample_rows,
+                ) = await run_in_threadpool(
+                    _stream_csv_to_normalized_file, file_name, source_path, staged_path
+                )
+            except Exception:
+                staged_path.unlink(missing_ok=True)
+                raise
             return ParsedUpload(
                 file_name=file_name,
                 file_size=file_size,
                 columns=original_columns,
                 internal_columns=internal_columns,
-                rows=rows,
+                total_rows=total_rows,
+                sample_rows=sample_rows,
+                staged_path=staged_path,
             )
         from app.services.excel_sheet_service import extract_sheet_names, process_selected_sheet
 
-        sheet_names = await run_in_threadpool(extract_sheet_names, content)
+        sheet_names = await run_in_threadpool(extract_sheet_names, str(source_path))
         if len(sheet_names) > 1:
             from app.services.temporary_upload_service import store_temporary_upload
 
             temporary_upload = store_temporary_upload(
-                content=content,
+                content=source_path.read_bytes(),
                 original_file_name=file_name,
                 available_sheets=sheet_names,
                 user_id=user_id,
@@ -547,31 +695,39 @@ async def parse_csv_upload(file: UploadFile, *, user_id: int) -> ParsedUpload | 
                 preview_row_count=None,
             )
 
-        with _temporary_upload_file(file_name, content) as temp_path:
+        staged_path = new_staged_csv_path()
+        try:
             (
                 parsed_file_name,
                 parsed_file_size,
                 original_columns,
                 internal_columns,
-                rows,
+                total_rows,
+                sample_rows,
                 sheet_name,
             ) = await run_in_threadpool(
                 process_selected_sheet,
-                file_path=str(temp_path),
+                file_path=str(source_path),
                 file_name=file_name,
                 sheet_name=sheet_names[0],
+                dest_path=staged_path,
                 available_sheets=sheet_names,
             )
-            return ParsedUpload(
-                file_name=parsed_file_name,
-                file_size=parsed_file_size,
-                columns=original_columns,
-                internal_columns=internal_columns,
-                rows=rows,
-                sheet_name=sheet_name,
-            )
+        except Exception:
+            staged_path.unlink(missing_ok=True)
+            raise
+        return ParsedUpload(
+            file_name=parsed_file_name,
+            file_size=parsed_file_size,
+            columns=original_columns,
+            internal_columns=internal_columns,
+            total_rows=total_rows,
+            sample_rows=sample_rows,
+            staged_path=staged_path,
+            sheet_name=sheet_name,
+        )
     finally:
-        await file.close()
+        source_path.unlink(missing_ok=True)
 
 
 def build_dataset_name(explicit_name: str | None, file_name: str) -> str:
@@ -899,14 +1055,20 @@ def create_uploaded_dataset(
     file_size: int,
     columns: list[str],
     internal_columns: list[str],
-    rows: list[dict],
+    source_path: Path,
+    total_rows: int,
+    sample_rows: list[dict],
     user_id: int,
 ) -> CsvUploadedDataset:
+    """Persist an uploaded dataset from its already normalized CSV.
+
+    ``source_path`` goes to object storage untouched, and ``total_rows``/``sample_rows`` carry
+    what the streaming parse counted, so the rows themselves never have to be held here.
+    """
     table_name = _generate_table_name(db, "upload", dataset_name)
-    storage_key, file_url, _ = _upload_rows_to_object_storage(
+    storage_key, file_url, _ = _upload_csv_file_to_object_storage(
         table_name=table_name,
-        columns=internal_columns,
-        rows=rows,
+        file_path=source_path,
     )
 
     dataset = CsvUploadedDataset(
@@ -918,10 +1080,10 @@ def create_uploaded_dataset(
         storage_key=storage_key,
         file_url=file_url,
         created_by_user_id=user_id,
-        total_rows=len(rows),
+        total_rows=total_rows,
         columns=columns,
         internal_columns=internal_columns,
-        column_types=build_column_types(columns, internal_columns, rows),
+        column_types=build_column_types(columns, internal_columns, sample_rows),
         created_at=datetime.utcnow(),
     )
     db.add(dataset)

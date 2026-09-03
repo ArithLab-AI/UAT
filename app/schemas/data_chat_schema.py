@@ -36,6 +36,8 @@ class ChartSpec(BaseModel):
     format_version: int = 1
     type: str = "table"
     title: Optional[str] = None
+    # AI-written headline for the question and its result, e.g. "Sales Peaked in March".
+    summary_title: Optional[str] = None
     mapping: ChartMapping = Field(default_factory=ChartMapping)
     options: ChartOptions = Field(default_factory=ChartOptions)
     payload: dict[str, Any] = Field(default_factory=dict)

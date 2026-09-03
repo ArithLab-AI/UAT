@@ -36,6 +36,7 @@ from app.services.csv_service import (
     create_uploaded_dataset,
     delete_merged_dataset,
     delete_uploaded_dataset,
+    new_staged_csv_path,
     ParsedUpload,
     PendingSheetSelection,
     parse_csv_upload,
@@ -522,107 +523,115 @@ async def upload_multiple_csv_datasets(
 
     parsed_uploads: list[ParsedUpload] = []
     pending_sheet_selections: list[PendingSheetSelection] = []
-    for file in files:
-        if not hasattr(file, "filename") or not hasattr(file, "read"):
-            raise error_response(status_code=400, detail="Invalid file input")
+    # Staged CSV files live on disk until object storage has them, so they are removed
+    # on every exit path rather than left behind on the instance.
+    try:
+        for file in files:
+            if not hasattr(file, "filename") or not hasattr(file, "read"):
+                raise error_response(status_code=400, detail="Invalid file input")
 
-        file_size = _get_file_size(file)
-        max_file_size_bytes = plan_capabilities["max_file_size_bytes"]
-        if (
-            file_size is not None
-            and max_file_size_bytes is not None
-            and file_size > max_file_size_bytes
-        ):
-            raise error_response(
-                status_code=400,
-                detail=(
-                    f"{file.filename} exceeds your current plan file size limit of "
-                    f"{_format_file_size_limit(max_file_size_bytes)}. Please upgrade your plan."
-                ),
+            file_size = _get_file_size(file)
+            max_file_size_bytes = plan_capabilities["max_file_size_bytes"]
+            if (
+                file_size is not None
+                and max_file_size_bytes is not None
+                and file_size > max_file_size_bytes
+            ):
+                raise error_response(
+                    status_code=400,
+                    detail=(
+                        f"{file.filename} exceeds your current plan file size limit of "
+                        f"{_format_file_size_limit(max_file_size_bytes)}. Please upgrade your plan."
+                    ),
+                )
+
+            parsed_upload = await parse_csv_upload(file, user_id=current_user.id)
+            if isinstance(parsed_upload, PendingSheetSelection):
+                pending_sheet_selections.append(parsed_upload)
+                continue
+            parsed_uploads.append(parsed_upload)
+
+        created_datasets = []
+        total_upload_size = sum(parsed_upload.file_size for parsed_upload in parsed_uploads)
+        ensure_upload_storage_available(
+            db,
+            user_id=current_user.id,
+            plan_capabilities=plan_capabilities,
+            upload_size_bytes=total_upload_size,
+        )
+        for parsed_upload in parsed_uploads:
+            dataset_name = _build_uploaded_dataset_name(parsed_upload.file_name, parsed_upload.sheet_name)
+            dataset = create_uploaded_dataset(
+                db,
+                dataset_name=dataset_name,
+                file_name=parsed_upload.file_name,
+                sheet_name=parsed_upload.sheet_name,
+                file_size=parsed_upload.file_size,
+                columns=parsed_upload.columns,
+                internal_columns=parsed_upload.internal_columns,
+                source_path=parsed_upload.staged_path,
+                total_rows=parsed_upload.total_rows,
+                sample_rows=parsed_upload.sample_rows,
+                user_id=current_user.id,
+            )
+            set_dataset_retention_expiry(
+                db=db,
+                dataset=dataset,
+                user_id=current_user.id,
+            )
+            created_datasets.append(dataset)
+
+        db.flush()
+        for dataset in created_datasets:
+            record_upload_storage_usage(db, dataset=dataset, user_id=current_user.id)
+
+        db.commit()
+
+        for dataset in created_datasets:
+            db.refresh(dataset)
+
+        if pending_sheet_selections:
+            pending_files = [
+                {
+                    "requires_sheet_selection": pending_upload.requires_sheet_selection,
+                    "file_token": pending_upload.file_token,
+                    "file_name": pending_upload.file_name,
+                    "available_sheets": pending_upload.available_sheets,
+                    "sheet_count": pending_upload.sheet_count,
+                    "preview_row_count": pending_upload.preview_row_count,
+                }
+                for pending_upload in pending_sheet_selections
+            ]
+            response_data = {
+                "requires_sheet_selection": True,
+                "pending_files": pending_files,
+                "uploaded_datasets": [
+                    _serialize_uploaded_dataset(dataset)
+                    for dataset in created_datasets
+                ],
+            }
+
+            return success_response(
+                "Sheet selection is required before upload can continue",
+                data=response_data,
             )
 
-        parsed_upload = await parse_csv_upload(file, user_id=current_user.id)
-        if isinstance(parsed_upload, PendingSheetSelection):
-            pending_sheet_selections.append(parsed_upload)
-            continue
-        parsed_uploads.append(parsed_upload)
-
-    created_datasets = []
-    total_upload_size = sum(parsed_upload.file_size for parsed_upload in parsed_uploads)
-    ensure_upload_storage_available(
-        db,
-        user_id=current_user.id,
-        plan_capabilities=plan_capabilities,
-        upload_size_bytes=total_upload_size,
-    )
-    for parsed_upload in parsed_uploads:
-        dataset_name = _build_uploaded_dataset_name(parsed_upload.file_name, parsed_upload.sheet_name)
-        dataset = create_uploaded_dataset(
-            db,
-            dataset_name=dataset_name,
-            file_name=parsed_upload.file_name,
-            sheet_name=parsed_upload.sheet_name,
-            file_size=parsed_upload.file_size,
-            columns=parsed_upload.columns,
-            internal_columns=parsed_upload.internal_columns,
-            rows=parsed_upload.rows,
-            user_id=current_user.id,
+        logger.info(
+            "Created %s uploaded datasets for user_id=%s",
+            len(created_datasets),
+            current_user.id,
         )
-        set_dataset_retention_expiry(
-            db=db,
-            dataset=dataset,
-            user_id=current_user.id,
-        )
-        created_datasets.append(dataset)
-
-    db.flush()
-    for dataset in created_datasets:
-        record_upload_storage_usage(db, dataset=dataset, user_id=current_user.id)
-
-    db.commit()
-
-    for dataset in created_datasets:
-        db.refresh(dataset)
-
-    if pending_sheet_selections:
-        pending_files = [
-            {
-                "requires_sheet_selection": pending_upload.requires_sheet_selection,
-                "file_token": pending_upload.file_token,
-                "file_name": pending_upload.file_name,
-                "available_sheets": pending_upload.available_sheets,
-                "sheet_count": pending_upload.sheet_count,
-                "preview_row_count": pending_upload.preview_row_count,
-            }
-            for pending_upload in pending_sheet_selections
-        ]
-        response_data = {
-            "requires_sheet_selection": True,
-            "pending_files": pending_files,
-            "uploaded_datasets": [
+        return success_response(
+            "Uploaded datasets created successfully",
+            status_code=201,
+            data=[
                 _serialize_uploaded_dataset(dataset)
                 for dataset in created_datasets
             ],
-        }
-
-        return success_response(
-            "Sheet selection is required before upload can continue",
-            data=response_data,
         )
-
-    logger.info(
-        "Created %s uploaded datasets for user_id=%s",
-        len(created_datasets),
-        current_user.id,
-    )
-    return success_response(
-        "Uploaded datasets created successfully",
-        status_code=201,
-        data=[
-            _serialize_uploaded_dataset(dataset)
-            for dataset in created_datasets
-        ],
-    )
+    finally:
+        for parsed_upload in parsed_uploads:
+            parsed_upload.cleanup()
 
 
 @router.post(
@@ -680,92 +689,109 @@ def select_excel_sheet_for_upload(
     selected_uploads = []
     total_selected_upload_size = 0
     seen_file_sheet_selections: set[tuple[str, str]] = set()
-    for selection, selected_sheet_names in selected_sheet_names_by_selection:
-        temporary_upload = validate_temporary_upload(
-            token=selection.file_token,
-            user_id=current_user.id,
-        )
-        for selected_sheet_name in selected_sheet_names:
-            file_sheet_key = (selection.file_token, selected_sheet_name)
-            if file_sheet_key in seen_file_sheet_selections:
-                raise error_response(
-                    status_code=400,
-                    detail="Each sheet can only be selected once per uploaded file",
-                )
-            seen_file_sheet_selections.add(file_sheet_key)
-            (
-                file_name,
-                file_size,
-                columns,
-                internal_columns,
-                rows,
-                sheet_name,
-            ) = process_temporary_upload_selection(
-                upload=temporary_upload,
-                sheet_name=selected_sheet_name,
-            )
-            total_selected_upload_size += file_size
-            ensure_upload_storage_available(
-                db,
+    # Each selected sheet is staged to its own normalized CSV, so the sheets are never all
+    # held as rows at once. They are removed on every exit path.
+    try:
+        for selection, selected_sheet_names in selected_sheet_names_by_selection:
+            temporary_upload = validate_temporary_upload(
+                token=selection.file_token,
                 user_id=current_user.id,
-                plan_capabilities=plan_capabilities,
-                upload_size_bytes=total_selected_upload_size,
             )
-            selected_uploads.append(
-                {
-                    "file_name": file_name,
-                    "display_file_name": _build_uploaded_file_name(file_name, sheet_name),
-                    "file_size": file_size,
-                    "columns": columns,
-                    "internal_columns": internal_columns,
-                    "rows": rows,
-                    "sheet_name": sheet_name,
-                }
+            for selected_sheet_name in selected_sheet_names:
+                file_sheet_key = (selection.file_token, selected_sheet_name)
+                if file_sheet_key in seen_file_sheet_selections:
+                    raise error_response(
+                        status_code=400,
+                        detail="Each sheet can only be selected once per uploaded file",
+                    )
+                seen_file_sheet_selections.add(file_sheet_key)
+                staged_path = new_staged_csv_path()
+                try:
+                    (
+                        file_name,
+                        file_size,
+                        columns,
+                        internal_columns,
+                        total_rows,
+                        sample_rows,
+                        sheet_name,
+                    ) = process_temporary_upload_selection(
+                        upload=temporary_upload,
+                        sheet_name=selected_sheet_name,
+                        dest_path=staged_path,
+                    )
+                except Exception:
+                    staged_path.unlink(missing_ok=True)
+                    raise
+                selected_uploads.append(
+                    {
+                        "file_name": file_name,
+                        "display_file_name": _build_uploaded_file_name(file_name, sheet_name),
+                        "file_size": file_size,
+                        "columns": columns,
+                        "internal_columns": internal_columns,
+                        "staged_path": staged_path,
+                        "total_rows": total_rows,
+                        "sample_rows": sample_rows,
+                        "sheet_name": sheet_name,
+                    }
+                )
+                total_selected_upload_size += file_size
+                ensure_upload_storage_available(
+                    db,
+                    user_id=current_user.id,
+                    plan_capabilities=plan_capabilities,
+                    upload_size_bytes=total_selected_upload_size,
+                )
+
+        created_datasets = []
+        for selected_upload in selected_uploads:
+            dataset = create_uploaded_dataset(
+                db,
+                dataset_name=_build_uploaded_dataset_name(
+                    selected_upload["file_name"],
+                    selected_upload["sheet_name"],
+                ),
+                file_name=selected_upload["display_file_name"],
+                sheet_name=selected_upload["sheet_name"],
+                file_size=selected_upload["file_size"],
+                columns=selected_upload["columns"],
+                internal_columns=selected_upload["internal_columns"],
+                source_path=selected_upload["staged_path"],
+                total_rows=selected_upload["total_rows"],
+                sample_rows=selected_upload["sample_rows"],
+                user_id=current_user.id,
             )
+            set_dataset_retention_expiry(
+                db=db,
+                dataset=dataset,
+                user_id=current_user.id,
+            )
+            created_datasets.append(dataset)
 
-    created_datasets = []
-    for selected_upload in selected_uploads:
-        dataset = create_uploaded_dataset(
-            db,
-            dataset_name=_build_uploaded_dataset_name(
-                selected_upload["file_name"],
-                selected_upload["sheet_name"],
-            ),
-            file_name=selected_upload["display_file_name"],
-            sheet_name=selected_upload["sheet_name"],
-            file_size=selected_upload["file_size"],
-            columns=selected_upload["columns"],
-            internal_columns=selected_upload["internal_columns"],
-            rows=selected_upload["rows"],
-            user_id=current_user.id,
+        db.flush()
+        for dataset in created_datasets:
+            record_upload_storage_usage(db, dataset=dataset, user_id=current_user.id)
+
+        db.commit()
+
+        for dataset in created_datasets:
+            db.refresh(dataset)
+
+        for file_token in {selection.file_token for selection in payload}:
+            delete_temporary_upload(file_token)
+
+        return success_response(
+            "Uploaded datasets created successfully",
+            status_code=201,
+            data=[
+                _serialize_uploaded_dataset(dataset)
+                for dataset in created_datasets
+            ],
         )
-        set_dataset_retention_expiry(
-            db=db,
-            dataset=dataset,
-            user_id=current_user.id,
-        )
-        created_datasets.append(dataset)
-
-    db.flush()
-    for dataset in created_datasets:
-        record_upload_storage_usage(db, dataset=dataset, user_id=current_user.id)
-
-    db.commit()
-
-    for dataset in created_datasets:
-        db.refresh(dataset)
-
-    for file_token in {selection.file_token for selection in payload}:
-        delete_temporary_upload(file_token)
-
-    return success_response(
-        "Uploaded datasets created successfully",
-        status_code=201,
-        data=[
-            _serialize_uploaded_dataset(dataset)
-            for dataset in created_datasets
-        ],
-    )
+    finally:
+        for selected_upload in selected_uploads:
+            selected_upload["staged_path"].unlink(missing_ok=True)
 
 
 @router.post("/merge/suggestions", response_model=MergeSuggestionsSuccessResponse)

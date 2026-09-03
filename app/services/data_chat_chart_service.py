@@ -10,6 +10,9 @@ import pandas as pd
 
 CHART_FORMAT_VERSION = 1
 
+# Cap for the AI summary headline carried on every chart spec.
+SUMMARY_TITLE_MAX_CHARS = 80
+
 CHART_SELECTION_GUIDE = """
 - smooth_line: time-series trend with one or more numeric metrics; use when the x-axis is time-like.
 - area: time-series where the filled area should emphasise the total scale over time.
@@ -215,6 +218,32 @@ def normalize_chart_spec(
     )
 
 
+def _truncate_title(title: str) -> str:
+    """Trim to the length cap on a word boundary so a title never ends mid-word."""
+    if len(title) <= SUMMARY_TITLE_MAX_CHARS:
+        return title
+    head = title[:SUMMARY_TITLE_MAX_CHARS]
+    if " " in head:
+        head = head.rsplit(" ", 1)[0]
+    return head.rstrip(" ,;:-")
+
+
+def _clean_summary_title(value: Any) -> str:
+    """Normalize the model's headline: collapse whitespace, drop wrapping quotes and end stops."""
+    title = " ".join(str(value or "").split()).strip().strip("\"'").strip()
+    title = title.rstrip(" .")
+    return _truncate_title(title)
+
+
+def _fallback_summary_title(question: str) -> str:
+    """Headline built from the question alone, for when the summariser gave none or failed."""
+    cleaned = " ".join(str(question or "").split()).strip(" ?.!")
+    if not cleaned:
+        return "Query Result"
+    cleaned = _truncate_title(cleaned)
+    return cleaned[0].upper() + cleaned[1:]
+
+
 def _base_chart_spec(
     *,
     chart_type: str,
@@ -224,12 +253,18 @@ def _base_chart_spec(
     raw_chart: dict[str, Any],
 ) -> dict[str, Any]:
     title = str(raw_chart.get("title") or question or "Chart").strip()
+    # AI headline for the query and its result. The fallback keeps the field populated when
+    # the summariser omits it or the whole summarise call failed, so it is never null.
+    summary_title = _clean_summary_title(raw_chart.get("summary_title")) or _fallback_summary_title(
+        question
+    )
     mapping = _resolve_mapping(chart_type, columns, rows, raw_chart)
     options = _default_options(chart_type, rows, mapping, raw_chart)
     return {
         "format_version": CHART_FORMAT_VERSION,
         "type": chart_type,
         "title": title,
+        "summary_title": summary_title,
         "mapping": mapping,
         "options": options,
         "payload": {},
