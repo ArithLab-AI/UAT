@@ -16,10 +16,12 @@ from app.routes.test_llm_route import router as test_llm_router
 from app.routes.token_usage_route import router as token_usage_router
 from app.routes.data_chat_route import router as data_chat_router
 from app.routes.basic_analysis_route import router as basic_analysis_router
+from app.routes.dashboard_route import router as dashboard_router
 from app.db.database import engine, Base, SessionLocal
 from app.config.config import settings
 from app.utils.auth_schema_setup import ensure_auth_schema
 from app.utils.csv_dataset_setup import ensure_csv_dataset_schema
+from app.utils.dashboard_schema_setup import ensure_dashboard_schema
 from app.utils.file_upload_schema_setup import ensure_file_upload_schema
 from app.utils.object_storage import get_object_storage_service
 from app.utils.responses import (
@@ -63,6 +65,7 @@ app.include_router(test_llm_router)
 app.include_router(token_usage_router)
 app.include_router(data_chat_router)
 app.include_router(basic_analysis_router)
+app.include_router(dashboard_router)
 
 @app.exception_handler(RequestValidationError)
 async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -96,6 +99,7 @@ def startup_event():
     Base.metadata.create_all(bind=engine)
     ensure_auth_schema(engine)
     ensure_csv_dataset_schema(engine)
+    ensure_dashboard_schema(engine)
     ensure_subscription_schema(engine)
     ensure_file_upload_schema(engine)
     ensure_ai_cleaning_schema(engine)
