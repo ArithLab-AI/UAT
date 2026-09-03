@@ -10,6 +10,7 @@ from app.schemas.data_chat_schema import DataChatQueryRequest
 from app.services.data_chat_service import (
     DEFAULT_SUGGESTED_QUESTIONS,
     delete_session,
+    get_session_chart_specs,
     get_session_messages,
     get_suggested_questions,
     list_sessions,
@@ -104,3 +105,14 @@ def get_messages(
 ):
     data = get_session_messages(db, current_user, session_id)
     return success_response("Messages fetched", data=data)
+
+
+@router.get("/sessions/{session_id}/chart-specs")
+def get_chart_specs(
+    session_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Same session as /messages, but the response carries only each message's chart_spec."""
+    data = get_session_chart_specs(db, current_user, session_id)
+    return success_response("Chart specs fetched", data=data)
