@@ -705,6 +705,36 @@ def get_session_messages(
 
 
 
+def get_session_chart_specs(
+    db: Session, current_user: User, session_id: str
+) -> list[dict[str, Any]]:
+    session = (
+        db.query(DataChatSession)
+        .filter(
+            DataChatSession.id == session_id,
+            DataChatSession.created_by_user_id == current_user.id,
+        )
+        .first()
+    )
+    if session is None:
+        raise error_response(status_code=404, detail="Chat session not found")
+
+    messages = (
+        db.query(DataChatMessage)
+        .filter(DataChatMessage.session_id == session_id)
+        .order_by(DataChatMessage.created_at.asc())
+        .all()
+    )
+    return [
+        {
+            "message_id": m.id,
+            "chart_spec": m.chart_spec,
+        }
+        for m in messages
+        if m.chart_spec
+    ]
+
+
 def delete_session(db: Session, current_user: User, session_id: str) -> dict[str, Any]:
     """Delete one chat session and every message in it.
 
