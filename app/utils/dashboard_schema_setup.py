@@ -1,7 +1,7 @@
 from sqlalchemy import inspect, text
 
 from app.db.database import Base
-from app.models.dashboard_models import SavedChart
+from app.models.dashboard_models import Dashboard, SavedChart
 
 
 def ensure_dashboard_schema(engine) -> None:
@@ -24,3 +24,13 @@ def ensure_dashboard_schema(engine) -> None:
                     "WHERE request_fingerprint IS NULL"
                 )
             )
+
+
+def ensure_dashboard_builder_schema(engine) -> None:
+    """Create the Dashboard Builder ``dashboards`` table if missing.
+
+    Separate from ``ensure_dashboard_schema`` (which owns ``saved_charts``) so
+    each table's setup evolves independently; both are idempotent, `checkfirst`
+    creates, run every startup like the other ``ensure_*_schema`` helpers.
+    """
+    Dashboard.__table__.create(bind=engine, checkfirst=True)
