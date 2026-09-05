@@ -92,3 +92,69 @@ SavedChartDetailSuccessResponse = SuccessResponse[SavedChartDetailResponse]
 SavedChartListSuccessResponse = SuccessResponse[list[SavedChartSummaryResponse]]
 DashboardDatasetListSuccessResponse = SuccessResponse[list[DashboardDatasetResponse]]
 DashboardOverviewSuccessResponse = SuccessResponse[list[DashboardDatasetChartsResponse]]
+
+
+class DashboardSourceDataset(BaseModel):
+    """The dataset a Dashboard Builder board was built from."""
+
+    id: int = Field(..., ge=1)
+    type: Literal["uploaded", "merged"]
+    name: Optional[str] = None
+    rows: Optional[int] = None
+    columns: Optional[list[str]] = None
+
+
+class CreateDashboardRequest(BaseModel):
+    """A full Dashboard Builder board, saved (or re-saved) as one unit.
+
+    ``widgets``, ``layout_engine`` and ``render_state`` are frontend-owned and
+    stored as-is — nothing here is recomputed, matching how
+    ``POST /basic-analysis/charts`` treats its ``chart`` payload. Re-saving with
+    the same ``client_generated_id`` updates this board in place.
+    """
+
+    schema_version: int = 1
+    client_generated_id: str = Field(..., min_length=1, max_length=100)
+    name: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = Field(default=None, max_length=1000)
+
+    source_dataset: DashboardSourceDataset
+
+    layout_engine: Optional[dict[str, Any]] = None
+    widgets: list[dict[str, Any]] = Field(default_factory=list)
+    render_state: Optional[dict[str, Any]] = None
+    selected_widget_id: Optional[str] = None
+
+    created_from: Optional[str] = Field(default=None, max_length=50)
+    saved_at: Optional[datetime] = None
+
+
+class DashboardSummaryResponse(BaseModel):
+    """Lightweight row for the "Your Dashboards" list."""
+
+    id: str
+    client_generated_id: str
+    name: str
+    description: Optional[str] = None
+    source_dataset_id: int
+    source_type: Literal["uploaded", "merged"]
+    source_dataset_name: Optional[str] = None
+    widget_count: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class DashboardDetailResponse(DashboardSummaryResponse):
+    """Full board the Dashboard Builder needs to reopen it."""
+
+    schema_version: int
+    source_dataset_columns: list[str] = Field(default_factory=list)
+    layout_engine: Optional[dict[str, Any]] = None
+    widgets: list[dict[str, Any]] = Field(default_factory=list)
+    render_state: Optional[dict[str, Any]] = None
+    selected_widget_id: Optional[str] = None
+    created_from: Optional[str] = None
+
+
+DashboardSuccessResponse = SuccessResponse[DashboardDetailResponse]
+DashboardListSuccessResponse = SuccessResponse[list[DashboardSummaryResponse]]

@@ -21,7 +21,7 @@ from app.db.database import engine, Base, SessionLocal
 from app.config.config import settings
 from app.utils.auth_schema_setup import ensure_auth_schema
 from app.utils.csv_dataset_setup import ensure_csv_dataset_schema
-from app.utils.dashboard_schema_setup import ensure_dashboard_schema
+from app.utils.dashboard_schema_setup import ensure_dashboard_schema, ensure_dashboard_builder_schema
 from app.utils.file_upload_schema_setup import ensure_file_upload_schema
 from app.utils.object_storage import get_object_storage_service
 from app.utils.responses import (
@@ -100,6 +100,7 @@ def startup_event():
     ensure_auth_schema(engine)
     ensure_csv_dataset_schema(engine)
     ensure_dashboard_schema(engine)
+    ensure_dashboard_builder_schema(engine)
     ensure_subscription_schema(engine)
     ensure_file_upload_schema(engine)
     ensure_ai_cleaning_schema(engine)

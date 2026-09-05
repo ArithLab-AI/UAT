@@ -24,8 +24,8 @@ from app.enum.analysis_type_enum import AnalysisType
 from app.enum.chart_type_enum import ChartType
 from app.models.auth_models import User
 from app.models.csv_dataset_models import CsvMergedDataset, CsvUploadedDataset
-from app.models.dashboard_models import SavedChart
-from app.schemas.dashboard_schema import SaveChartRequest
+from app.models.dashboard_models import Dashboard, SavedChart
+from app.schemas.dashboard_schema import CreateDashboardRequest, SaveChartRequest
 from app.utils.responses import error_response
 
 
@@ -427,3 +427,123 @@ def delete_saved_chart(db: Session, *, current_user: User, chart_id: str) -> Non
         raise error_response(status_code=404, detail="Saved chart not found")
     db.delete(chart)
     db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Dashboard Builder boards (a named grid of widgets), distinct from the single
+# SavedChart rows above. Widgets/layout/render_state are frontend-owned JSON,
+# stored and served back exactly as sent.
+# ---------------------------------------------------------------------------
+
+
+def _serialize_dashboard_summary(dashboard: Dashboard) -> dict[str, Any]:
+    return {
+        "id": dashboard.id,
+        "client_generated_id": dashboard.client_generated_id,
+        "name": dashboard.name,
+        "description": dashboard.description,
+        "source_dataset_id": dashboard.source_dataset_id,
+        "source_type": dashboard.source_type,
+        "source_dataset_name": dashboard.source_dataset_name,
+        "widget_count": len(dashboard.widgets or []),
+        "created_at": dashboard.created_at,
+        "updated_at": dashboard.updated_at,
+    }
+
+
+def _serialize_dashboard_detail(dashboard: Dashboard) -> dict[str, Any]:
+    return {
+        **_serialize_dashboard_summary(dashboard),
+        "schema_version": dashboard.schema_version,
+        "source_dataset_columns": dashboard.source_dataset_columns or [],
+        "layout_engine": dashboard.layout_engine,
+        "widgets": dashboard.widgets or [],
+        "render_state": dashboard.render_state,
+        "selected_widget_id": dashboard.selected_widget_id,
+        "created_from": dashboard.created_from,
+    }
+
+
+def save_dashboard(
+    db: Session, *, current_user: User, request: CreateDashboardRequest
+) -> dict[str, Any]:
+    """Create a Dashboard Builder board, or update it in place when
+    ``client_generated_id`` matches one this user already saved.
+
+    Mirrors ``save_chart``: the dataset is confirmed to exist and belong to the
+    caller (name taken from the DB, not trusted from the client); everything
+    else — widgets, layout, colors, UI state — is stored exactly as sent.
+    """
+    live_names = _existing_dataset_names(db, current_user=current_user)
+    dataset_meta = live_names.get(
+        (request.source_dataset.type, request.source_dataset.id)
+    )
+    if dataset_meta is None:
+        raise error_response(
+            status_code=404,
+            detail=f"{request.source_dataset.type.capitalize()} dataset not found",
+        )
+
+    values = {
+        "schema_version": request.schema_version,
+        "name": request.name.strip()[:255],
+        "description": request.description,
+        "source_dataset_id": request.source_dataset.id,
+        "source_type": request.source_dataset.type,
+        "source_dataset_name": dataset_meta["dataset_name"],
+        "source_dataset_columns": request.source_dataset.columns or [],
+        "layout_engine": request.layout_engine,
+        "widgets": request.widgets or [],
+        "render_state": request.render_state,
+        "selected_widget_id": request.selected_widget_id,
+        "created_from": request.created_from,
+        "client_saved_at": request.saved_at,
+    }
+
+    dashboard = (
+        db.query(Dashboard)
+        .filter(
+            Dashboard.created_by_user_id == current_user.id,
+            Dashboard.client_generated_id == request.client_generated_id,
+        )
+        .first()
+    )
+    if dashboard is None:
+        dashboard = Dashboard(
+            created_by_user_id=current_user.id,
+            client_generated_id=request.client_generated_id,
+            **values,
+        )
+        db.add(dashboard)
+    else:
+        for key, value in values.items():
+            setattr(dashboard, key, value)
+
+    db.commit()
+    db.refresh(dashboard)
+    return _serialize_dashboard_detail(dashboard)
+
+
+def list_dashboards(db: Session, *, current_user: User) -> list[dict[str, Any]]:
+    """Every board the user has saved, most recently updated first."""
+    dashboards = (
+        db.query(Dashboard)
+        .filter(Dashboard.created_by_user_id == current_user.id)
+        .order_by(Dashboard.updated_at.desc())
+        .all()
+    )
+    return [_serialize_dashboard_summary(dashboard) for dashboard in dashboards]
+
+
+def get_dashboard(db: Session, *, current_user: User, dashboard_id: str) -> dict[str, Any]:
+    dashboard = (
+        db.query(Dashboard)
+        .filter(
+            Dashboard.id == dashboard_id,
+            Dashboard.created_by_user_id == current_user.id,
+        )
+        .first()
+    )
+    if dashboard is None:
+        raise error_response(status_code=404, detail="Dashboard not found")
+    return _serialize_dashboard_detail(dashboard)

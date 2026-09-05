@@ -9,8 +9,11 @@ from app.db.database import get_db
 from app.models.auth_models import User
 from app.schemas.common_schema import MessageSuccessResponse
 from app.schemas.dashboard_schema import (
+    CreateDashboardRequest,
     DashboardDatasetListSuccessResponse,
+    DashboardListSuccessResponse,
     DashboardOverviewSuccessResponse,
+    DashboardSuccessResponse,
     SaveChartRequest,
     SaveChartSuccessResponse,
     SavedChartDetailSuccessResponse,
@@ -21,11 +24,14 @@ from app.schemas.dashboard_schema import (
 # renames and deletes.
 from app.services.dashboard_service import (
     delete_saved_chart,
+    get_dashboard,
     get_dashboard_overview,
     get_saved_chart,
     list_dashboard_datasets,
+    list_dashboards,
     list_saved_charts,
     refresh_saved_chart,
+    save_dashboard,
     update_saved_chart,
 )
 from app.utils.responses import success_response
@@ -160,3 +166,67 @@ def delete_saved_chart_route(
     delete_saved_chart(db, current_user=current_user, chart_id=chart_id)
     logger.info("Deleted dashboard chart id=%s for user_id=%s", chart_id, current_user.id)
     return success_response("Saved chart deleted successfully", data=None)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard Builder boards — a named grid of widgets (chart + layout + style),
+# separate from the single-chart rows above. "/create" and "/list" are
+# registered ahead of "/{dashboard_id}" so neither is swallowed by it.
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/create",
+    response_model=DashboardSuccessResponse,
+    response_model_exclude_none=True,
+    status_code=201,
+)
+def create_dashboard_route(
+    payload: CreateDashboardRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Save a Dashboard Builder board — its widgets, layout and per-widget style.
+
+    Stored as-is, same as ``POST /basic-analysis/charts`` treats ``chart``.
+    Re-posting with the same ``client_generated_id`` updates that board in
+    place (e.g. the user resized/recolored a widget and hit Save again)
+    instead of creating a duplicate.
+    """
+    data = save_dashboard(db, current_user=current_user, request=payload)
+    logger.info(
+        "Saved dashboard id=%s name=%s for user_id=%s",
+        data["id"],
+        data["name"],
+        current_user.id,
+    )
+    return success_response("Dashboard saved successfully", data=data)
+
+
+@router.get(
+    "/list",
+    response_model=DashboardListSuccessResponse,
+    response_model_exclude_none=True,
+)
+def list_dashboards_route(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Every board the user has saved — the "Your Dashboards" list — newest-updated first."""
+    data = list_dashboards(db, current_user=current_user)
+    return success_response("Dashboards fetched successfully", data=data)
+
+
+@router.get(
+    "/{dashboard_id}",
+    response_model=DashboardSuccessResponse,
+    response_model_exclude_none=True,
+)
+def get_dashboard_route(
+    dashboard_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Full board — widgets, layout, colors, UI state — for the builder to reopen."""
+    data = get_dashboard(db, current_user=current_user, dashboard_id=dashboard_id)
+    return success_response("Dashboard fetched successfully", data=data)
