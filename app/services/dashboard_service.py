@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+from math import ceil
 from typing import Any, Optional
 
 from fastapi import HTTPException
 from pydantic import ValidationError
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.enum.analysis_type_enum import AnalysisType
@@ -25,8 +27,15 @@ from app.enum.chart_type_enum import ChartType
 from app.models.auth_models import User
 from app.models.csv_dataset_models import CsvMergedDataset, CsvUploadedDataset
 from app.models.dashboard_models import Dashboard, SavedChart
-from app.schemas.dashboard_schema import CreateDashboardRequest, SaveChartRequest
+from app.schemas.dashboard_schema import (
+    CreateDashboardRequest,
+    SaveChartRequest,
+    UpdateDashboardRequest,
+)
 from app.utils.responses import error_response
+
+DEFAULT_DASHBOARD_PAGE_SIZE = 10
+MAX_DASHBOARD_PAGE_SIZE = 100
 
 
 def _request_fingerprint(request: SaveChartRequest) -> str:
@@ -524,18 +533,54 @@ def save_dashboard(
     return _serialize_dashboard_detail(dashboard)
 
 
-def list_dashboards(db: Session, *, current_user: User) -> list[dict[str, Any]]:
-    """Every board the user has saved, most recently updated first."""
+def _dashboard_pagination_meta(total: int, page: int, page_size: int) -> dict[str, int]:
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": ceil(total / page_size) if total else 0,
+    }
+
+
+def list_dashboards(
+    db: Session,
+    *,
+    current_user: User,
+    search: Optional[str] = None,
+    page: int = 1,
+    page_size: int = DEFAULT_DASHBOARD_PAGE_SIZE,
+) -> dict[str, Any]:
+    """Boards the user has saved, most recently updated first.
+
+    ``search`` matches (case-insensitive, substring) against name and
+    description. Returns the page plus ``{page, page_size, total, total_pages}``.
+    """
+    query = db.query(Dashboard).filter(Dashboard.created_by_user_id == current_user.id)
+
+    search_term = (search or "").strip()
+    if search_term:
+        pattern = f"%{search_term}%"
+        query = query.filter(
+            or_(
+                Dashboard.name.ilike(pattern),
+                Dashboard.description.ilike(pattern),
+            )
+        )
+
+    total = query.count()
     dashboards = (
-        db.query(Dashboard)
-        .filter(Dashboard.created_by_user_id == current_user.id)
-        .order_by(Dashboard.updated_at.desc())
+        query.order_by(Dashboard.updated_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
         .all()
     )
-    return [_serialize_dashboard_summary(dashboard) for dashboard in dashboards]
+    return {
+        "dashboards": [_serialize_dashboard_summary(dashboard) for dashboard in dashboards],
+        "pagination": _dashboard_pagination_meta(total, page, page_size),
+    }
 
 
-def get_dashboard(db: Session, *, current_user: User, dashboard_id: str) -> dict[str, Any]:
+def _get_owned_dashboard(db: Session, *, current_user: User, dashboard_id: str) -> Dashboard:
     dashboard = (
         db.query(Dashboard)
         .filter(
@@ -546,4 +591,74 @@ def get_dashboard(db: Session, *, current_user: User, dashboard_id: str) -> dict
     )
     if dashboard is None:
         raise error_response(status_code=404, detail="Dashboard not found")
+    return dashboard
+
+
+def get_dashboard(db: Session, *, current_user: User, dashboard_id: str) -> dict[str, Any]:
+    dashboard = _get_owned_dashboard(db, current_user=current_user, dashboard_id=dashboard_id)
     return _serialize_dashboard_detail(dashboard)
+
+
+def update_dashboard(
+    db: Session,
+    *,
+    current_user: User,
+    dashboard_id: str,
+    request: UpdateDashboardRequest,
+) -> dict[str, Any]:
+    """Partial update of one board by id — only the fields sent are changed.
+
+    ``client_generated_id`` is immutable. If ``source_dataset`` is sent it is
+    re-checked for ownership and the stored name is refreshed from the DB, same
+    as ``save_dashboard``.
+    """
+    dashboard = _get_owned_dashboard(db, current_user=current_user, dashboard_id=dashboard_id)
+
+    provided = request.model_dump(exclude_unset=True)
+    if not provided:
+        raise error_response(status_code=400, detail="No fields to update")
+
+    if "source_dataset" in provided and request.source_dataset is not None:
+        live_names = _existing_dataset_names(db, current_user=current_user)
+        dataset_meta = live_names.get(
+            (request.source_dataset.type, request.source_dataset.id)
+        )
+        if dataset_meta is None:
+            raise error_response(
+                status_code=404,
+                detail=f"{request.source_dataset.type.capitalize()} dataset not found",
+            )
+        dashboard.source_dataset_id = request.source_dataset.id
+        dashboard.source_type = request.source_dataset.type
+        dashboard.source_dataset_name = dataset_meta["dataset_name"]
+        if request.source_dataset.columns is not None:
+            dashboard.source_dataset_columns = request.source_dataset.columns
+
+    field_map = {
+        "schema_version": "schema_version",
+        "name": "name",
+        "description": "description",
+        "layout_engine": "layout_engine",
+        "widgets": "widgets",
+        "render_state": "render_state",
+        "selected_widget_id": "selected_widget_id",
+        "created_from": "created_from",
+        "saved_at": "client_saved_at",
+    }
+    for request_field, column in field_map.items():
+        if request_field not in provided:
+            continue
+        value = getattr(request, request_field)
+        if request_field == "name" and value is not None:
+            value = value.strip()[:255]
+        setattr(dashboard, column, value)
+
+    db.commit()
+    db.refresh(dashboard)
+    return _serialize_dashboard_detail(dashboard)
+
+
+def delete_dashboard(db: Session, *, current_user: User, dashboard_id: str) -> None:
+    dashboard = _get_owned_dashboard(db, current_user=current_user, dashboard_id=dashboard_id)
+    db.delete(dashboard)
+    db.commit()

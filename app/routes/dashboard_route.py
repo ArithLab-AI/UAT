@@ -18,11 +18,15 @@ from app.schemas.dashboard_schema import (
     SaveChartSuccessResponse,
     SavedChartDetailSuccessResponse,
     SavedChartListSuccessResponse,
+    UpdateDashboardRequest,
 )
 # ``POST /dashboard/charts`` moved to ``POST /basic-analysis/charts`` — chart
 # creation now lives with the analysis flow. This router only reads, refreshes,
 # renames and deletes.
 from app.services.dashboard_service import (
+    DEFAULT_DASHBOARD_PAGE_SIZE,
+    MAX_DASHBOARD_PAGE_SIZE,
+    delete_dashboard,
     delete_saved_chart,
     get_dashboard,
     get_dashboard_overview,
@@ -32,6 +36,7 @@ from app.services.dashboard_service import (
     list_saved_charts,
     refresh_saved_chart,
     save_dashboard,
+    update_dashboard,
     update_saved_chart,
 )
 from app.utils.responses import success_response
@@ -209,11 +214,30 @@ def create_dashboard_route(
     response_model_exclude_none=True,
 )
 def list_dashboards_route(
+    search: Optional[str] = Query(
+        default=None,
+        description="Case-insensitive substring match on dashboard name and description.",
+    ),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(
+        default=DEFAULT_DASHBOARD_PAGE_SIZE,
+        ge=1,
+        le=MAX_DASHBOARD_PAGE_SIZE,
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Every board the user has saved — the "Your Dashboards" list — newest-updated first."""
-    data = list_dashboards(db, current_user=current_user)
+    """The "Your Dashboards" list — newest-updated first, searchable and paginated.
+
+    Returns ``{dashboards: [...], pagination: {page, page_size, total, total_pages}}``.
+    """
+    data = list_dashboards(
+        db,
+        current_user=current_user,
+        search=search,
+        page=page,
+        page_size=page_size,
+    )
     return success_response("Dashboards fetched successfully", data=data)
 
 
@@ -230,3 +254,42 @@ def get_dashboard_route(
     """Full board — widgets, layout, colors, UI state — for the builder to reopen."""
     data = get_dashboard(db, current_user=current_user, dashboard_id=dashboard_id)
     return success_response("Dashboard fetched successfully", data=data)
+
+
+@router.put(
+    "/{dashboard_id}",
+    response_model=DashboardSuccessResponse,
+    response_model_exclude_none=True,
+)
+def update_dashboard_route(
+    dashboard_id: str,
+    payload: UpdateDashboardRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Partial update of a board by id — only the fields sent are changed.
+
+    Use for renaming from the list, or persisting widget resize/recolor edits to
+    a board already saved server-side. ``client_generated_id`` cannot change.
+    """
+    data = update_dashboard(
+        db, current_user=current_user, dashboard_id=dashboard_id, request=payload
+    )
+    logger.info("Updated dashboard id=%s for user_id=%s", dashboard_id, current_user.id)
+    return success_response("Dashboard updated successfully", data=data)
+
+
+@router.delete(
+    "/{dashboard_id}",
+    response_model=MessageSuccessResponse,
+    response_model_exclude_none=True,
+)
+def delete_dashboard_route(
+    dashboard_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete one of the user's boards."""
+    delete_dashboard(db, current_user=current_user, dashboard_id=dashboard_id)
+    logger.info("Deleted dashboard id=%s for user_id=%s", dashboard_id, current_user.id)
+    return success_response("Dashboard deleted successfully", data=None)

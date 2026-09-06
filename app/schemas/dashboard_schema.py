@@ -129,6 +129,28 @@ class CreateDashboardRequest(BaseModel):
     saved_at: Optional[datetime] = None
 
 
+class UpdateDashboardRequest(BaseModel):
+    """Partial update of an existing board by id (``PUT /dashboard/{id}``).
+
+    Only the fields actually sent are changed; ``client_generated_id`` is
+    immutable and cannot be updated here.
+    """
+
+    schema_version: Optional[int] = None
+    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    description: Optional[str] = Field(default=None, max_length=1000)
+
+    source_dataset: Optional[DashboardSourceDataset] = None
+
+    layout_engine: Optional[dict[str, Any]] = None
+    widgets: Optional[list[dict[str, Any]]] = None
+    render_state: Optional[dict[str, Any]] = None
+    selected_widget_id: Optional[str] = None
+
+    created_from: Optional[str] = Field(default=None, max_length=50)
+    saved_at: Optional[datetime] = None
+
+
 class DashboardSummaryResponse(BaseModel):
     """Lightweight row for the "Your Dashboards" list."""
 
@@ -156,5 +178,17 @@ class DashboardDetailResponse(DashboardSummaryResponse):
     created_from: Optional[str] = None
 
 
+class DashboardPaginationMeta(BaseModel):
+    page: int
+    page_size: int
+    total: int
+    total_pages: int
+
+
+class DashboardListResponse(BaseModel):
+    dashboards: list[DashboardSummaryResponse] = Field(default_factory=list)
+    pagination: DashboardPaginationMeta
+
+
 DashboardSuccessResponse = SuccessResponse[DashboardDetailResponse]
-DashboardListSuccessResponse = SuccessResponse[list[DashboardSummaryResponse]]
+DashboardListSuccessResponse = SuccessResponse[DashboardListResponse]
