@@ -308,6 +308,44 @@ def _stream_csv_to_normalized_file(
         ) from exc
 
 
+def parse_csv_source_file(
+    *,
+    file_name: str,
+    source_path: Path,
+    file_size: int | None = None,
+    empty_detail: str | None = None,
+) -> ParsedUpload:
+    """Parse a trusted CSV file already staged locally into the normal upload format."""
+    effective_file_size = file_size if file_size is not None else source_path.stat().st_size
+    if not effective_file_size:
+        raise error_response(status_code=400, detail=empty_detail or f"{file_name} is empty")
+
+    staged_path = new_staged_csv_path()
+    try:
+        columns, internal_columns, total_rows, sample_rows = _stream_csv_to_normalized_file(
+            file_name,
+            source_path,
+            staged_path,
+        )
+        if not internal_columns or not total_rows:
+            raise error_response(
+                status_code=400,
+                detail=empty_detail or f"{file_name} does not contain data rows",
+            )
+        return ParsedUpload(
+            file_name=file_name,
+            file_size=effective_file_size,
+            columns=columns,
+            internal_columns=internal_columns,
+            total_rows=total_rows,
+            sample_rows=sample_rows,
+            staged_path=staged_path,
+        )
+    except Exception:
+        staged_path.unlink(missing_ok=True)
+        raise
+
+
 def _fetch_dataset_rows(
     *,
     table_name: str,

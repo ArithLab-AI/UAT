@@ -27,3 +27,16 @@ def ensure_auth_schema(engine) -> None:
                     "ON users (google_subject)"
                 )
             )
+
+    if not inspector.has_table("otps"):
+        return
+
+    otp_columns = {column["name"] for column in inspector.get_columns("otps")}
+    if "purpose" not in otp_columns:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "ALTER TABLE otps "
+                    "ADD COLUMN purpose VARCHAR(50) NOT NULL DEFAULT 'general'"
+                )
+            )

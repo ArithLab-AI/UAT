@@ -29,6 +29,9 @@ class OTP(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, index=True)
     otp_code = Column(String, nullable=False)
+    # OTPs are scoped so password-reset and standard login codes cannot be used
+    # to complete the Enterprise SSO flow.
+    purpose = Column(String(50), nullable=False, default="general", server_default="general")
     expires_at = Column(DateTime, nullable=False)
     is_used = Column(Boolean, default=False)
 

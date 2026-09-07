@@ -108,6 +108,17 @@ class SelectExcelSheetRequest(BaseModel):
         }
 
 
+class GoogleSheetImportRequest(BaseModel):
+    url: str = Field(..., min_length=1, max_length=2_048)
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "url": "https://docs.google.com/spreadsheets/d/1abcDEFghiJKlmnOPq/edit#gid=0",
+            }
+        }
+
+
 class CsvMergedDatasetResponse(CsvDatasetSummaryResponse):
     file_name: str
     source_datasets: list[CsvMergedSourceDatasetResponse]
@@ -249,6 +260,17 @@ class MergeCsvDatasetsRequest(MultiSourceJoinRequest):
                         "right_column": "Email",
                     }
                 ],
+            }
+        }
+
+
+class RenameDatasetRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "name": "Customer Orders September",
             }
         }
 

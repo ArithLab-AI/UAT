@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: Optional[int] = None
     REFRESH_TOKEN_EXPIRE_DAYS: Optional[int] = None
     OTP_EXPIRE_MINUTES: Optional[int] = None
+    GOOGLE_SHEETS_FETCH_TIMEOUT_SECONDS: float = 20.0
     # OAuth 2.0 web-client ID used to validate Google ID tokens submitted by the
     # browser. Keep this server-side configuration separate from the client UI.
     GOOGLE_CLIENT_ID: Optional[str] = None
