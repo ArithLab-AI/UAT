@@ -15,17 +15,22 @@ from app.models.analysis_models import AnalysisSuggestion, DatasetAnalysis
 from app.models.auth_models import User
 from app.models.cleaning_models import CleaningJob
 from app.models.csv_dataset_models import CsvMergedDataset, CsvUploadedDataset
+from app.models.data_chat_models import DataChatSession
+from app.models.subscription_models import UserUploadStorageUsage
 from app.schemas.csv_dataset_schema import (
     CsvDatasetItemSuccessResponse,
     CsvDatasetListSuccessResponse,
     CsvMergedDatasetSuccessResponse,
+    CsvUploadedDatasetSuccessResponse,
     CsvUploadedDatasetListSuccessResponse,
     MergeCsvDatasetsRequest,
     MergeSuggestionsRequest,
     MergeSourceDatasetsRequest,
     MergeSuggestionsSuccessResponse,
+    GoogleSheetImportRequest,
     PreviewMergeRequest,
     PreviewMergeSuccessResponse,
+    RenameDatasetRequest,
     SelectExcelSheetRequest,
 )
 from app.schemas.common_schema import MessageSuccessResponse
@@ -37,6 +42,7 @@ from app.services.csv_service import (
     delete_merged_dataset,
     delete_uploaded_dataset,
     new_staged_csv_path,
+    parse_csv_source_file,
     ParsedUpload,
     PendingSheetSelection,
     parse_csv_upload,
@@ -53,6 +59,7 @@ from app.services.file_retention_service import (
     retention_dataset_for_user,
     set_dataset_retention_expiry,
 )
+from app.services.google_sheets_service import download_google_sheet_csv
 from app.services.subscription_service import (
     ensure_upload_storage_available,
     get_recorded_upload_count,
@@ -129,6 +136,88 @@ def _build_merged_file_name(merged_dataset) -> str:
     if name.lower().endswith(".csv"):
         return name
     return f"{name}.csv"
+
+
+def _normalize_rename_name(name: str) -> str:
+    normalized_name = " ".join(name.strip().split())
+    if not normalized_name:
+        raise error_response(status_code=400, detail="Dataset name cannot be empty")
+    if "/" in normalized_name or "\\" in normalized_name:
+        raise error_response(status_code=400, detail="Dataset name cannot contain a path")
+    return normalized_name
+
+
+def _uploaded_rename_values(dataset: CsvUploadedDataset, requested_name: str) -> tuple[str, str]:
+    """Keep an uploaded dataset's original extension and sheet label on rename."""
+    sheet_suffix = f" ({dataset.sheet_name})" if dataset.sheet_name else ""
+    requested_base = requested_name
+    if sheet_suffix and requested_base.lower().endswith(sheet_suffix.lower()):
+        requested_base = requested_base[: -len(sheet_suffix)].rstrip()
+
+    original_file_name = dataset.file_name
+    if sheet_suffix and original_file_name.lower().endswith(sheet_suffix.lower()):
+        original_file_name = original_file_name[: -len(sheet_suffix)]
+    _, extension = os.path.splitext(original_file_name)
+    if extension and requested_base.lower().endswith(extension.lower()):
+        requested_base = requested_base[: -len(extension)].rstrip()
+    if not requested_base:
+        raise error_response(status_code=400, detail="Dataset name cannot be empty")
+
+    return f"{requested_base}{sheet_suffix}", f"{requested_base}{extension}{sheet_suffix}"
+
+
+def _merged_rename_value(requested_name: str) -> str:
+    if requested_name.lower().endswith(".csv"):
+        requested_name = requested_name[:-4].rstrip()
+    if not requested_name:
+        raise error_response(status_code=400, detail="Dataset name cannot be empty")
+    return requested_name
+
+
+def _rename_dataset_references(
+    db: Session,
+    *,
+    dataset_id: int,
+    dataset_type: Literal["uploaded", "merged"],
+    user_id: int,
+    dataset_name: str,
+    file_name: str,
+    previous_file_name: str,
+) -> None:
+    """Keep display-only references in user-scoped records in sync with a rename."""
+    db.query(DatasetAnalysis).filter(
+        DatasetAnalysis.source_dataset_id == dataset_id,
+        DatasetAnalysis.source_type == dataset_type,
+        DatasetAnalysis.created_by_user_id == user_id,
+    ).update(
+        {"dataset_name": dataset_name, "file_name": file_name},
+        synchronize_session=False,
+    )
+    db.query(AICleaningJobDetail).filter(
+        AICleaningJobDetail.source_dataset_id == dataset_id,
+        AICleaningJobDetail.source_dataset_type == dataset_type,
+        AICleaningJobDetail.created_by_user_id == user_id,
+    ).update(
+        {"source_dataset_name": dataset_name, "source_file_name": file_name},
+        synchronize_session=False,
+    )
+    db.query(DataChatSession).filter(
+        DataChatSession.source_dataset_id == dataset_id,
+        DataChatSession.source_type == dataset_type,
+        DataChatSession.created_by_user_id == user_id,
+    ).update({"dataset_name": dataset_name}, synchronize_session=False)
+    # Manual cleaning jobs predate source-type/user metadata. Matching the stable dataset
+    # id together with its prior filename keeps existing cleaned data discoverable.
+    db.query(CleaningJob).filter(
+        CleaningJob.source_dataset_id == dataset_id,
+        CleaningJob.original_filename == previous_file_name,
+    ).update({"original_filename": file_name}, synchronize_session=False)
+
+    if dataset_type == "uploaded":
+        db.query(UserUploadStorageUsage).filter(
+            UserUploadStorageUsage.user_id == user_id,
+            UserUploadStorageUsage.uploaded_dataset_id == dataset_id,
+        ).update({"file_name": file_name}, synchronize_session=False)
 
 
 def _normalize_sort_timestamp(value: datetime | None) -> float:
@@ -632,6 +721,83 @@ async def upload_multiple_csv_datasets(
     finally:
         for parsed_upload in parsed_uploads:
             parsed_upload.cleanup()
+
+
+@router.post(
+    "/upload/google-sheet",
+    response_model=CsvUploadedDatasetSuccessResponse,
+    status_code=201,
+)
+def upload_google_sheet(
+    payload: GoogleSheetImportRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Import the selected public Google Sheets tab through the standard CSV workflow."""
+    plan_capabilities = get_user_plan_capabilities(db, current_user)
+    recorded_upload_count = get_recorded_upload_count(db, current_user.id)
+    max_active_datasets = plan_capabilities["max_active_datasets"]
+    if max_active_datasets is not None and recorded_upload_count + 1 > max_active_datasets:
+        raise error_response(
+            status_code=400,
+            detail=(
+                f"Your current plan allows up to {max_active_datasets} uploaded files. "
+                "You have reached your upload limit. Please upgrade your plan."
+            ),
+        )
+
+    google_export = None
+    parsed_upload = None
+    try:
+        google_export = download_google_sheet_csv(
+            sheet_url=payload.url,
+            max_file_size_bytes=plan_capabilities["max_file_size_bytes"],
+        )
+        parsed_upload = parse_csv_source_file(
+            file_name=google_export.file_name,
+            source_path=google_export.source_path,
+            file_size=google_export.file_size,
+            empty_detail="The selected Google Sheet is empty or does not contain data rows",
+        )
+        ensure_upload_storage_available(
+            db,
+            user_id=current_user.id,
+            plan_capabilities=plan_capabilities,
+            upload_size_bytes=parsed_upload.file_size,
+        )
+        dataset = create_uploaded_dataset(
+            db,
+            dataset_name=_build_uploaded_dataset_name(parsed_upload.file_name),
+            file_name=parsed_upload.file_name,
+            file_size=parsed_upload.file_size,
+            columns=parsed_upload.columns,
+            internal_columns=parsed_upload.internal_columns,
+            source_path=parsed_upload.staged_path,
+            total_rows=parsed_upload.total_rows,
+            sample_rows=parsed_upload.sample_rows,
+            user_id=current_user.id,
+        )
+        set_dataset_retention_expiry(db=db, dataset=dataset, user_id=current_user.id)
+        db.flush()
+        record_upload_storage_usage(db, dataset=dataset, user_id=current_user.id)
+        db.commit()
+        db.refresh(dataset)
+
+        logger.info(
+            "Imported Google Sheet dataset_id=%s for user_id=%s",
+            dataset.id,
+            current_user.id,
+        )
+        return success_response(
+            "Google Sheet imported successfully",
+            status_code=201,
+            data=_serialize_uploaded_dataset(dataset),
+        )
+    finally:
+        if parsed_upload is not None:
+            parsed_upload.cleanup()
+        if google_export is not None:
+            google_export.cleanup()
 
 
 @router.post(
@@ -1158,6 +1324,91 @@ def retention_csv_uploaded_dataset(
             "retention_until": dataset.retention_until,
             "retention_at": dataset.retention_at,
         },
+    )
+
+
+@router.patch(
+    "/uploaded/{dataset_id}/rename",
+    response_model=CsvUploadedDatasetSuccessResponse,
+)
+def rename_csv_uploaded_dataset(
+    dataset_id: int,
+    payload: RenameDatasetRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    dataset = (
+        db.query(CsvUploadedDataset)
+        .filter(
+            CsvUploadedDataset.id == dataset_id,
+            CsvUploadedDataset.created_by_user_id == current_user.id,
+        )
+        .first()
+    )
+    if not dataset:
+        raise error_response(status_code=404, detail="Uploaded dataset not found")
+
+    requested_name = _normalize_rename_name(payload.name)
+    previous_file_name = dataset.file_name
+    dataset.name, dataset.file_name = _uploaded_rename_values(dataset, requested_name)
+    _rename_dataset_references(
+        db,
+        dataset_id=dataset.id,
+        dataset_type="uploaded",
+        user_id=current_user.id,
+        dataset_name=dataset.name,
+        file_name=dataset.file_name,
+        previous_file_name=previous_file_name,
+    )
+    db.commit()
+    db.refresh(dataset)
+
+    logger.info("Renamed uploaded dataset_id=%s for user_id=%s", dataset_id, current_user.id)
+    return success_response(
+        "Uploaded dataset renamed successfully",
+        data=_serialize_uploaded_dataset(dataset),
+    )
+
+
+@router.patch(
+    "/merged/{dataset_id}/rename",
+    response_model=CsvMergedDatasetSuccessResponse,
+)
+def rename_csv_merged_dataset(
+    dataset_id: int,
+    payload: RenameDatasetRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    dataset = (
+        db.query(CsvMergedDataset)
+        .filter(
+            CsvMergedDataset.id == dataset_id,
+            CsvMergedDataset.created_by_user_id == current_user.id,
+        )
+        .first()
+    )
+    if not dataset:
+        raise error_response(status_code=404, detail="Merged dataset not found")
+
+    previous_file_name = _build_merged_file_name(dataset)
+    dataset.name = _merged_rename_value(_normalize_rename_name(payload.name))
+    _rename_dataset_references(
+        db,
+        dataset_id=dataset.id,
+        dataset_type="merged",
+        user_id=current_user.id,
+        dataset_name=dataset.name,
+        file_name=_build_merged_file_name(dataset),
+        previous_file_name=previous_file_name,
+    )
+    db.commit()
+    db.refresh(dataset)
+
+    logger.info("Renamed merged dataset_id=%s for user_id=%s", dataset_id, current_user.id)
+    return success_response(
+        "Merged dataset renamed successfully",
+        data=_serialize_merged_dataset(dataset),
     )
 
 
