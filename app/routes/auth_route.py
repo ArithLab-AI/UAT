@@ -64,19 +64,18 @@ def _google_username(email: str, db: Session) -> str:
     return candidate
 
 
-def _get_active_enterprise_user(db: Session, email: str) -> auth_models.User | None:
-    """Return the user when their email has an active Enterprise subscription."""
+def _get_enterprise_user(db: Session, email: str) -> auth_models.User:
     normalized_email = email.strip().lower()
     user = db.query(auth_models.User).filter(
         func.lower(func.trim(auth_models.User.email)) == normalized_email
     ).first()
     if not user:
-        return None
+        raise error_response(status_code=status.HTTP_403_FORBIDDEN, detail="Enterprise SSO is not available for this account")
 
     subscription = get_active_subscription(db, user.id)
     plan_name = subscription.plan.name if subscription and subscription.plan else None
     if normalize_plan_tier(plan_name) != "enterprise":
-        return None
+        raise error_response(status_code=status.HTTP_403_FORBIDDEN, detail="Enterprise SSO requires an active Enterprise subscription")
     return user
 
 @router.post("/register", response_model=auth_schema.UserSuccessResponse, status_code=201)
@@ -240,6 +239,73 @@ def google_login(payload: auth_schema.GoogleLogin, db: Session = Depends(get_db)
     return _token_response(user, "Google login successful")
 
 
+@router.post("/sso/request-otp", response_model=MessageSuccessResponse)
+def request_enterprise_sso_otp(
+    payload: auth_schema.EnterpriseSSORequestOTP,
+    db: Session = Depends(get_db),
+):
+    """Email a one-time code to an existing Enterprise subscriber."""
+    email = str(payload.email).lower()
+    user = _get_enterprise_user(db, email)
+
+    db.query(auth_models.OTP).filter(
+        auth_models.OTP.email == user.email,
+        auth_models.OTP.purpose == ENTERPRISE_SSO_OTP_PURPOSE,
+        auth_models.OTP.is_used == False,
+    ).delete(synchronize_session=False)
+
+    otp_code = str(secrets.randbelow(900000) + 100000)
+    db.add(
+        auth_models.OTP(
+            email=user.email,
+            otp_code=hash_password(otp_code),
+            purpose=ENTERPRISE_SSO_OTP_PURPOSE,
+            expires_at=datetime.utcnow() + timedelta(minutes=settings.OTP_EXPIRE_MINUTES),
+        )
+    )
+    db.flush()
+
+    try:
+        send_otp_email(user.email, otp_code)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    logger.info("Enterprise SSO OTP sent for user_id=%s", user.id)
+    return success_response("Enterprise SSO OTP sent successfully", data=None)
+
+
+@router.post("/sso/verify-otp", response_model=auth_schema.TokenSuccessResponse)
+def verify_enterprise_sso_otp(
+    payload: auth_schema.EnterpriseSSOVerifyOTP,
+    db: Session = Depends(get_db),
+):
+    """Verify an Enterprise SSO OTP and issue the normal API token pair."""
+    email = str(payload.email).lower()
+    user = _get_enterprise_user(db, email)
+    db_otp = db.query(auth_models.OTP).filter(
+        auth_models.OTP.email == user.email,
+        auth_models.OTP.purpose == ENTERPRISE_SSO_OTP_PURPOSE,
+        auth_models.OTP.is_used == False,
+    ).order_by(auth_models.OTP.id.desc()).first()
+
+    if not db_otp:
+        raise error_response(status_code=400, detail="Enterprise SSO OTP not found")
+    if db_otp.expires_at < datetime.utcnow():
+        raise error_response(status_code=400, detail="Enterprise SSO OTP expired")
+    if not verify_password(payload.otp, db_otp.otp_code):
+        logger.warning("Enterprise SSO OTP verification failed for user_id=%s", user.id)
+        raise error_response(status_code=400, detail="Invalid Enterprise SSO OTP")
+
+    db_otp.is_used = True
+    user.is_verified = True
+    user.last_login = datetime.utcnow()
+    db.commit()
+
+    logger.info("Enterprise SSO login successful user_id=%s", user.id)
+    return _token_response(user, "Enterprise SSO login successful")
+
 @router.post("/refresh", response_model=auth_schema.TokenSuccessResponse)
 def refresh_token(payload: auth_schema.RefreshToken, db: Session = Depends(get_db)):
     logger.info("Token refresh requested")
@@ -303,35 +369,6 @@ def refresh_token(payload: auth_schema.RefreshToken, db: Session = Depends(get_d
 def request_otp(payload: auth_schema.RequestOTP, db: Session = Depends(get_db)):
     logger.info("OTP request initiated for email=%s", payload.email)
 
-    enterprise_user = _get_active_enterprise_user(db, str(payload.email))
-    if enterprise_user:
-        db.query(auth_models.OTP).filter(
-            auth_models.OTP.email == enterprise_user.email,
-            auth_models.OTP.purpose == ENTERPRISE_SSO_OTP_PURPOSE,
-            auth_models.OTP.is_used == False,
-        ).delete(synchronize_session=False)
-
-        otp_code = str(secrets.randbelow(900000) + 100000)
-        db.add(
-            auth_models.OTP(
-                email=enterprise_user.email,
-                otp_code=hash_password(otp_code),
-                purpose=ENTERPRISE_SSO_OTP_PURPOSE,
-                expires_at=datetime.utcnow() + timedelta(minutes=settings.OTP_EXPIRE_MINUTES),
-            )
-        )
-        db.flush()
-
-        try:
-            send_otp_email(enterprise_user.email, otp_code)
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
-
-        logger.info("Enterprise SSO OTP sent for user_id=%s", enterprise_user.id)
-        return success_response("Enterprise SSO OTP sent successfully", data=None)
-
     user = db.query(auth_models.User).filter(
         auth_models.User.email == payload.email
     ).first()
@@ -373,30 +410,6 @@ def request_otp(payload: auth_schema.RequestOTP, db: Session = Depends(get_db)):
 @router.post("/verify-otp", response_model=auth_schema.TokenSuccessResponse)
 def verify_otp(payload: auth_schema.VerifyOTP, db: Session = Depends(get_db)):
     logger.info("OTP verification requested for email=%s", payload.email)
-
-    enterprise_user = _get_active_enterprise_user(db, str(payload.email))
-    if enterprise_user:
-        db_otp = db.query(auth_models.OTP).filter(
-            auth_models.OTP.email == enterprise_user.email,
-            auth_models.OTP.purpose == ENTERPRISE_SSO_OTP_PURPOSE,
-            auth_models.OTP.is_used == False,
-        ).order_by(auth_models.OTP.id.desc()).first()
-
-        if not db_otp:
-            raise error_response(status_code=400, detail="Enterprise SSO OTP not found")
-        if db_otp.expires_at < datetime.utcnow():
-            raise error_response(status_code=400, detail="Enterprise SSO OTP expired")
-        if not verify_password(payload.otp, db_otp.otp_code):
-            logger.warning("Enterprise SSO OTP verification failed for user_id=%s", enterprise_user.id)
-            raise error_response(status_code=400, detail="Invalid Enterprise SSO OTP")
-
-        db_otp.is_used = True
-        enterprise_user.is_verified = True
-        enterprise_user.last_login = datetime.utcnow()
-        db.commit()
-
-        logger.info("Enterprise SSO login successful user_id=%s", enterprise_user.id)
-        return _token_response(enterprise_user, "Enterprise SSO login successful")
 
     db_otp = db.query(auth_models.OTP).filter(
         auth_models.OTP.email == payload.email,
