@@ -6,7 +6,10 @@ from sqlalchemy.orm import Session
 from app.config.deps import get_current_user
 from app.db.database import get_db
 from app.models.auth_models import User
-from app.schemas.data_chat_schema import DataChatQueryRequest
+from app.schemas.data_chat_schema import (
+    DataChatQueryRequest,
+    RenameDataChatSessionRequest,
+)
 from app.services.data_chat_service import (
     DEFAULT_SUGGESTED_QUESTIONS,
     delete_session,
@@ -14,6 +17,7 @@ from app.services.data_chat_service import (
     get_session_messages,
     get_suggested_questions,
     list_sessions,
+    rename_session,
     run_data_chat_query,
 )
 from app.utils.responses import success_response
@@ -84,6 +88,18 @@ def get_sessions(
 ):
     data = list_sessions(db, current_user, dataset_type=dataset_type, dataset_id=dataset_id)
     return success_response("Sessions fetched", data=data)
+
+
+@router.put("/sessions/{session_id}")
+def rename_session_route(
+    session_id: str,
+    payload: RenameDataChatSessionRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Rename a chat session."""
+    data = rename_session(db, current_user, session_id, title=payload.title)
+    return success_response("Session renamed", data=data)
 
 
 @router.delete("/sessions/{session_id}")

@@ -11,6 +11,12 @@ class DataChatQueryRequest(BaseModel):
     include_insight: bool = True
 
 
+class RenameDataChatSessionRequest(BaseModel):
+    """Rename an existing chat session (``PUT /data-chat/sessions/{session_id}``)."""
+
+    title: str = Field(..., min_length=1, max_length=255)
+
+
 class ChartMapping(BaseModel):
     category: Optional[str] = None
     value: list[str] = Field(default_factory=list)

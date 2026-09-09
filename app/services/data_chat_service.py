@@ -772,6 +772,49 @@ def delete_session(db: Session, current_user: User, session_id: str) -> dict[str
     return {"session_id": session_id, "deleted_messages": int(deleted_messages or 0)}
 
 
+def rename_session(
+    db: Session, current_user: User, session_id: str, *, title: str
+) -> dict[str, Any]:
+    """Rename one chat session.
+
+    Ownership is checked first, same as ``delete_session``: another user's session
+    reads as not found. The returned shape matches one entry of ``list_sessions``
+    so the client can drop it straight into an already-rendered list.
+    """
+    ensure_data_chat_tables()
+
+    new_title = title.strip()
+    if not new_title:
+        raise error_response(status_code=400, detail="Title cannot be empty")
+
+    session = (
+        db.query(DataChatSession)
+        .filter(
+            DataChatSession.id == session_id,
+            DataChatSession.created_by_user_id == current_user.id,
+        )
+        .first()
+    )
+    if session is None:
+        raise error_response(status_code=404, detail="Chat session not found")
+
+    session.title = new_title
+    db.commit()
+    db.refresh(session)
+
+    logger.info(
+        "Renamed data chat session_id=%s for user_id=%s", session_id, current_user.id
+    )
+    return {
+        "session_id": session.id,
+        "title": session.title,
+        "dataset_name": session.dataset_name,
+        "is_clean": session.is_clean,
+        "created_at": session.created_at.isoformat() if session.created_at else None,
+        "updated_at": session.updated_at.isoformat() if session.updated_at else None,
+    }
+
+
 def list_sessions(
     db: Session, current_user: User, *, dataset_type: str, dataset_id: int
 ) -> list[dict[str, Any]]:
