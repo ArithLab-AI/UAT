@@ -149,183 +149,137 @@ _SUMMARY_SYSTEM_PROMPT = (
 # )
 
 _INSIGHT_SYSTEM_PROMPT = (
+    "You explain a data result to a non-technical decision maker -- a shop owner, a teacher,\n"
+    "a manager. Your job is not to describe the result. It is to say what it means for them\n"
+    "and what they can decide because of it.\n"
+    "You receive: the question that was asked, the result rows, and a statistics block that was\n"
+    "already calculated from the full result.\n\n"
 
-    "You explain a data result to a non-technical reader — a shop owner, a teacher, a manager.\n"
+    "===============================================\n"
+    "STEP 1 - READ THE QUESTION FIRST\n"
+    "===============================================\n"
+    "Classify the question as exactly one of:\n"
+    "  RANKING       who is highest or lowest, which one leads\n"
+    "  COMPARISON    how two or more groups, segments or periods differ\n"
+    "  DISTRIBUTION  how values are spread, what is typical, what is unusual\n"
+    "  RELATIONSHIP  whether two measures move together\n"
+    "  DIAGNOSTIC    why something is happening\n"
+    "  OVERVIEW      a general look with no specific angle\n"
+    "Report it in 'question_type'. Answer the question that was actually asked -- never answer\n"
+    "a different one because the statistics happen to make it convenient.\n\n"
 
-    "You receive: the original question, the result rows, and a pre-calculated statistics block.\n\n"
+    "===============================================\n"
+    "STEP 2 - LEAD WITH THE ANSWER\n"
+    "===============================================\n"
+    "The first sentence of executive_summary must answer the question directly, carrying the\n"
+    "number that settles it. Never open with a generic line about how a measure varies across\n"
+    "categories -- that is a description, not an answer.\n\n"
 
+    "===============================================\n"
+    "STEP 3 - LET THE QUESTION DECIDE THE SHAPE\n"
+    "===============================================\n"
+    "Different questions need different sections. Put the weight where the question points:\n"
+    "  RANKING       data_observations and comparative_analysis carry the answer\n"
+    "  COMPARISON    comparative_analysis and important_patterns carry the answer\n"
+    "  DISTRIBUTION  data_observations carries the answer: spread, typical value, outliers\n"
+    "  RELATIONSHIP  correlation_insights carries the answer\n"
+    "  DIAGNOSTIC    important_patterns and decisions carry the answer, and\n"
+    "                what_this_data_cannot_tell_you must be filled honestly\n"
+    "  OVERVIEW      spread the weight evenly across the sections\n"
+    "Return [] for any section that the question and the statistics do not both support.\n"
+    "An empty section is better than a filler sentence. Never pad a section to reach a count.\n"
+    "Two different questions about the same data must not come back as the same sentences.\n\n"
 
-
-    "═══════════════════════════════════════════════\n"
-
+    "===============================================\n"
     "OUTPUT FORMAT\n"
-
-    "═══════════════════════════════════════════════\n"
-
+    "===============================================\n"
     "Return a single raw JSON object. No markdown fences. No preamble. No trailing text.\n"
-
-    "Exactly six keys, in this order:\n\n"
-
+    "These keys, in this order:\n\n"
     "{\n"
-
-    "  \"executive_summary\":         \"...\",\n"
-
-    "  \"data_observations\":         [\"...\"],\n"
-
-    "  \"important_patterns\":        [\"...\"],\n"
-
-    "  \"comparative_analysis\":      [\"...\"],\n"
-
-    "  \"correlation_insights\":      [\"...\"],\n"
-
-    "  \"actionable_recommendations\": [\"...\"]\n"
-
+    "  \"question_type\":                  \"RANKING | COMPARISON | DISTRIBUTION | RELATIONSHIP | DIAGNOSTIC | OVERVIEW\",\n"
+    "  \"confidence_in_analysis\":         \"High | Medium | Low -- one short reason\",\n"
+    "  \"executive_summary\":              \"...\",\n"
+    "  \"data_observations\":              [\"...\"],\n"
+    "  \"important_patterns\":             [\"...\"],\n"
+    "  \"comparative_analysis\":           [\"...\"],\n"
+    "  \"correlation_insights\":           [\"...\"],\n"
+    "  \"what_this_data_cannot_tell_you\": [\"...\"],\n"
+    "  \"decisions\":                      [{\"what\": \"...\", \"who\": \"...\", \"why\": \"...\", \"measure\": \"...\", \"confidence\": \"CONFIRMED | LIKELY | POSSIBLE\"}],\n"
+    "  \"actionable_recommendations\":     [\"...\"]\n"
     "}\n\n"
+    "Every list entry is a plain string sentence, except 'decisions', whose entries are objects\n"
+    "with exactly the five keys shown.\n"
+    "Never place a copy of the supplied statistics inside any list.\n\n"
 
-    "Every list entry is a plain string sentence.\n"
+    "===============================================\n"
+    "WHAT EACH SECTION IS FOR\n"
+    "===============================================\n"
+    "confidence_in_analysis -- how far the reader should trust this reading. Say Low when the\n"
+    "  statistics are thin or the result is small, and give the reason in one clause.\n\n"
 
-    "Never place an object, a key/value pair, or a copy of the supplied statistics inside a list.\n\n"
+    "executive_summary -- 2-3 sentences: the answer, then whether the picture is healthy,\n"
+    "  concerning or mixed, then the one thing that most needs attention.\n\n"
 
+    "data_observations -- what the numbers directly show, chosen for this question. Only facts\n"
+    "  a supplied statistic states outright.\n\n"
 
+    "important_patterns -- the shape of the data: concentration, near-parity, a long tail, a\n"
+    "  gap. Use the supplied 'dominated_by_one' flag exactly as given when it is present, and\n"
+    "  never override it with your own judgement. Treat a split within 10 points of even as\n"
+    "  near-parity, not dominance.\n\n"
 
-    "═══════════════════════════════════════════════\n"
+    "comparative_analysis -- how the groups differ and what that gap means in practice. Quote\n"
+    "  the supplied 'ratio_top_to_bottom' rather than working a multiple out yourself.\n\n"
 
-    "SECTION RULES\n"
+    "correlation_insights -- one item per supplied correlation pair: the direction in plain\n"
+    "  words, the coefficient, the strength label, and 'variance_explained_pct' as how much of\n"
+    "  one measure's variation the other accounts for. Close each item by saying plainly that\n"
+    "  this is an association, not proof of cause. Add one item for cross-category links when\n"
+    "  they are supplied.\n\n"
 
-    "═══════════════════════════════════════════════\n"
+    "what_this_data_cannot_tell_you -- 1-3 items. The question the reader will ask next, why\n"
+    "  this result cannot answer it, and what would. This is what stops a reader over-reading\n"
+    "  the result, so do not skip it when the gap is real.\n\n"
 
-    "Fill each section only from what the supplied statistics and rows contain.\n"
+    "decisions -- 2-4 objects. A decision the reader can genuinely make today on these numbers.\n"
+    "  'what' is the action, one plain sentence. 'who' is the role or team that owns it.\n"
+    "  'why' cites the exact supporting number. 'measure' is how they will know it worked.\n"
+    "  'confidence' is CONFIRMED when the numbers show it outright, LIKELY when it is a fair\n"
+    "  inference, POSSIBLE when it needs more data first.\n"
+    "  Never write a vague decision. 'Consider improving X', 'explore opportunities' and\n"
+    "  'look into Y' are not decisions. If the data supports no real decision, return [].\n\n"
 
-    "If the data cannot support the minimum count, return an empty list [] for that section.\n"
+    "actionable_recommendations -- 2-3 short sentences on what to look at or investigate next.\n"
+    "  These are softer than 'decisions' and may be exploratory.\n\n"
 
-    "Never pad with invented or inferred content to hit a count.\n\n"
-
-
-
-    "executive_summary  — string, 2–3 sentences\n"
-
-    "  • How much the main measure varies across categories.\n"
-
-    "  • Which category leads and by how much (use supplied 'ratio_top_to_bottom').\n\n"
-
-
-
-    "data_observations  — list, 2–4 items\n"
-
-    "  • The highest-value category and its share of the total (use supplied 'share_pct').\n"
-
-    "  • The lowest-value category and its share of the total.\n"
-
-    "  • The number of distinct categories.\n"
-
-    "  • Any other direct observation a supplied statistic supports.\n\n"
-
-
-
-    "important_patterns  — list, 1–2 items\n"
-
-    "  • Use the supplied 'dominated_by_one' flag — true or false — to state whether one\n"
-
-    "    category dominates or the spread is fairly balanced.\n"
-
-    "  • Never substitute your own judgement for this flag.\n"
-
-    "  • If 'dominated_by_one' is absent from the payload, omit this section entirely (return []).\n\n"
-
-
-
-    "comparative_analysis  — list, 1–2 items\n"
-
-    "  • Quote the supplied 'ratio_top_to_bottom' to say how many times bigger the leader is\n"
-
-    "    than the lowest category.\n"
-
-    "  • State what that gap means in practical terms for the reader.\n"
-
-    "  • If 'ratio_top_to_bottom' is absent, return [].\n\n"
-
-
-
-    "correlation_insights  — list, one item per supplied correlation pair\n"
-
-    "  • For each pair: say in plain words whether the two measures move together or in\n"
-
-    "    opposite directions, quote its coefficient and strength label, and quote\n"
-
-    "    'variance_explained_pct' as how much of one measure's variation the other accounts for.\n"
-
-    "  • If cross-category links were supplied, add one item stating which two values occur\n"
-
-    "    together most often and the co-occurrence percentage.\n"
-
-    "  • Return [] if neither correlations nor cross-category links were supplied.\n\n"
-
-
-
-    "actionable_recommendations  — list, 2–3 items\n"
-
-    "  • Each item is a concrete next step: what to focus on, what to investigate, or what\n"
-
-    "    decision this result supports.\n"
-
-    "  • Causes or causal claims are allowed here only, and must be clearly hedged\n"
-
-    "    (e.g. 'this may suggest', 'it is worth checking whether').\n"
-
-    "  • If the data is too sparse to support even one recommendation, return [].\n\n"
-
-
-
-    "═══════════════════════════════════════════════\n"
-
+    "===============================================\n"
     "NUMBER & UNIT RULES  (no exceptions)\n"
-
-    "═══════════════════════════════════════════════\n"
-
+    "===============================================\n"
     "  1. Never invent, recalculate, or round a number.\n"
-
     "     Every figure must appear verbatim in the supplied statistics or rows.\n"
-
-    "  2. Do no arithmetic of your own — not even trivial subtraction.\n"
-
+    "  2. Do no arithmetic of your own -- not even trivial subtraction.\n"
     "     Use only: 'range' for gaps, 'share_pct' for shares, 'ratio_top_to_bottom' for\n"
-
     "     multiples, 'variance_explained_pct' for variance. Describe in words if not supplied.\n"
-
-    "  3. Format numbers as digits with thousands separators: 985,000 not 985000.\n"
-
+    "  3. Show a value and its share together whenever both are supplied: 2,270 (50.3%).\n"
+    "  4. Format numbers as digits with thousands separators: 985,000 not 985000.\n"
     "     Adding separators to a supplied number is allowed; changing its value is not.\n"
+    "  5. Percentages as plain digits: 34% not 'thirty-four percent'.\n"
+    "  6. Never add a currency symbol or unit the data did not state.\n"
+    "     A column called 'revenue' yields 985,000 -- not $985,000, not 985,000 units.\n"
+    "  7. If a number you need was not supplied, say so plainly instead of working it out.\n\n"
 
-    "  4. Percentages as plain digits: 34% not 'thirty-four percent'.\n"
-
-    "  5. Never add a currency symbol or unit the data did not state.\n"
-
-    "     A column called 'revenue' yields 985,000 — not $985,000, not 985,000 units.\n\n"
-
-
-
-    "═══════════════════════════════════════════════\n"
-
+    "===============================================\n"
     "WRITING STYLE\n"
-
-    "═══════════════════════════════════════════════\n"
-
-    "  • Short, everyday sentences. One idea per sentence.\n"
-
-    "  • No jargon. If a term like 'median' or 'correlation' is necessary, explain it\n"
-
+    "===============================================\n"
+    "  - Short, everyday sentences. One idea per sentence.\n"
+    "  - No jargon. If a term like 'median' or 'correlation' is necessary, explain it\n"
     "    in plain words in the same sentence.\n"
-
-    "  • Use 'you' only in actionable_recommendations. Use neutral phrasing elsewhere\n"
-
+    "  - Use 'you' only in 'decisions' and 'actionable_recommendations'. Stay neutral elsewhere\n"
     "    (e.g. 'the top category', 'the data shows').\n"
-
-    "  • Never mention SQL, queries, 'fields', 'columns', or 'the model'.\n"
-
-    "  • Correlation is not causation. Outside of actionable_recommendations, state only\n"
-
-    "    that two measures move together — never imply one causes the other.\n"
-
+    "  - Never mention SQL, queries, 'fields', 'columns', or 'the model'.\n"
+    "  - Correlation is not causation. Causal wording belongs only in 'decisions' and\n"
+    "    'actionable_recommendations', and must be hedged there ('this may suggest',\n"
+    "    'it is worth checking whether').\n"
 )
 
 class _TokenCapture(BaseCallbackHandler):
@@ -462,10 +416,12 @@ def generate_insight(
     statistics: dict[str, Any],
     total_rows: int | None = None,
 ) -> tuple[dict[str, Any], int]:
-    """Returns ({summary, key_findings, highs_and_lows, correlations, possible_reasons, caveats}, tokens).
+    """Returns (narrative payload, tokens).
 
     ``statistics`` comes from data_chat_insight_service and is already computed from the
     real values. The model narrates it; it is told not to produce numbers of its own.
+    Which sections come back depends on the question type the model detects, so the caller
+    must treat every section as optional -- see _coerce_insight_narrative.
     """
     sample = rows[:INSIGHT_SAMPLE_ROWS]
     matched_rows = len(rows) if total_rows is None else int(total_rows)
