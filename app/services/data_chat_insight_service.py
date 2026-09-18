@@ -462,10 +462,11 @@ def compute_result_statistics(
 
 
 def build_fallback_insight(statistics: dict[str, Any]) -> dict[str, Any]:
-    """The same six sections, assembled from the numbers alone.
+    """The same sections as the model returns, assembled from the numbers alone.
 
     Used when the LLM is unavailable or returns nothing, so the field stays genuinely
     useful instead of empty. Every sentence here is filled from a computed value.
+    Question type is always OVERVIEW: there is no question analysis without the model.
     """
     measures = statistics.get("measures") or []
     distributions = statistics.get("distributions") or []
@@ -568,12 +569,57 @@ def build_fallback_insight(statistics: dict[str, Any]) -> dict[str, Any]:
             f"Investigate the link between {left} and {right} before treating either as a lever."
         )
 
+    cannot_tell: list[str] = []
+    if primary:
+        cannot_tell.append(
+            f"These numbers show that {primary['top']['label']} leads on {metric}, but not why. "
+            "Answering that needs data on what changed over time."
+        )
+    if not correlations:
+        cannot_tell.append(
+            "No relationship between measures could be measured here, so nothing can be said "
+            "about which measure moves with which."
+        )
+
+    decisions: list[dict[str, str]] = []
+    if primary:
+        decisions.append(
+            {
+                "what": f"Look at {primary['top']['label']} first.",
+                "who": "Whoever owns this area",
+                "why": (
+                    f"It carries the largest share of {metric}, "
+                    f"{_format_number(primary['top']['share_pct'])}% of the total."
+                ),
+                "measure": f"Check whether its share of {metric} has moved at the next review.",
+                "confidence": "CONFIRMED",
+            }
+        )
+        decisions.append(
+            {
+                "what": f"Review {primary['bottom']['label']} before putting more into it.",
+                "who": "Whoever owns this area",
+                "why": (
+                    f"It holds the smallest share of {metric}, "
+                    f"{_format_number(primary['bottom']['share_pct'])}% of the total."
+                ),
+                "measure": f"Check whether its {metric} improves after the review.",
+                "confidence": "LIKELY",
+            }
+        )
+
     return {
+        "question_type": "OVERVIEW",
+        "confidence_in_analysis": (
+            "Low - this reading was assembled from the numbers alone, without an AI narrative."
+        ),
         "executive_summary": executive_summary,
         "data_observations": observations,
         "important_patterns": patterns,
         "comparative_analysis": comparative,
         "correlation_insights": correlation_insights,
+        "what_this_data_cannot_tell_you": cannot_tell,
+        "decisions": decisions,
         "actionable_recommendations": recommendations,
         "caveats": ["This description was generated from the numbers only, without an AI narrative."],
     }

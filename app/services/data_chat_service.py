@@ -237,18 +237,25 @@ def _node_summarize(state: _ChatState) -> _ChatState:
 
 
 
-# The six sections the insight is reported in. executive_summary is prose; the rest are
+# The sections the insight is reported in. executive_summary is prose; the rest are
 # lists of one-line points so the frontend can render each section on its own.
-_INSIGHT_TEXT_KEYS = ("executive_summary",)
+# question_type and confidence_in_analysis describe the reading rather than being part of
+# it, so they are carried through but left out of the emptiness check below.
+_INSIGHT_METADATA_KEYS = ("question_type", "confidence_in_analysis")
+_INSIGHT_TEXT_KEYS = _INSIGHT_METADATA_KEYS + ("executive_summary",)
 _INSIGHT_LIST_KEYS = (
     "data_observations",
     "important_patterns",
     "comparative_analysis",
     "correlation_insights",
+    "what_this_data_cannot_tell_you",
     "actionable_recommendations",
     "caveats",
 )
-_INSIGHT_NARRATIVE_KEYS = _INSIGHT_TEXT_KEYS + _INSIGHT_LIST_KEYS
+# Decisions stay objects -- what/who/why/measure/confidence only mean something together.
+_INSIGHT_OBJECT_KEYS = ("decisions",)
+_INSIGHT_NARRATIVE_KEYS = ("executive_summary",) + _INSIGHT_LIST_KEYS + _INSIGHT_OBJECT_KEYS
+_DECISION_FIELDS = ("what", "who", "why", "measure", "confidence")
 
 
 _INSIGHT_TEXT_FIELDS = ("explanation", "text", "point", "insight", "description", "summary")
@@ -272,11 +279,27 @@ def _narrative_line(item: Any) -> str:
     return str(item).strip()
 
 
+def _decision_entry(item: Any) -> dict[str, str] | None:
+    """Coerce one decision to an object, dropping any entry with no action in it.
+
+    The model still returns a bare sentence sometimes; that becomes the action with the
+    other fields blank, so the frontend renders one shape either way.
+    """
+    if isinstance(item, str):
+        text = item.strip()
+        return {field: text if field == "what" else "" for field in _DECISION_FIELDS} if text else None
+    if not isinstance(item, dict):
+        return None
+    entry = {field: str(item.get(field) or "").strip() for field in _DECISION_FIELDS}
+    return entry if entry["what"] else None
+
+
 def _coerce_insight_narrative(payload: Any) -> dict[str, Any] | None:
     """Keep only the expected narrative keys, with list fields forced to lists of text.
 
     The model occasionally returns a bare string where a list belongs; wrapping it
-    keeps the response shape stable for the frontend.
+    keeps the response shape stable for the frontend. Sections the model left out for
+    this question type come back empty rather than missing, for the same reason.
     """
     if not isinstance(payload, dict):
         return None
@@ -284,6 +307,10 @@ def _coerce_insight_narrative(payload: Any) -> dict[str, Any] | None:
     narrative: dict[str, Any] = {}
     for key in _INSIGHT_TEXT_KEYS:
         narrative[key] = str(payload.get(key) or "").strip()
+    for key in _INSIGHT_OBJECT_KEYS:
+        value = payload.get(key)
+        items = value if isinstance(value, list) else []
+        narrative[key] = [entry for entry in (_decision_entry(item) for item in items) if entry]
     for key in _INSIGHT_LIST_KEYS:
         value = payload.get(key)
         if isinstance(value, str):
@@ -564,8 +591,8 @@ def run_data_chat_query(
         "row_count": len(rows),
         "total_row_count": total_rows,
         "chart_spec": final.get("chart"),
-        # Six-section plain-language reading of the result. None when the turn returned
-        # no rows or insight was skipped.
+        # Plain-language reading of the result. Which sections carry content depends on
+        # the question type. None when the turn returned no rows or insight was skipped.
         "insight": final.get("insight"),
         "attempts": message.attempts,
         # Technical error DB/logs me hi rehta hai; client ko plain-English message jaata hai.
