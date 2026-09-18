@@ -76,7 +76,7 @@ class Settings(BaseSettings):
     # Ceiling for the insight narrative specifically. Kept as its own knob because when the
     # JSON is cut off mid-object the section silently falls back to the rule-based text
     # rather than erroring, so the limit needs to be tunable without touching every call.
-    UAT_DATA_CHAT_INSIGHT_MAX_TOKENS: int = 1200
+    UAT_DATA_CHAT_INSIGHT_MAX_TOKENS: int = 2800
 
     class Config:
         env_file = ".env"
