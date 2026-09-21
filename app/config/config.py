@@ -77,6 +77,12 @@ class Settings(BaseSettings):
     # JSON is cut off mid-object the section silently falls back to the rule-based text
     # rather than erroring, so the limit needs to be tunable without touching every call.
     UAT_DATA_CHAT_INSIGHT_MAX_TOKENS: int = 2800
+    # Master switch for returning the generated SQL to the client. Off by default:
+    # the SQL stays in the DB (data_chat_messages.generated_sql) and never reaches
+    # the response. Turn it on in UAT only -- a caller then has to ALSO pass
+    # ?debug_sql=true to actually get it back, so leaving it on cannot silently
+    # start leaking SQL into the normal app responses.
+    UAT_DATA_CHAT_EXPOSE_SQL: bool = False
 
     class Config:
         env_file = ".env"

@@ -18,6 +18,7 @@ from typing import Any, Optional, TypedDict
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
+from app.config.config import settings
 from app.db.database import Base, engine
 from app.models.auth_models import User
 from app.models.data_chat_models import DataChatMessage, DataChatSession, DataChatSuggestionCache
@@ -46,6 +47,11 @@ from app.utils.responses import error_response
 logger = logging.getLogger(__name__)
 
 MAX_SQL_ATTEMPTS = 3
+
+
+def _should_expose_sql(debug_sql: bool) -> bool:
+    """SQL response me tabhi jaata hai jab env flag ON ho AUR caller ne maanga ho."""
+    return bool(debug_sql) and bool(settings.UAT_DATA_CHAT_EXPOSE_SQL)
 DEFAULT_SUGGESTED_QUESTIONS = 5
 SUGGESTIONS_CACHE_TTL_SECONDS = 6 * 60 * 60  # 6 hours
 
@@ -459,6 +465,7 @@ def run_data_chat_query(
     is_clean: bool,
     session_id: Optional[str],
     include_insight: bool = True,
+    debug_sql: bool = False,
 ) -> dict[str, Any]:
     ensure_data_chat_tables()
 
@@ -527,15 +534,12 @@ def run_data_chat_query(
     db.commit()
     db.refresh(message)
 
-    return {
+    payload: dict[str, Any] = {
         "session_id": session.id,
         "message_id": message.id,
         "status": status,
         "answer": final.get("answer")
         or (to_user_message(final.get("error")) if status == "error" else ""),
-        # Raw SQL response se hata diya gaya hai: query DB (generated_sql) aur logs me
-        # ab bhi save hoti hai, bas client ko wapas nahi jaati.
-        # "sql": final.get("sql") or None,
         "columns": columns,
         "rows": rows,
         # row_count pehle jaisa hi hai: kitni rows response me bheji gayi (MAX_RESULT_ROWS par
@@ -551,6 +555,11 @@ def run_data_chat_query(
         # Technical error DB/logs me hi rehta hai; client ko plain-English message jaata hai.
         "error": to_user_message(final.get("error")) if status == "error" else None,
     }
+    # Raw SQL normally response me nahi jaati (DB ke generated_sql me hi rehti hai);
+    # sirf debugging ke liye, dono switch ON hone par wapas add hoti hai.
+    if _should_expose_sql(debug_sql):
+        payload["sql"] = final.get("sql") or None
+    return payload
 
 
 def get_suggested_questions(
@@ -677,7 +686,7 @@ def get_suggested_questions(
 
 
 def get_session_messages(
-    db: Session, current_user: User, session_id: str
+    db: Session, current_user: User, session_id: str, debug_sql: bool = False
 ) -> list[dict[str, Any]]:
     session = (
         db.query(DataChatSession)
@@ -696,14 +705,14 @@ def get_session_messages(
         .order_by(DataChatMessage.created_at.asc())
         .all()
     )
-    return [
-        {
+    expose_sql = _should_expose_sql(debug_sql)
+    history: list[dict[str, Any]] = []
+    for m in messages:
+        entry: dict[str, Any] = {
             "message_id": m.id,
             "question": m.nl_query,
             "answer": m.assistant_text
             or (to_user_message(m.error_message) if m.status == "error" else None),
-            # Query API ki tarah history me bhi raw SQL client ko nahi bheji jaati.
-            # "sql": m.generated_sql,
             "chart_spec": m.chart_spec,
             "insight": m.insight,
             "rows": m.result_preview or [],
@@ -712,8 +721,12 @@ def get_session_messages(
             "error": to_user_message(m.error_message) if m.status == "error" else None,
             "created_at": m.created_at.isoformat() if m.created_at else None,
         }
-        for m in messages
-    ]
+        # Query API jaisa hi rule: normally SQL client tak nahi jaati, sirf debugging ke
+        # liye dono switch ON hone par history me wapas aati hai.
+        if expose_sql:
+            entry["sql"] = m.generated_sql
+        history.append(entry)
+    return history
 
 
 
