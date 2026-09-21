@@ -13,6 +13,12 @@ CHART_FORMAT_VERSION = 1
 # Cap for the AI summary headline carried on every chart spec.
 SUMMARY_TITLE_MAX_CHARS = 80
 
+# "bar" ka plain categorical-fallback avatar. Jahan request/inference sirf generic
+# category-vs-metric "bar" par land karti thi (koi trend/share/2D/single-row/2-metric
+# shape nahi mili), wahan ab yeh dikhta hai. Ek smart pick (smooth_line/doughnut/
+# heatmap/stacked_bar/kpi/mixed/...) already ban chuki ho to woh untouched rehti hai.
+DEFAULT_CHART_TYPE = "column"
+
 CHART_SELECTION_GUIDE = """
 - smooth_line: time-series trend with one or more numeric metrics; use when the x-axis is time-like.
 - area: time-series where the filled area should emphasise the total scale over time.
@@ -34,6 +40,7 @@ CHART_SELECTION_GUIDE = """
 SUPPORTED_CHART_TYPES = {
     "table",
     "kpi",
+    "column",
     "bar",
     "stacked_bar",
     "smooth_line",
@@ -51,6 +58,9 @@ SUPPORTED_CHART_TYPES = {
 
 _CHART_TYPE_ALIASES = {
     "line": "smooth_line",
+    "column_chart": "column",
+    "vertical_bar": "column",
+    "basic_column": "column",
     "correlation": "bubble",
     "basic_bar": "bar",
     "basic_area": "area",
@@ -66,6 +76,7 @@ _CHART_TYPE_ALIASES = {
 }
 
 _AXIS_CHART_TYPES = {
+    "column",
     "bar",
     "stacked_bar",
     "smooth_line",
@@ -111,7 +122,8 @@ _EXPLICIT_CHART_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bbubble\b", re.I), "bubble"),
     (re.compile(r"\bscatter\b", re.I), "scatter"),
     (re.compile(r"\bcombo\s+(chart|graph)\b|\bbar\s*\+\s*line\b", re.I), "mixed"),
-    (re.compile(r"\b(bar|column)[\s-]*(chart|graph|plot)\b", re.I), "bar"),
+    (re.compile(r"\bcolumn[\s-]*(chart|graph|plot)\b|\bvertical\s+bar\b", re.I), "column"),
+    (re.compile(r"\bbar[\s-]*(chart|graph|plot)\b", re.I), "bar"),
     (re.compile(r"\bline[\s-]*(chart|graph|plot)\b", re.I), "smooth_line"),
     (re.compile(r"\barea[\s-]*(chart|graph|plot)\b", re.I), "area"),
     (re.compile(r"\bkpi\b|\bheadline\s+number\b|\bsingle\s+number\b", re.I), "kpi"),
@@ -131,6 +143,19 @@ def detect_explicit_chart_type(question: str) -> Optional[str]:
         if pattern.search(text):
             return chart_type
     return None
+
+
+def _supports_default_column(columns: list[str], rows: list[dict[str, Any]]) -> bool:
+    """True when the result has a real category plus a measure, so a column chart says something.
+
+    Sirf ek headline number (kpi) ya do numeric columns (scatter/bubble) wale results ke liye
+    column chart matlab nahi rakhta; wahan default lagane ke bajaye normal inference chalti hai.
+    """
+    if not columns or not rows:
+        return False
+    numeric_columns = _numeric_columns(columns, rows)
+    dimension_columns = [column for column in columns if column not in numeric_columns]
+    return bool(numeric_columns and dimension_columns)
 
 
 def _build_forced_doughnut_chart(
@@ -171,12 +196,30 @@ def normalize_chart_spec(
     requested_type = _normalise_chart_type(chart_request.get("type"))
     explicit_type = detect_explicit_chart_type(question)
     inferred_type = _infer_chart_type(question, safe_columns, safe_rows, requested_type)
+
+    def _prefer_column(chart_type: str) -> str:
+        """Relabel only the plain "bar" fallback as "column"; every smarter pick a
+        request or inference already made (smooth_line, doughnut, heatmap, stacked_bar,
+        kpi, mixed, ...) is returned unchanged."""
+        if chart_type == "bar" and _supports_default_column(safe_columns, safe_rows):
+            return DEFAULT_CHART_TYPE
+        return chart_type
+
+    # Last-resort net, tried just before the hardcoded "table": if every smarter candidate
+    # above failed to build (e.g. a doughnut whose slice count exceeds the cap) but the
+    # result still has a category plus a measure, land on column instead of a plain table.
+    default_type = (
+        DEFAULT_CHART_TYPE
+        if explicit_type is None and _supports_default_column(safe_columns, safe_rows)
+        else None
+    )
     candidates: list[str] = []
     for candidate in (
         explicit_type,  # user ne khud chart type maanga hai to wahi pehle try hota hai
-        inferred_type if requested_type == "table" else requested_type,
-        requested_type,
-        inferred_type,
+        _prefer_column(inferred_type if requested_type == "table" else requested_type),
+        _prefer_column(requested_type),
+        _prefer_column(inferred_type),
+        default_type,
         "table",
     ):
         if candidate and candidate not in candidates:
@@ -418,7 +461,10 @@ def _default_options(
     raw_chart: dict[str, Any],
 ) -> dict[str, Any]:
     orientation = None
-    if chart_type in {"bar", "stacked_bar"}:
+    if chart_type == "column":
+        # Column chart ki definition hi vertical bars hai, isliye yeh orientation fixed hai.
+        orientation = "vertical"
+    elif chart_type in {"bar", "stacked_bar"}:
         orientation = str(raw_chart.get("orientation") or "").strip().lower() or None
         if orientation not in {"horizontal", "vertical"}:
             orientation = _default_bar_orientation(rows, mapping.get("category"))
@@ -927,6 +973,15 @@ def _label(value: Any) -> str:
 _CHART_BUILDERS = {
     "table": _build_table_chart,
     "kpi": _build_kpi_chart,
+    # Column aur bar ka payload same hai (ECharts series type "bar"); farq sirf spec ke type
+    # aur orientation ka hai, jo _default_options set karta hai.
+    "column": lambda columns, rows, mapping, options: _build_simple_axis_chart(
+        columns,
+        rows,
+        mapping,
+        options,
+        series_type="bar",
+    ),
     "bar": lambda columns, rows, mapping, options: _build_simple_axis_chart(
         columns,
         rows,

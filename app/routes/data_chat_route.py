@@ -32,6 +32,9 @@ def query_dataset(
     dataset_type: DatasetType,
     dataset_id: int,
     payload: DataChatQueryRequest,
+    # Debugging only: the generated SQL comes back in the response when this is true AND
+    # UAT_DATA_CHAT_EXPOSE_SQL is on in the environment. Both are off by default.
+    debug_sql: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -45,6 +48,7 @@ def query_dataset(
         is_clean=payload.is_clean,
         session_id=payload.session_id,
         include_insight=payload.include_insight,
+        debug_sql=debug_sql,
     )
     # Shape wahi rehta hai; sirf message ab result ko reflect karta hai taaki UI toast me
     # technical text ke bajaye plain-English wajah dikhe.
@@ -64,6 +68,9 @@ def get_suggested_questions_route(
     dataset_id: int,
     is_clean: bool = False,
     count: int = DEFAULT_SUGGESTED_QUESTIONS,
+    # False (default): serve the cached batch when it's still fresh. True: always ask the
+    # LLM again for a batch that's different from what's cached, and cache that instead.
+    regenerate: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -75,6 +82,7 @@ def get_suggested_questions_route(
         dataset_id=dataset_id,
         is_clean=is_clean,
         count=count,
+        regenerate=regenerate,
     )
     return success_response("Suggested questions generated", data=data)
 
@@ -116,10 +124,12 @@ def delete_session_route(
 @router.get("/sessions/{session_id}/messages")
 def get_messages(
     session_id: str,
+    # Same debugging gate as the query endpoint.
+    debug_sql: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    data = get_session_messages(db, current_user, session_id)
+    data = get_session_messages(db, current_user, session_id, debug_sql=debug_sql)
     return success_response("Messages fetched", data=data)
 
 

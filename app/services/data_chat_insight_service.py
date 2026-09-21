@@ -621,5 +621,4 @@ def build_fallback_insight(statistics: dict[str, Any]) -> dict[str, Any]:
         "what_this_data_cannot_tell_you": cannot_tell,
         "decisions": decisions,
         "actionable_recommendations": recommendations,
-        "caveats": ["This description was generated from the numbers only, without an AI narrative."],
     }

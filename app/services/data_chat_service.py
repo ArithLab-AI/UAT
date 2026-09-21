@@ -1,7 +1,10 @@
 """Natural-language data chat orchestration.
 
 Flow (LangGraph state machine):
-    generate_sql -> execute -> (on SQL error, feed error back and retry, max N) -> summarize -> insight
+    generate_sql -> execute -> evaluate -> summarize -> insight
+
+Two bounded retry loops feed back into generate_sql: a DuckDB error (max MAX_SQL_ATTEMPTS)
+and a judge that scores how well the result answers the question (max MAX_SQL_EVAL_ATTEMPTS).
 
 Everything is scoped to a single dataset. Every query + generated SQL + result is
 persisted to ``data_chat_messages`` so the full history is queryable.
@@ -18,6 +21,7 @@ from typing import Any, Optional, TypedDict
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
+from app.config.config import settings
 from app.db.database import Base, engine
 from app.models.auth_models import User
 from app.models.data_chat_models import DataChatMessage, DataChatSession, DataChatSuggestionCache
@@ -29,6 +33,7 @@ from app.services.data_chat_insight_service import (
 )
 from app.services.data_chat_llm_service import (
     build_schema_context,
+    evaluate_sql_result,
     generate_insight,
     generate_sample_questions,
     generate_sql,
@@ -46,8 +51,17 @@ from app.utils.responses import error_response
 logger = logging.getLogger(__name__)
 
 MAX_SQL_ATTEMPTS = 3
+# How many times the judge may send SQL back to be rewritten. Counted separately from
+# MAX_SQL_ATTEMPTS (which bounds DuckDB errors), because the two loops fail for different
+# reasons; both counters only ever go up, so generate_sql runs at most 5 times per turn.
+MAX_SQL_EVAL_ATTEMPTS = 2
 DEFAULT_SUGGESTED_QUESTIONS = 5
 SUGGESTIONS_CACHE_TTL_SECONDS = 6 * 60 * 60  # 6 hours
+
+
+def _should_expose_sql(debug_sql: bool) -> bool:
+    """SQL response me tabhi jaata hai jab env flag ON ho AUR caller ne maanga ho."""
+    return bool(debug_sql) and bool(settings.UAT_DATA_CHAT_EXPOSE_SQL)
 
 
 @lru_cache(maxsize=1)
@@ -70,6 +84,12 @@ def ensure_data_chat_tables() -> None:
         with engine.begin() as connection:
             connection.execute(text("ALTER TABLE data_chat_messages ADD COLUMN insight JSON"))
         logger.info("Added data_chat_messages.insight column")
+    if "sql_evaluation" not in existing:
+        with engine.begin() as connection:
+            connection.execute(
+                text("ALTER TABLE data_chat_messages ADD COLUMN sql_evaluation JSON")
+            )
+        logger.info("Added data_chat_messages.sql_evaluation column")
 
 
 class _ChatState(TypedDict, total=False):
@@ -88,6 +108,15 @@ class _ChatState(TypedDict, total=False):
     chart: Optional[dict[str, Any]]
     insight: Optional[dict[str, Any]]
     want_insight: bool
+    # {score, verdict, issues} for the attempt currently in state, None when the judge is
+    # off or unavailable.
+    evaluation: Optional[dict[str, Any]]
+    # Highest-scoring successful attempt so far, so a rewrite can only help, never lose a
+    # better answer we already had.
+    best_result: Optional[dict[str, Any]]
+    eval_attempts: int
+    retry_reason: Optional[str]
+    want_eval: bool
     tokens: int
 
 
@@ -201,6 +230,120 @@ def _node_execute(state: _ChatState) -> _ChatState:
     return state
 
 
+def _coerce_evaluation(payload: Any) -> Optional[dict[str, Any]]:
+    """Normalise the judge's JSON, or None when it is unusable.
+
+    A malformed verdict must not gate anything, so anything that cannot be read as a score
+    comes back as None and the result is accepted as it is.
+    """
+    if not isinstance(payload, dict):
+        return None
+    try:
+        score = int(float(payload.get("score")))
+    except (TypeError, ValueError):
+        return None
+    score = max(0, min(100, score))
+
+    raw_issues = payload.get("issues")
+    if isinstance(raw_issues, str):
+        issues = [raw_issues.strip()] if raw_issues.strip() else []
+    elif isinstance(raw_issues, list):
+        issues = [str(item).strip() for item in raw_issues if str(item).strip()]
+    else:
+        issues = []
+
+    verdict = str(payload.get("verdict") or "").strip().lower()
+    if verdict not in {"pass", "weak", "fail"}:
+        verdict = "pass" if score >= 90 else "weak" if score >= 70 else "fail"
+    return {"score": score, "verdict": verdict, "issues": issues[:5]}
+
+
+def _evaluation_feedback(evaluation: dict[str, Any]) -> str:
+    """The judge's complaints, worded to slot into generate_sql's error-feedback channel."""
+    issues = evaluation.get("issues") or []
+    listed = "\n".join(f"- {issue}" for issue in issues)
+    return (
+        f"It ran without erroring, but the result does not answer the question "
+        f"(score {evaluation.get('score')}/100). Rewrite the SQL and fix this:\n"
+        f"{listed or '- the result does not answer the question that was asked'}"
+    )
+
+
+def _snapshot_result(state: _ChatState) -> dict[str, Any]:
+    return {
+        "sql": state.get("sql", ""),
+        "columns": state.get("columns", []),
+        "rows": state.get("rows", []),
+        "total_rows": state.get("total_rows"),
+        "evaluation": state.get("evaluation"),
+    }
+
+
+def _restore_result(state: _ChatState, snapshot: dict[str, Any]) -> None:
+    state["sql"] = snapshot.get("sql", "")
+    state["columns"] = snapshot.get("columns", []) or []
+    state["rows"] = snapshot.get("rows", []) or []
+    state["total_rows"] = snapshot.get("total_rows")
+    state["evaluation"] = snapshot.get("evaluation")
+    state["status"] = "success"
+    state["error"] = None
+
+
+def _evaluation_score(evaluation: Optional[dict[str, Any]]) -> Optional[int]:
+    return evaluation.get("score") if isinstance(evaluation, dict) else None
+
+
+def _node_evaluate(state: _ChatState) -> _ChatState:
+    """Score how well the result answers the question, and decide whether to rewrite the SQL.
+
+    This is the only check on whether the SQL answered the RIGHT question -- validate_sql and
+    the DuckDB error retry both only prove that it ran. The judge is advisory, never a gate:
+    if it is switched off or the call fails, the result goes out exactly as before.
+    """
+    state["retry_reason"] = None
+    if not state.get("want_eval", True) or not settings.UAT_DATA_CHAT_SQL_EVAL_ENABLED:
+        return state
+
+    evaluation: Optional[dict[str, Any]] = None
+    try:
+        payload, tokens = evaluate_sql_result(
+            state["question"],
+            state.get("sql", ""),
+            state.get("schema_context", ""),
+            state.get("columns", []) or [],
+            state.get("rows", []) or [],
+            total_rows=state.get("total_rows"),
+        )
+        state["tokens"] = state.get("tokens", 0) + tokens
+        evaluation = _coerce_evaluation(payload)
+    except Exception:  # noqa: BLE001 - the data is already in hand; never fail the turn on this
+        logger.exception("Data chat SQL evaluation failed; accepting the result as is")
+
+    state["evaluation"] = evaluation
+
+    # Keep the best attempt seen so far. Without this a rewrite that scores worse would
+    # silently replace a better answer the user could have had.
+    best = state.get("best_result")
+    score = _evaluation_score(evaluation)
+    best_score = _evaluation_score((best or {}).get("evaluation"))
+    if best is None or (score is not None and (best_score is None or score > best_score)):
+        state["best_result"] = _snapshot_result(state)
+
+    if score is None or score >= settings.UAT_DATA_CHAT_SQL_EVAL_MIN_SCORE:
+        return state
+    if state.get("eval_attempts", 0) >= MAX_SQL_EVAL_ATTEMPTS:
+        # Budget spent: go on with the best attempt rather than looping. The low score is
+        # still reported, so a weak answer is visible instead of silently passing as good.
+        return state
+
+    state["eval_attempts"] = state.get("eval_attempts", 0) + 1
+    # generate_sql already rewrites from feedback for DuckDB errors; the judge's complaints
+    # ride the same channel, so no second code path is needed there.
+    state["error"] = _evaluation_feedback(evaluation)
+    state["retry_reason"] = "evaluation"
+    return state
+
+
 def _fallback_answer(state: _ChatState) -> str:
     """Plain answer built from the result itself, for when the summariser is unavailable."""
     rows = state.get("rows") or []
@@ -215,6 +358,18 @@ def _fallback_answer(state: _ChatState) -> str:
 
 
 def _node_summarize(state: _ChatState) -> _ChatState:
+    # Arriving here after a judge-triggered rewrite, the attempt in hand is not always the
+    # best one -- the rewrite may have scored lower, or broken outright. Fall back to the
+    # highest-scoring attempt so the loop can only improve the answer, never worsen it.
+    best = state.get("best_result")
+    if best is not None:
+        best_score = _evaluation_score(best.get("evaluation"))
+        current_score = _evaluation_score(state.get("evaluation"))
+        if state.get("status") != "success" or (
+            best_score is not None and (current_score is None or best_score > current_score)
+        ):
+            _restore_result(state, best)
+
     try:
         payload, tokens = summarize_result(
             state["question"],
@@ -250,7 +405,6 @@ _INSIGHT_LIST_KEYS = (
     "correlation_insights",
     "what_this_data_cannot_tell_you",
     "actionable_recommendations",
-    "caveats",
 )
 # Decisions stay objects -- what/who/why/measure/confidence only mean something together.
 _INSIGHT_OBJECT_KEYS = ("decisions",)
@@ -327,46 +481,8 @@ def _coerce_insight_narrative(payload: Any) -> dict[str, Any] | None:
 
 
 
-# Small samples and truncated results are facts about the data, so they are appended
-# in code rather than left to the model, which does not reliably volunteer them.
-SMALL_RESULT_ROWS = 5
-WEAK_CORRELATION_SAMPLE = 10
-# The model keeps volunteering its own sampling caveat even when told not to, because the
-# truncation is right there in its context. Dropping those by hand is more reliable than
-# rewording the prompt again, and only applies once we have added the authoritative one.
-_SAMPLING_CAVEAT_TERMS = ("sample", "sampled", "row", "rows", "analysed", "analyzed")
-
-
-def _mandatory_caveats(statistics: dict[str, Any]) -> list[str]:
-    caveats: list[str] = []
-    rows_analysed = int(statistics.get("rows_analysed") or 0)
-    rows_matched = int(statistics.get("rows_matched") or rows_analysed)
-
-    if statistics.get("sampled"):
-        caveats.append(
-            f"Only {rows_analysed:,} of {rows_matched:,} matching rows were analysed, "
-            "so these figures describe part of the data, not all of it."
-        )
-    elif 0 < rows_analysed < SMALL_RESULT_ROWS:
-        caveats.append(
-            f"This is based on just {rows_analysed} row(s), which is too few to show a reliable pattern."
-        )
-
-    correlations = statistics.get("correlations") or []
-    smallest_sample = min(
-        (int(pair.get("sample_size") or 0) for pair in correlations),
-        default=None,
-    )
-    if smallest_sample is not None and smallest_sample < WEAK_CORRELATION_SAMPLE:
-        caveats.append(
-            f"The relationships between columns were measured on as few as {smallest_sample} "
-            "data points, so treat them as a hint rather than proof."
-        )
-    return caveats
-
-
 def _node_insight(state: _ChatState) -> _ChatState:
-    """Attach a detailed, plain-language reading of the result, in six sections.
+    """Attach a detailed, plain-language reading of the result, section by section.
 
     Statistics are computed from the rows first and passed to the model to quote, so
     the numbers hold even when the LLM is unavailable -- in that case a rule-based
@@ -399,16 +515,6 @@ def _node_insight(state: _ChatState) -> _ChatState:
         narrative = build_fallback_insight(statistics)
         generated_by = "rules"
 
-    required = _mandatory_caveats(statistics)
-    existing = [note for note in (narrative.get("caveats") or []) if note not in required]
-    if required:
-        existing = [
-            note
-            for note in existing
-            if not any(term in note.lower() for term in _SAMPLING_CAVEAT_TERMS)
-        ]
-    narrative["caveats"] = required + existing
-
     # Statistics are what the narrative is written from, but the client only needs the
     # narrative, so they stay server-side.
     state["insight"] = {**narrative, "generated_by": generated_by}
@@ -421,10 +527,23 @@ def _route_after_sql(state: _ChatState) -> str:
 
 def _route_after_execute(state: _ChatState) -> str:
     if state.get("status") == "success":
-        return "summarize"
+        return "evaluate"
     if state.get("attempts", 0) < MAX_SQL_ATTEMPTS:
         return "retry"
+    # A judge-triggered rewrite that ends up broken must not cost the user an answer that
+    # already worked: summarize restores the best earlier attempt instead of failing.
+    if state.get("best_result") is not None:
+        return "summarize"
     return "fail"
+
+
+def _route_after_evaluate(state: _ChatState) -> str:
+    """Rewrite only while the judge rejected the result AND the retry budget is left.
+
+    _node_evaluate sets retry_reason and owns the counter, so this stays a pure read and the
+    loop is bounded by MAX_SQL_EVAL_ATTEMPTS no matter what the model returns.
+    """
+    return "retry" if state.get("retry_reason") == "evaluation" else "summarize"
 
 
 @lru_cache(maxsize=1)
@@ -434,6 +553,7 @@ def _build_graph():
     graph = StateGraph(_ChatState)
     graph.add_node("generate_sql", _node_generate_sql)
     graph.add_node("execute", _node_execute)
+    graph.add_node("evaluate", _node_evaluate)
     graph.add_node("summarize", _node_summarize)
     graph.add_node("insight", _node_insight)
 
@@ -444,7 +564,17 @@ def _build_graph():
     graph.add_conditional_edges(
         "execute",
         _route_after_execute,
-        {"summarize": "summarize", "retry": "generate_sql", "fail": END},
+        {
+            "evaluate": "evaluate",
+            "summarize": "summarize",
+            "retry": "generate_sql",
+            "fail": END,
+        },
+    )
+    graph.add_conditional_edges(
+        "evaluate",
+        _route_after_evaluate,
+        {"summarize": "summarize", "retry": "generate_sql"},
     )
     graph.add_edge("summarize", "insight")
     graph.add_edge("insight", END)
@@ -508,6 +638,7 @@ def run_data_chat_query(
     is_clean: bool,
     session_id: Optional[str],
     include_insight: bool = True,
+    debug_sql: bool = False,
 ) -> dict[str, Any]:
     ensure_data_chat_tables()
 
@@ -530,8 +661,10 @@ def run_data_chat_query(
         "df": df,
         "history": history,
         "attempts": 0,
+        "eval_attempts": 0,
         "tokens": 0,
         "want_insight": include_insight,
+        "want_eval": True,
     }
 
     try:
@@ -563,6 +696,7 @@ def run_data_chat_query(
         assistant_text=final.get("answer"),
         chart_spec=final.get("chart"),
         insight=final.get("insight"),
+        sql_evaluation=final.get("evaluation"),
         result_preview=rows[:MAX_PREVIEW_ROWS] if rows else None,
         row_count=len(rows),
         status=status,
@@ -576,13 +710,12 @@ def run_data_chat_query(
     db.commit()
     db.refresh(message)
 
-    return {
+    payload: dict[str, Any] = {
         "session_id": session.id,
         "message_id": message.id,
         "status": status,
         "answer": final.get("answer")
         or (to_user_message(final.get("error")) if status == "error" else ""),
-        "sql": final.get("sql") or None,
         "columns": columns,
         "rows": rows,
         # row_count pehle jaisa hi hai: kitni rows response me bheji gayi (MAX_RESULT_ROWS par
@@ -598,6 +731,21 @@ def run_data_chat_query(
         # Technical error DB/logs me hi rehta hai; client ko plain-English message jaata hai.
         "error": to_user_message(final.get("error")) if status == "error" else None,
     }
+    # Raw SQL normally response me nahi jaati (DB ke generated_sql me hi rehti hai);
+    # sirf debugging ke liye, dono switch ON hone par wapas add hoti hai.
+    if _should_expose_sql(debug_sql):
+        payload["sql"] = final.get("sql") or None
+
+    # How well the judge thought this result answers the question. Score and verdict are
+    # safe to show; the issues quote the SQL, so they follow the same gate the SQL does.
+    evaluation = final.get("evaluation")
+    if isinstance(evaluation, dict):
+        summary = {"score": evaluation.get("score"), "verdict": evaluation.get("verdict")}
+        if _should_expose_sql(debug_sql):
+            summary["issues"] = evaluation.get("issues") or []
+            summary["retries"] = int(final.get("eval_attempts", 0) or 0)
+        payload["sql_evaluation"] = summary
+    return payload
 
 
 def get_suggested_questions(
@@ -608,10 +756,13 @@ def get_suggested_questions(
     dataset_id: int,
     is_clean: bool,
     count: int = DEFAULT_SUGGESTED_QUESTIONS,
+    regenerate: bool = False,
 ) -> list[dict[str, Any]]:
     """Generate a handful of dummy questions for a dataset and answer each with its chart,
     so the frontend can show a preview of what data chat can do without the user typing anything.
-    Results are cached per dataset so repeated hits skip the LLM entirely."""
+    Results are cached per dataset so repeated hits skip the LLM entirely, unless ``regenerate``
+    is set -- that always calls the LLM again and steers it away from the cached batch so the
+    user gets a different set of questions instead of the same one back."""
     ensure_data_chat_tables()
 
     cache_row = (
@@ -627,7 +778,12 @@ def get_suggested_questions(
         (datetime.utcnow() - cache_row.updated_at).total_seconds() if cache_row else None
     )
     cached_suggestions = cache_row.suggestions if cache_row else None
-    if cached_suggestions and cache_age is not None and cache_age < SUGGESTIONS_CACHE_TTL_SECONDS:
+    if (
+        not regenerate
+        and cached_suggestions
+        and cache_age is not None
+        and cache_age < SUGGESTIONS_CACHE_TTL_SECONDS
+    ):
         if len(cached_suggestions) >= count:
             return cached_suggestions[:count]
 
@@ -640,7 +796,32 @@ def get_suggested_questions(
         raise error_response(status_code=400, detail="Dataset has no data to query.")
 
     schema_context = build_schema_context(df)
-    questions, _ = generate_sample_questions(schema_context, count)
+
+    # regenerate=true ke liye pichla cached batch hi "avoid" list hai -- iske alawa kuch
+    # store nahi karna padta aur "not previous one" ki ask exactly yehi cover karti hai.
+    avoid_questions: list[str] | None = None
+    if regenerate and cached_suggestions:
+        avoid_questions = [
+            str(item.get("question") or "").strip()
+            for item in cached_suggestions
+            if str(item.get("question") or "").strip()
+        ] or None
+
+    questions, _ = generate_sample_questions(schema_context, count, avoid_questions=avoid_questions)
+
+    if avoid_questions:
+        # Model kabhi kabhi avoid list ke bawajood ek purana sawaal repeat kar deta hai;
+        # yeh safety net unhe drop karta hai aur zaroorat pade to bacha hua count ek aur
+        # call se bhar deta hai, taaki regenerate hamesha genuinely different lage.
+        avoid_normalised = {question.lower() for question in avoid_questions}
+        questions = [q for q in questions if q.lower() not in avoid_normalised]
+        if len(questions) < count:
+            extra, _ = generate_sample_questions(
+                schema_context,
+                count - len(questions),
+                avoid_questions=avoid_questions + questions,
+            )
+            questions.extend(q for q in extra if q.lower() not in avoid_normalised)
 
     results: list[dict[str, Any]] = []
     for question in questions:
@@ -652,8 +833,10 @@ def get_suggested_questions(
             "attempts": 0,
             "tokens": 0,
             # Suggestions only need the chart type, so skip the insight LLM call that
-            # would otherwise run once per suggested question.
+            # would otherwise run once per suggested question -- and the judge with it,
+            # which would otherwise cost one more call per question on every cache miss.
             "want_insight": False,
+            "want_eval": False,
         }
         try:
             final: _ChatState = _build_graph().invoke(initial)
@@ -689,11 +872,9 @@ def get_suggested_questions(
 
     return results
 
-    return results
-
 
 def get_session_messages(
-    db: Session, current_user: User, session_id: str
+    db: Session, current_user: User, session_id: str, debug_sql: bool = False
 ) -> list[dict[str, Any]]:
     session = (
         db.query(DataChatSession)
@@ -712,13 +893,14 @@ def get_session_messages(
         .order_by(DataChatMessage.created_at.asc())
         .all()
     )
-    return [
-        {
+    expose_sql = _should_expose_sql(debug_sql)
+    history: list[dict[str, Any]] = []
+    for m in messages:
+        entry: dict[str, Any] = {
             "message_id": m.id,
             "question": m.nl_query,
             "answer": m.assistant_text
             or (to_user_message(m.error_message) if m.status == "error" else None),
-            "sql": m.generated_sql,
             "chart_spec": m.chart_spec,
             "insight": m.insight,
             "rows": m.result_preview or [],
@@ -727,8 +909,12 @@ def get_session_messages(
             "error": to_user_message(m.error_message) if m.status == "error" else None,
             "created_at": m.created_at.isoformat() if m.created_at else None,
         }
-        for m in messages
-    ]
+        # Query API jaisa hi rule: normally SQL client tak nahi jaati, sirf debugging ke
+        # liye dono switch ON hone par history me wapas aati hai.
+        if expose_sql:
+            entry["sql"] = m.generated_sql
+        history.append(entry)
+    return history
 
 
 

@@ -20,6 +20,9 @@ MAX_SAMPLE_VALUES = 6
 LOW_CARDINALITY_LIMIT = 25
 SUMMARY_SAMPLE_ROWS = 20
 INSIGHT_SAMPLE_ROWS = 30
+# The judge reasons about the shape of the result, not its full contents, so it gets a
+# smaller sample than the summariser: enough rows to see the grouping and the ordering.
+EVAL_SAMPLE_ROWS = 10
 
 _SQL_SYSTEM_PROMPT = (
     "You are an expert data analyst that translates a natural-language question into a single "
@@ -63,7 +66,40 @@ _SUGGESTIONS_SYSTEM_PROMPT = (
     "- Only ask questions answerable from the given columns.\n"
     "- Keep each question under 15 words.\n"
     "- Make the questions diverse in intent, not variations of the same question.\n"
-    "- Return exactly the requested count."
+    "- Return exactly the requested count.\n"
+    "- If a list of questions to avoid is given, return ones that differ in both "
+    "wording and intent from every question on that list, not just a light reword."
+)
+
+_SQL_EVAL_SYSTEM_PROMPT = (
+    "You check whether a SQL query and the rows it returned actually answer the question that "
+    "was asked. You are given the schema, the question, the SQL that ran, and a sample of its "
+    "result.\n"
+    "Output JSON only: {\"score\": 0-100, \"verdict\": \"pass|weak|fail\", \"issues\": [\"...\"]}.\n"
+    "Scoring:\n"
+    "- 90-100: the result answers exactly what was asked.\n"
+    "- 70-89: it answers the question with a minor gap that does not change the conclusion.\n"
+    "- 40-69: it answers only part of the question, or answers a near-miss version of it.\n"
+    "- 0-39: it answers a different question: wrong measure, wrong grouping, or a filter the "
+    "question required is missing.\n"
+    "Check the mistakes that run without erroring:\n"
+    "- the measure aggregated is the one the question asks about, not a neighbouring column;\n"
+    "- the grouping dimension is the one the question asks about;\n"
+    "- every filter named in the question (a date range, a category, a threshold) is in the SQL;\n"
+    "- a top-N or bottom-N question has both ORDER BY and LIMIT, in the right direction;\n"
+    "- the aggregate the question implies (sum, average, count, share) is the one used;\n"
+    "- a question about a trend returns the time column it should be plotted against.\n"
+    "Rules:\n"
+    "- Judge only whether the question is answered. Never lower the score for column naming, "
+    "formatting, rounding, row order beyond what was asked, or SQL you would have written "
+    "differently.\n"
+    "- An empty result is not wrong by itself. Fail it only when the SQL is the reason -- a "
+    "filter that cannot match, or a condition the question never asked for.\n"
+    "- A result capped at a row limit is not wrong; the caller caps rows after the query runs.\n"
+    "- issues: one short instruction per entry, naming what to change. The SQL is rewritten "
+    "from these, so write them as fixes, not as observations. Return [] when the score is 90+.\n"
+    "- Be decisive. If the result answers the question, say so with a high score rather than "
+    "hunting for something to complain about."
 )
 
 _SUMMARY_SYSTEM_PROMPT = (
@@ -370,10 +406,19 @@ def generate_sql(
     return _extract_json(content), tokens
 
 
-def generate_sample_questions(schema_context: str, count: int) -> tuple[list[str], int]:
-    """Returns (list of dummy questions covering varied chart types, tokens_used)."""
+def generate_sample_questions(
+    schema_context: str, count: int, avoid_questions: list[str] | None = None
+) -> tuple[list[str], int]:
+    """Returns (list of dummy questions covering varied chart types, tokens_used).
+
+    ``avoid_questions``, when given, is the previous batch shown to the user; passing it
+    is how ``regenerate=true`` gets a genuinely different set instead of the same one again.
+    """
     system = _SUGGESTIONS_SYSTEM_PROMPT
     user = f"{schema_context}\n\nGenerate exactly {count} questions."
+    if avoid_questions:
+        avoid_list = "\n".join(f"- {question}" for question in avoid_questions)
+        user += f"\n\nQuestions to avoid (already suggested, do not repeat or reword):\n{avoid_list}"
     content, tokens = _invoke(system, user, label="data-chat-suggestions")
     payload = _extract_json(content)
     questions = [str(q).strip() for q in payload.get("questions", []) if str(q).strip()]
@@ -409,6 +454,33 @@ def summarize_result(
     return _extract_json(content), tokens
 
 
+def evaluate_sql_result(
+    question: str,
+    sql: str,
+    schema_context: str,
+    columns: list[str],
+    rows: list[dict[str, Any]],
+    total_rows: int | None = None,
+) -> tuple[dict[str, Any], int]:
+    """Returns ({score, verdict, issues}, tokens_used) for how well a result answers a question.
+
+    The judge sees the schema as well as the result, so it can catch a measure or a filter the
+    SQL should have used and did not -- something the rows alone would never reveal.
+    """
+    sample = rows[:EVAL_SAMPLE_ROWS]
+    matched_rows = len(rows) if total_rows is None else int(total_rows)
+    user = (
+        f"{schema_context}\n\n"
+        f"Question the user asked: {question}\n\n"
+        f"SQL that ran:\n{sql}\n\n"
+        f"Result columns: {columns}\n"
+        f"Rows returned: {matched_rows} (showing {len(sample)})\n"
+        f"{json.dumps(sample, ensure_ascii=False, default=str)}"
+    )
+    content, tokens = _invoke(_SQL_EVAL_SYSTEM_PROMPT, user, label="data-chat-sql-eval")
+    return _extract_json(content), tokens
+
+
 def generate_insight(
     question: str,
     columns: list[str],
@@ -425,8 +497,8 @@ def generate_insight(
     """
     sample = rows[:INSIGHT_SAMPLE_ROWS]
     matched_rows = len(rows) if total_rows is None else int(total_rows)
-    # The caller appends a truncation caveat itself, so the model is only told the
-    # scope of what it is looking at -- otherwise both add one and they read as duplicates.
+    # The model is told the scope of what it is looking at so a reading built on a
+    # truncated result does not get written as if it covered every matching row.
     truncation_note = (
         f"\nOnly {len(rows)} of {matched_rows} matching rows were analysed."
         if matched_rows > len(rows)
