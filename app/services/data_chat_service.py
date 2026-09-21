@@ -250,7 +250,6 @@ _INSIGHT_LIST_KEYS = (
     "correlation_insights",
     "what_this_data_cannot_tell_you",
     "actionable_recommendations",
-    "caveats",
 )
 # Decisions stay objects -- what/who/why/measure/confidence only mean something together.
 _INSIGHT_OBJECT_KEYS = ("decisions",)
@@ -327,46 +326,8 @@ def _coerce_insight_narrative(payload: Any) -> dict[str, Any] | None:
 
 
 
-# Small samples and truncated results are facts about the data, so they are appended
-# in code rather than left to the model, which does not reliably volunteer them.
-SMALL_RESULT_ROWS = 5
-WEAK_CORRELATION_SAMPLE = 10
-# The model keeps volunteering its own sampling caveat even when told not to, because the
-# truncation is right there in its context. Dropping those by hand is more reliable than
-# rewording the prompt again, and only applies once we have added the authoritative one.
-_SAMPLING_CAVEAT_TERMS = ("sample", "sampled", "row", "rows", "analysed", "analyzed")
-
-
-def _mandatory_caveats(statistics: dict[str, Any]) -> list[str]:
-    caveats: list[str] = []
-    rows_analysed = int(statistics.get("rows_analysed") or 0)
-    rows_matched = int(statistics.get("rows_matched") or rows_analysed)
-
-    if statistics.get("sampled"):
-        caveats.append(
-            f"Only {rows_analysed:,} of {rows_matched:,} matching rows were analysed, "
-            "so these figures describe part of the data, not all of it."
-        )
-    elif 0 < rows_analysed < SMALL_RESULT_ROWS:
-        caveats.append(
-            f"This is based on just {rows_analysed} row(s), which is too few to show a reliable pattern."
-        )
-
-    correlations = statistics.get("correlations") or []
-    smallest_sample = min(
-        (int(pair.get("sample_size") or 0) for pair in correlations),
-        default=None,
-    )
-    if smallest_sample is not None and smallest_sample < WEAK_CORRELATION_SAMPLE:
-        caveats.append(
-            f"The relationships between columns were measured on as few as {smallest_sample} "
-            "data points, so treat them as a hint rather than proof."
-        )
-    return caveats
-
-
 def _node_insight(state: _ChatState) -> _ChatState:
-    """Attach a detailed, plain-language reading of the result, in six sections.
+    """Attach a detailed, plain-language reading of the result, section by section.
 
     Statistics are computed from the rows first and passed to the model to quote, so
     the numbers hold even when the LLM is unavailable -- in that case a rule-based
@@ -398,16 +359,6 @@ def _node_insight(state: _ChatState) -> _ChatState:
     if narrative is None:
         narrative = build_fallback_insight(statistics)
         generated_by = "rules"
-
-    required = _mandatory_caveats(statistics)
-    existing = [note for note in (narrative.get("caveats") or []) if note not in required]
-    if required:
-        existing = [
-            note
-            for note in existing
-            if not any(term in note.lower() for term in _SAMPLING_CAVEAT_TERMS)
-        ]
-    narrative["caveats"] = required + existing
 
     # Statistics are what the narrative is written from, but the client only needs the
     # narrative, so they stay server-side.
@@ -582,7 +533,9 @@ def run_data_chat_query(
         "status": status,
         "answer": final.get("answer")
         or (to_user_message(final.get("error")) if status == "error" else ""),
-        "sql": final.get("sql") or None,
+        # Raw SQL response se hata diya gaya hai: query DB (generated_sql) aur logs me
+        # ab bhi save hoti hai, bas client ko wapas nahi jaati.
+        # "sql": final.get("sql") or None,
         "columns": columns,
         "rows": rows,
         # row_count pehle jaisa hi hai: kitni rows response me bheji gayi (MAX_RESULT_ROWS par
@@ -608,10 +561,13 @@ def get_suggested_questions(
     dataset_id: int,
     is_clean: bool,
     count: int = DEFAULT_SUGGESTED_QUESTIONS,
+    regenerate: bool = False,
 ) -> list[dict[str, Any]]:
     """Generate a handful of dummy questions for a dataset and answer each with its chart,
     so the frontend can show a preview of what data chat can do without the user typing anything.
-    Results are cached per dataset so repeated hits skip the LLM entirely."""
+    Results are cached per dataset so repeated hits skip the LLM entirely, unless ``regenerate``
+    is set -- that always calls the LLM again and steers it away from the cached batch so the
+    user gets a different set of questions instead of the same one back."""
     ensure_data_chat_tables()
 
     cache_row = (
@@ -627,7 +583,12 @@ def get_suggested_questions(
         (datetime.utcnow() - cache_row.updated_at).total_seconds() if cache_row else None
     )
     cached_suggestions = cache_row.suggestions if cache_row else None
-    if cached_suggestions and cache_age is not None and cache_age < SUGGESTIONS_CACHE_TTL_SECONDS:
+    if (
+        not regenerate
+        and cached_suggestions
+        and cache_age is not None
+        and cache_age < SUGGESTIONS_CACHE_TTL_SECONDS
+    ):
         if len(cached_suggestions) >= count:
             return cached_suggestions[:count]
 
@@ -640,7 +601,32 @@ def get_suggested_questions(
         raise error_response(status_code=400, detail="Dataset has no data to query.")
 
     schema_context = build_schema_context(df)
-    questions, _ = generate_sample_questions(schema_context, count)
+
+    # regenerate=true ke liye pichla cached batch hi "avoid" list hai -- iske alawa kuch
+    # store nahi karna padta aur "not previous one" ki ask exactly yehi cover karti hai.
+    avoid_questions: list[str] | None = None
+    if regenerate and cached_suggestions:
+        avoid_questions = [
+            str(item.get("question") or "").strip()
+            for item in cached_suggestions
+            if str(item.get("question") or "").strip()
+        ] or None
+
+    questions, _ = generate_sample_questions(schema_context, count, avoid_questions=avoid_questions)
+
+    if avoid_questions:
+        # Model kabhi kabhi avoid list ke bawajood ek purana sawaal repeat kar deta hai;
+        # yeh safety net unhe drop karta hai aur zaroorat pade to bacha hua count ek aur
+        # call se bhar deta hai, taaki regenerate hamesha genuinely different lage.
+        avoid_normalised = {question.lower() for question in avoid_questions}
+        questions = [q for q in questions if q.lower() not in avoid_normalised]
+        if len(questions) < count:
+            extra, _ = generate_sample_questions(
+                schema_context,
+                count - len(questions),
+                avoid_questions=avoid_questions + questions,
+            )
+            questions.extend(q for q in extra if q.lower() not in avoid_normalised)
 
     results: list[dict[str, Any]] = []
     for question in questions:
@@ -689,8 +675,6 @@ def get_suggested_questions(
 
     return results
 
-    return results
-
 
 def get_session_messages(
     db: Session, current_user: User, session_id: str
@@ -718,7 +702,8 @@ def get_session_messages(
             "question": m.nl_query,
             "answer": m.assistant_text
             or (to_user_message(m.error_message) if m.status == "error" else None),
-            "sql": m.generated_sql,
+            # Query API ki tarah history me bhi raw SQL client ko nahi bheji jaati.
+            # "sql": m.generated_sql,
             "chart_spec": m.chart_spec,
             "insight": m.insight,
             "rows": m.result_preview or [],

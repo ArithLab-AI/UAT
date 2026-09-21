@@ -54,7 +54,8 @@ class DataChatQueryResponse(BaseModel):
     message_id: str
     status: str  # success | error | clarify
     answer: str
-    sql: Optional[str] = None
+    # Raw SQL ab response me nahi jaati; DB me generated_sql par save rehti hai.
+    # sql: Optional[str] = None
     columns: list[str] = Field(default_factory=list)
     rows: list[dict[str, Any]] = Field(default_factory=list)
     row_count: int = 0

@@ -63,7 +63,9 @@ _SUGGESTIONS_SYSTEM_PROMPT = (
     "- Only ask questions answerable from the given columns.\n"
     "- Keep each question under 15 words.\n"
     "- Make the questions diverse in intent, not variations of the same question.\n"
-    "- Return exactly the requested count."
+    "- Return exactly the requested count.\n"
+    "- If a list of questions to avoid is given, return ones that differ in both "
+    "wording and intent from every question on that list, not just a light reword."
 )
 
 _SUMMARY_SYSTEM_PROMPT = (
@@ -370,10 +372,19 @@ def generate_sql(
     return _extract_json(content), tokens
 
 
-def generate_sample_questions(schema_context: str, count: int) -> tuple[list[str], int]:
-    """Returns (list of dummy questions covering varied chart types, tokens_used)."""
+def generate_sample_questions(
+    schema_context: str, count: int, avoid_questions: list[str] | None = None
+) -> tuple[list[str], int]:
+    """Returns (list of dummy questions covering varied chart types, tokens_used).
+
+    ``avoid_questions``, when given, is the previous batch shown to the user; passing it
+    is how ``regenerate=true`` gets a genuinely different set instead of the same one again.
+    """
     system = _SUGGESTIONS_SYSTEM_PROMPT
     user = f"{schema_context}\n\nGenerate exactly {count} questions."
+    if avoid_questions:
+        avoid_list = "\n".join(f"- {question}" for question in avoid_questions)
+        user += f"\n\nQuestions to avoid (already suggested, do not repeat or reword):\n{avoid_list}"
     content, tokens = _invoke(system, user, label="data-chat-suggestions")
     payload = _extract_json(content)
     questions = [str(q).strip() for q in payload.get("questions", []) if str(q).strip()]
@@ -425,8 +436,8 @@ def generate_insight(
     """
     sample = rows[:INSIGHT_SAMPLE_ROWS]
     matched_rows = len(rows) if total_rows is None else int(total_rows)
-    # The caller appends a truncation caveat itself, so the model is only told the
-    # scope of what it is looking at -- otherwise both add one and they read as duplicates.
+    # The model is told the scope of what it is looking at so a reading built on a
+    # truncated result does not get written as if it covered every matching row.
     truncation_note = (
         f"\nOnly {len(rows)} of {matched_rows} matching rows were analysed."
         if matched_rows > len(rows)

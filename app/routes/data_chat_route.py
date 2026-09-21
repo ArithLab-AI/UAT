@@ -64,6 +64,9 @@ def get_suggested_questions_route(
     dataset_id: int,
     is_clean: bool = False,
     count: int = DEFAULT_SUGGESTED_QUESTIONS,
+    # False (default): serve the cached batch when it's still fresh. True: always ask the
+    # LLM again for a batch that's different from what's cached, and cache that instead.
+    regenerate: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -75,6 +78,7 @@ def get_suggested_questions_route(
         dataset_id=dataset_id,
         is_clean=is_clean,
         count=count,
+        regenerate=regenerate,
     )
     return success_response("Suggested questions generated", data=data)
 
