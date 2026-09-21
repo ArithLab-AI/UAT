@@ -63,6 +63,9 @@ class DataChatMessage(Base):
     # user saw live instead of only the one-line answer. Shape varies by question type,
     # and 'decisions' holds objects, so this stays a JSON column.
     insight = Column(JSON, nullable=True)
+    # {score, verdict, issues} from the SQL judge for this turn, kept so the quality of
+    # generated SQL can be audited later instead of only being acted on live.
+    sql_evaluation = Column(JSON, nullable=True)
     result_preview = Column(JSON, nullable=True)  # capped list of result rows for history
     row_count = Column(Integer, nullable=True)
     status = Column(String(20), nullable=False, default="success")  # success | error | clarify
