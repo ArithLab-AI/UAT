@@ -59,9 +59,10 @@ DEFAULT_SUGGESTED_QUESTIONS = 5
 SUGGESTIONS_CACHE_TTL_SECONDS = 6 * 60 * 60  # 6 hours
 
 
-def _should_expose_sql(debug_sql: bool) -> bool:
-    """SQL response me tabhi jaata hai jab env flag ON ho AUR caller ne maanga ho."""
-    return bool(debug_sql) and bool(settings.UAT_DATA_CHAT_EXPOSE_SQL)
+def _should_expose_sql() -> bool:
+    """SQL (aur uske eval issues) response me sirf UAT_DATA_CHAT_EXPOSE_SQL=true hone
+    par jaate hain -- koi query param nahi, purely config-driven switch hai."""
+    return bool(settings.UAT_DATA_CHAT_EXPOSE_SQL)
 
 
 @lru_cache(maxsize=1)
@@ -638,7 +639,6 @@ def run_data_chat_query(
     is_clean: bool,
     session_id: Optional[str],
     include_insight: bool = True,
-    debug_sql: bool = False,
 ) -> dict[str, Any]:
     ensure_data_chat_tables()
 
@@ -733,7 +733,7 @@ def run_data_chat_query(
     }
     # Raw SQL normally response me nahi jaati (DB ke generated_sql me hi rehti hai);
     # sirf debugging ke liye, dono switch ON hone par wapas add hoti hai.
-    if _should_expose_sql(debug_sql):
+    if _should_expose_sql():
         payload["sql"] = final.get("sql") or None
 
     # How well the judge thought this result answers the question. Score and verdict are
@@ -741,7 +741,7 @@ def run_data_chat_query(
     evaluation = final.get("evaluation")
     if isinstance(evaluation, dict):
         summary = {"score": evaluation.get("score"), "verdict": evaluation.get("verdict")}
-        if _should_expose_sql(debug_sql):
+        if _should_expose_sql():
             summary["issues"] = evaluation.get("issues") or []
             summary["retries"] = int(final.get("eval_attempts", 0) or 0)
         payload["sql_evaluation"] = summary
@@ -874,7 +874,7 @@ def get_suggested_questions(
 
 
 def get_session_messages(
-    db: Session, current_user: User, session_id: str, debug_sql: bool = False
+    db: Session, current_user: User, session_id: str
 ) -> list[dict[str, Any]]:
     session = (
         db.query(DataChatSession)
@@ -893,7 +893,7 @@ def get_session_messages(
         .order_by(DataChatMessage.created_at.asc())
         .all()
     )
-    expose_sql = _should_expose_sql(debug_sql)
+    expose_sql = _should_expose_sql()
     history: list[dict[str, Any]] = []
     for m in messages:
         entry: dict[str, Any] = {
