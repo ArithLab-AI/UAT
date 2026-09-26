@@ -148,7 +148,7 @@ def _normalize_rename_name(name: str) -> str:
 
 
 def _uploaded_rename_values(dataset: CsvUploadedDataset, requested_name: str) -> tuple[str, str]:
-    """Keep an uploaded dataset's original extension and sheet label on rename."""
+    """Keep file metadata intact while using the requested dataset display name."""
     sheet_suffix = f" ({dataset.sheet_name})" if dataset.sheet_name else ""
     requested_base = requested_name
     if sheet_suffix and requested_base.lower().endswith(sheet_suffix.lower()):
@@ -163,7 +163,11 @@ def _uploaded_rename_values(dataset: CsvUploadedDataset, requested_name: str) ->
     if not requested_base:
         raise error_response(status_code=400, detail="Dataset name cannot be empty")
 
-    return f"{requested_base}{sheet_suffix}", f"{requested_base}{extension}{sheet_suffix}"
+    # ``sheet_name`` is already returned separately.  It must not be folded into the
+    # dataset name, otherwise a rename such as "Sales" appears as
+    # "Sales (Sheet1)" again in the dataset list.  Retain it only on ``file_name``
+    # so existing file and sheet-specific flows continue to identify the same data.
+    return requested_base, f"{requested_base}{extension}{sheet_suffix}"
 
 
 def _merged_rename_value(requested_name: str) -> str:
