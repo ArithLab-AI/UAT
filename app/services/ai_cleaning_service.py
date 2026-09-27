@@ -1610,13 +1610,13 @@ def _run_ai_cleaning_batch_worker(
         db.close()
 
 
-def get_ai_cleaning_detail(
+def _find_latest_ai_cleaning_record(
     db: Session,
     *,
     current_user: User,
     dataset_id: int,
     dataset_type: str | None = None,
-) -> dict[str, Any]:
+) -> tuple[CleaningJob, AICleaningJobDetail]:
     query = (
         db.query(CleaningJob, AICleaningJobDetail)
         .join(AICleaningJobDetail, AICleaningJobDetail.job_id == CleaningJob.id)
@@ -1636,9 +1636,58 @@ def get_ai_cleaning_detail(
     )
     if record is None:
         raise error_response(status_code=404, detail="AI cleaning data not found for the provided dataset")
+    return record
 
-    job, detail = record
+
+def get_ai_cleaning_detail(
+    db: Session,
+    *,
+    current_user: User,
+    dataset_id: int,
+    dataset_type: str | None = None,
+) -> dict[str, Any]:
+    job, detail = _find_latest_ai_cleaning_record(
+        db,
+        current_user=current_user,
+        dataset_id=dataset_id,
+        dataset_type=dataset_type,
+    )
     return _serialize_ai_cleaning_detail(job, detail)
+
+
+def get_ai_cleaned_table_data(
+    db: Session,
+    *,
+    current_user: User,
+    dataset_id: int,
+    dataset_type: str | None = None,
+    limit: int = 25,
+) -> dict[str, Any]:
+    """Lightweight cleaned-table rows for a dataset, capped at ``limit`` rows.
+
+    Reuses the preview rows persisted at cleaning time (``detail.cleaned_data``,
+    already capped at ``settings.UAT_AI_CLEAN_PREVIEW_ROWS``) instead of re-reading
+    the full cleaned file from object storage.
+    """
+    job, detail = _find_latest_ai_cleaning_record(
+        db,
+        current_user=current_user,
+        dataset_id=dataset_id,
+        dataset_type=dataset_type,
+    )
+    available_rows = detail.cleaned_data or []
+    rows = available_rows[:limit]
+    total_rows = detail.cleaned_rows or 0
+    return {
+        "job_id": job.id,
+        "source_dataset_id": detail.source_dataset_id,
+        "source_dataset_type": detail.source_dataset_type,
+        "cleaned_columns": detail.cleaned_columns or [],
+        "cleaned_data": rows,
+        "rows_returned": len(rows),
+        "cleaned_rows": total_rows,
+        "truncated": total_rows > len(rows),
+    }
 
 
 def get_ai_cleaning_detail_by_job_id(db: Session, *, current_user: User, job_id: str) -> dict[str, Any]:

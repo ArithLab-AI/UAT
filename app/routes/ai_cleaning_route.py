@@ -10,6 +10,7 @@ from app.config.deps import get_current_user
 from app.db.database import get_db
 from app.models.auth_models import User
 from app.schemas.ai_cleaning_schema import (
+    AICleanedTableDataSuccessResponse,
     AICleaningAnalysisRequest,
     AICleaningAnalysisSuccessResponse,
     AICleaningBatchRunRequest,
@@ -21,6 +22,7 @@ from app.schemas.ai_cleaning_schema import (
 from app.services.ai_cleaning_service import (
     analyze_ai_cleaning_output,
     get_ai_cleaned_download_payload,
+    get_ai_cleaned_table_data,
     get_ai_cleaning_detail,
     get_ai_cleaning_detail_by_job_id,
     run_ai_cleaning,
@@ -102,6 +104,31 @@ def get_ai_cleaning_job(
             current_user=current_user,
             dataset_id=dataset_id,
             dataset_type=dataset_type,
+        ),
+    )
+
+
+@router.get(
+    "/{dataset_id:int}/data",
+    response_model=AICleanedTableDataSuccessResponse,
+    response_model_exclude_none=True,
+    summary="Get cleaned table rows for a dataset (capped at 20-30 rows)",
+)
+def get_ai_cleaned_table_rows(
+    dataset_id: int,
+    dataset_type: Literal["uploaded", "merged"] | None = Query(default=None),
+    limit: int = Query(default=25, ge=20, le=30),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    return success_response(
+        "Cleaned table data fetched successfully",
+        data=get_ai_cleaned_table_data(
+            db,
+            current_user=current_user,
+            dataset_id=dataset_id,
+            dataset_type=dataset_type,
+            limit=limit,
         ),
     )
 
