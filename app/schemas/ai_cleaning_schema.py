@@ -164,6 +164,17 @@ class AICleaningDetailResponse(AICleaningPayloadResponse):
     updated_at: str | None = None
 
 
+class AICleanedTableDataResponse(BaseModel):
+    job_id: str
+    source_dataset_id: int
+    source_dataset_type: Literal["uploaded", "merged"]
+    cleaned_columns: list[str] = Field(default_factory=list)
+    cleaned_data: list[dict] = Field(default_factory=list)
+    rows_returned: int = 0
+    cleaned_rows: int = 0
+    truncated: bool = False
+
+
 class AICleaningAnalysisRequest(BaseModel):
     use_llm: bool = True
     llm_provider: Literal["openai"] | None = None
@@ -194,3 +205,4 @@ AICleaningRunSuccessResponse = SuccessResponse[AICleaningPayloadResponse]
 AICleaningBatchRunSuccessResponse = SuccessResponse[AICleaningBatchPayloadResponse]
 AICleaningDetailSuccessResponse = SuccessResponse[AICleaningDetailResponse]
 AICleaningAnalysisSuccessResponse = SuccessResponse[AICleaningAnalysisResponse]
+AICleanedTableDataSuccessResponse = SuccessResponse[AICleanedTableDataResponse]
