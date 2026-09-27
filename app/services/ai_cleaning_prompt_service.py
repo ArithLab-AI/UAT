@@ -69,6 +69,8 @@ Rules:
 4. Preserve the exact number of rows and the exact same column keys in every row.
 5. If the prompt asks for a literal placeholder such as "NaN", "NULL", or "N/A", write that exact string value, not JSON null.
 6. If the instruction targets empty values, treat nulls, blank strings, and visibly empty cells as empty values.
+7. If the prompt asks to strip, remove, or replace only a specific substring, character, symbol, prefix, or suffix (e.g. a currency symbol, a word, a code, punctuation, or whitespace) from a column's values, remove or replace ONLY that specific part and keep the rest of the original value exactly as-is. Never replace the whole cell with a placeholder like "-", "N/A", "NULL", or an empty value just because part of it was removed.
+8. Only replace a value entirely with a placeholder when the prompt explicitly asks to treat that value as missing/invalid and replace it — never as a side effect of a partial-removal, formatting, validation, or "correct"/"standardize" instruction that does not itself ask for replacement.
 """
 
 _USER_CLEAN_DATA_PROMPT = """
