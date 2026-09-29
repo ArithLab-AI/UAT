@@ -8,9 +8,10 @@ Analyses:
   4. Bottom N                 - rank ascending, N max 10
   5. Time Series              - resample X (date) by granularity, aggregate Y
   6. Advanced Distribution    - group by X, aggregate Y (Y mandatory)
-  7. Correlation              - Pearson only; 2 cols -> scatter; 3+ -> heatmap/pair plot
-  8. Predictive Regression    - train a regression model, report fit metrics + feature
-                                 importance (see predictive_regression_service.py)
+  7. Correlation              - Pearson only; 2 cols -> scatter; 3 -> bubble/heatmap;
+                                 4+ -> heatmap
+  8. Multi Axis               - shared X (category/date), primary Y as columns on the
+                                 left axis, secondary Y as a line on the right axis
   9. Geospatial & Location    - aggregate a metric per location / lat-long point
                                  (see geospatial_analysis_service.py)
 
@@ -47,11 +48,11 @@ from app.services.basic_analysis_helpers import (
 )
 from app.services.data_chat_query_engine import load_dataset_dataframe
 from app.services.geospatial_analysis_service import _compute_geospatial
-from app.services.predictive_regression_service import _compute_predictive_regression
 from app.utils.responses import error_response
 
 
 MAX_POINTS = 2000       # cap for scatter plots
+MAX_BUBBLES = 500       # cap for bubble charts (too many bubbles become unreadable)
 MAX_GROUPS = 100        # cap for group counts on charts
 MAX_HEATMAP_COLS = 20   # cap for correlation heatmap columns
 
@@ -69,8 +70,8 @@ _PANDAS_FREQ: dict[TimeGranularity, str] = {
 # ---------------------------------------------------------------------------
 # _round / _clean_label / _require_column / _numeric_series / _datetime_series /
 # _is_numeric_column / _is_categorical_column / _apply_groupby_aggregation / _PANDAS_AGG
-# now live in basic_analysis_helpers.py (imported above) so predictive_regression_service
-# and geospatial_analysis_service can reuse them without importing this module.
+# now live in basic_analysis_helpers.py (imported above) so geospatial_analysis_service
+# can reuse them without importing this module.
 
 
 def _auto_granularity_freq(dates: pd.Series) -> tuple[str, TimeGranularity]:
@@ -143,7 +144,7 @@ def _compute_descriptive(
 # ---------------------------------------------------------------------------
 # Spec: X = categorical only. Aggregation on X grouped by X itself.
 # Backend: df.groupby(X)[X].agg(agg_func)
-# Charts: Bar, Line, Pie, Doughnut, Line Area.
+# Charts: Bar, Column, Line, Pie, Doughnut, Line Area.
 
 def _compute_simple_distribution(
     df: pd.DataFrame, req: BasicAnalysisRequest, chart_type: ChartType
@@ -337,7 +338,7 @@ def _compute_time_series(
 
 
 # ---------------------------------------------------------------------------
-# 6. Advanced Distribution / Group By
+# 6. Advanced Distribution
 # ---------------------------------------------------------------------------
 # Spec: X=Categorical (required), Y=Numeric (MANDATORY).
 # Backend: df.groupby(X)[Y].agg(agg_func)
@@ -382,8 +383,29 @@ def _compute_advanced_distribution(
 # 7. Correlation Analysis
 # ---------------------------------------------------------------------------
 # Spec: multi-select numeric, min 2 required. Pearson only.
-#   Exactly 2 cols -> Scatter Plot, Scatter + Trend Line.
-#   3 or more cols -> Correlation Heatmap, Pair Plot.
+# Chart type follows the column selection:
+#   Exactly 2 cols -> Scatter Plot  (X = independent, Y = dependent)
+#   Exactly 3 cols -> Bubble Chart  (X, Y, 3rd col = bubble size) or Heatmap
+#   4 or more cols -> Correlation Heatmap
+
+def _correlation_pairs(corr: pd.DataFrame, cols: list[str]) -> list[dict[str, Any]]:
+    """Every unique column pair from a correlation matrix, strongest first."""
+    pairs: list[dict[str, Any]] = []
+    for i in range(len(cols)):
+        for j in range(i + 1, len(cols)):
+            v = corr.iloc[i, j]
+            if pd.isna(v):
+                continue
+            pairs.append({
+                "column_a": cols[i],
+                "column_b": cols[j],
+                "correlation": float(v),
+                "r_squared": round(float(v) * float(v), 4),
+                "strength": _correlation_strength(float(v)),
+            })
+    pairs.sort(key=lambda p: abs(p["correlation"]), reverse=True)
+    return pairs
+
 
 def _compute_correlation(
     df: pd.DataFrame, req: BasicAnalysisRequest, chart_type: ChartType
@@ -401,24 +423,19 @@ def _compute_correlation(
         raise error_response(status_code=400, detail=f"Column(s) must be numeric: {non_numeric}")
 
     # Coerce once: df columns are always loaded as object/string dtype (see
-    # load_dataset_dataframe), so np.polyfit/.corr() need real numeric dtypes here, not raw
-    # strings — operating on df directly raised an unhandled TypeError from np.polyfit.
+    # load_dataset_dataframe), so .corr() needs real numeric dtypes here, not raw strings.
     numeric_df = pd.DataFrame({col: _numeric_series(df, col) for col in cols})
     # A source value like "inf"/"Infinity" or an overflowing literal (e.g. "1e400") coerces
-    # to +/-inf rather than NaN, and dropna() does not remove inf. np.polyfit then fails the
-    # SVD it relies on internally (numpy.linalg.LinAlgError) — an unhandled exception that
-    # surfaced as a raw 500. Treat +/-inf as missing, same as any other unusable value.
+    # to +/-inf rather than NaN, and dropna() does not remove inf. Treat +/-inf as missing,
+    # same as any other unusable value.
     numeric_df = numeric_df.replace([np.inf, -np.inf], np.nan)
 
     warnings: list[str] = []
     n_cols = len(cols)
 
-    # Case A: Exactly 2 columns -> scatter / scatter + trend line
+    # Case A: Exactly 2 columns -> scatter plot
     if n_cols == 2:
-        # If caller passed a 3+ col chart type (heatmap/pair_plot) with only 2 cols,
-        # snap to scatter+trend which is the appropriate default.
-        if chart_type not in (ChartType.SCATTER, ChartType.SCATTER_TREND_LINE):
-            chart_type = ChartType.SCATTER_TREND_LINE
+        chart_type = ChartType.SCATTER
 
         col_x, col_y = cols[0], cols[1]
         pair = numeric_df[[col_x, col_y]].dropna()
@@ -430,20 +447,6 @@ def _compute_correlation(
 
         r = float(pair[col_x].corr(pair[col_y], method="pearson"))
         r_squared = round(r * r, 4)
-
-        slope, intercept = np.polyfit(pair[col_x].values, pair[col_y].values, 1)
-        trend_line = {
-            "slope": _round(float(slope), 6),
-            "intercept": _round(float(intercept), 6),
-            "start": {
-                "x": _round(float(pair[col_x].min())),
-                "y": _round(float(intercept + slope * pair[col_x].min())),
-            },
-            "end": {
-                "x": _round(float(pair[col_x].max())),
-                "y": _round(float(intercept + slope * pair[col_x].max())),
-            },
-        }
 
         sample = pair.sample(min(len(pair), MAX_POINTS), random_state=42) if len(pair) > MAX_POINTS else pair
         if len(pair) > MAX_POINTS:
@@ -461,8 +464,6 @@ def _compute_correlation(
             "x_column": col_x,
             "y_column": col_y,
         }
-        if chart_type == ChartType.SCATTER_TREND_LINE:
-            extra["trend_line"] = trend_line
 
         chart = ChartPayload(chart_type=chart_type, points=points, extra=extra)
         summary = {
@@ -475,11 +476,65 @@ def _compute_correlation(
         }
         return chart, summary, warnings
 
-    # Case B: 3+ columns -> heatmap / pair plot
-    # If caller passed a 2-col chart type (scatter/scatter_trend_line) as default
-    # because 3+ cols were provided, snap to correlation_heatmap.
-    if chart_type not in (ChartType.CORRELATION_HEATMAP, ChartType.PAIR_PLOT):
-        chart_type = ChartType.CORRELATION_HEATMAP
+    # Case B: Exactly 3 columns -> bubble chart (default) unless heatmap was chosen.
+    # X = independent, Y = dependent, 3rd column drives the bubble size. The raw size
+    # value is returned with its min/max so the frontend can scale symbol sizes.
+    if n_cols == 3 and chart_type != ChartType.CORRELATION_HEATMAP:
+        chart_type = ChartType.BUBBLE
+
+        col_x, col_y, col_size = cols[0], cols[1], cols[2]
+        triple = numeric_df[[col_x, col_y, col_size]].dropna()
+        if len(triple) < 3:
+            raise error_response(
+                status_code=400,
+                detail="Need at least 3 rows with values in all three columns.",
+            )
+
+        r = float(triple[col_x].corr(triple[col_y], method="pearson"))
+        r_squared = round(r * r, 4)
+        pairs = _correlation_pairs(triple.corr(method="pearson").round(4), [col_x, col_y, col_size])
+
+        sample = triple.sample(MAX_BUBBLES, random_state=42) if len(triple) > MAX_BUBBLES else triple
+        if len(triple) > MAX_BUBBLES:
+            warnings.append(f"Bubble chart sampled down to {MAX_BUBBLES} bubbles for readability.")
+
+        points = [
+            {
+                "x": _round(float(row[col_x])),
+                "y": _round(float(row[col_y])),
+                "size": _round(float(row[col_size])),
+            }
+            for _, row in sample.iterrows()
+        ]
+
+        extra = {
+            "r": round(r, 4),
+            "r_squared": r_squared,
+            "strength": _correlation_strength(r),
+            "x_column": col_x,
+            "y_column": col_y,
+            "size_column": col_size,
+            "size_range": {
+                "min": _round(float(sample[col_size].min())),
+                "max": _round(float(sample[col_size].max())),
+            },
+            "pairs": pairs,
+        }
+
+        chart = ChartPayload(chart_type=chart_type, points=points, extra=extra)
+        summary = {
+            "mode": "bubble",
+            "method": "pearson",
+            "r": round(r, 4),
+            "r_squared": r_squared,
+            "strength": _correlation_strength(r),
+            "n": int(len(triple)),
+            "strongest_pair": pairs[0] if pairs else None,
+        }
+        return chart, summary, warnings
+
+    # Case C: 3 columns with heatmap chosen, or 4+ columns -> correlation heatmap
+    chart_type = ChartType.CORRELATION_HEATMAP
 
     if n_cols > MAX_HEATMAP_COLS:
         warnings.append(f"Truncated to first {MAX_HEATMAP_COLS} columns for the heatmap.")
@@ -499,43 +554,15 @@ def _compute_correlation(
             })
         matrix.append(row)
 
-    pairs: list[dict[str, Any]] = []
-    for i in range(n_cols):
-        for j in range(i + 1, n_cols):
-            v = corr.iloc[i, j]
-            if pd.isna(v):
-                continue
-            pairs.append({
-                "column_a": cols[i],
-                "column_b": cols[j],
-                "correlation": float(v),
-                "r_squared": round(float(v) * float(v), 4),
-                "strength": _correlation_strength(float(v)),
-            })
-    pairs.sort(key=lambda p: abs(p["correlation"]), reverse=True)
+    pairs = _correlation_pairs(corr, cols)
 
+    # Diverging scale: -1 (strong negative) .. 0 (none) .. +1 (strong positive).
     extra_multi: dict[str, Any] = {
         "matrix": matrix,
         "pairs": pairs,
         "columns": cols,
         "color_scale": {"min": -1, "max": 1, "midpoint": 0},
     }
-
-    # Pair plot: include sampled scatter points per column pair
-    if chart_type == ChartType.PAIR_PLOT:
-        pair_plot_data: dict[str, list[dict[str, Any]]] = {}
-        for i in range(n_cols):
-            for j in range(n_cols):
-                if i == j:
-                    continue
-                cx, cy = cols[j], cols[i]
-                pair_df = numeric_df[[cx, cy]].dropna()
-                sample = pair_df.sample(min(len(pair_df), 500), random_state=42) if len(pair_df) > 500 else pair_df
-                pair_plot_data[f"{cy}__vs__{cx}"] = [
-                    {"x": _round(float(row[cx])), "y": _round(float(row[cy]))}
-                    for _, row in sample.iterrows()
-                ]
-        extra_multi["pair_plot_data"] = pair_plot_data
 
     chart = ChartPayload(chart_type=chart_type, labels=cols, extra=extra_multi)
     summary = {
@@ -544,6 +571,189 @@ def _compute_correlation(
         "columns_analyzed": n_cols,
         "strongest_pair": pairs[0] if pairs else None,
     }
+    return chart, summary, warnings
+
+
+# ---------------------------------------------------------------------------
+# 8. Multi Axis Analysis
+# ---------------------------------------------------------------------------
+# X = shared dimension: categorical (Product Line, Region) or date/time (Months, Years).
+# Primary Y (left axis)    = numeric, higher volume -> Columns (bar).
+# Secondary Y (right axis) = numeric, different unit/scale (rate, ratio, average) -> Line.
+# Backend: categorical X -> df.groupby(X)[Y].agg(); date X -> df.resample(granularity)[Y].agg()
+# Chart: mixed Bar + Line on dual Y axes.
+
+_MONTH_ORDER: dict[str, int] = {
+    name: i
+    for i, names in enumerate(
+        [("jan", "january"), ("feb", "february"), ("mar", "march"), ("apr", "april"),
+         ("may",), ("jun", "june"), ("jul", "july"), ("aug", "august"),
+         ("sep", "sept", "september"), ("oct", "october"), ("nov", "november"), ("dec", "december")]
+    )
+    for name in names
+}
+
+
+def _is_month_name_column(df: pd.DataFrame, column: str) -> bool:
+    values = df[column].dropna().astype(str).str.strip().str.lower()
+    values = values[values != ""]
+    return not values.empty and values.isin(_MONTH_ORDER.keys()).all()
+
+
+def _looks_like_dates(df: pd.DataFrame, column: str) -> bool:
+    non_blank = df[column].dropna()
+    non_blank = non_blank[non_blank.astype(str).str.strip() != ""]
+    if non_blank.empty:
+        return False
+    # Bare month names ("Jan", "February") would parse to year 0001 — keep them categorical.
+    if _is_month_name_column(df, column):
+        return False
+    parsed = pd.to_datetime(non_blank, errors="coerce")
+    return parsed.notna().mean() >= 0.8
+
+
+def _resample_aggregate(resampled: Any, column: str, agg: AggregationType) -> pd.Series:
+    if agg == AggregationType.PERCENTAGE:
+        sums = resampled[column].sum()
+        total = float(sums.sum())
+        return (sums / total * 100) if total != 0 else sums
+    if agg == AggregationType.COUNT:
+        return resampled[column].count()
+    return resampled[column].agg(_PANDAS_AGG[agg])
+
+
+def _compute_multi_axis(
+    df: pd.DataFrame, req: BasicAnalysisRequest, chart_type: ChartType
+) -> tuple[ChartPayload, dict[str, Any], list[str]]:
+    x_col = _require_column(df, req.x_column, "x")
+    primary_col = _require_column(df, req.y_column, "y")
+    secondary_col = _require_column(df, req.secondary_y_column, "secondary_y")
+
+    if primary_col == secondary_col:
+        raise error_response(
+            status_code=400,
+            detail="Primary and secondary Y columns must be different for Multi Axis analysis.",
+        )
+    if x_col in (primary_col, secondary_col):
+        raise error_response(
+            status_code=400,
+            detail="X column cannot also be used as a Y column for Multi Axis analysis.",
+        )
+    for col in (primary_col, secondary_col):
+        if not _is_numeric_column(df, col):
+            raise error_response(status_code=400, detail=f"'{col}' must be numeric for Multi Axis analysis.")
+
+    primary_agg = req.aggregation or AggregationType.SUM
+    secondary_agg = req.secondary_aggregation or AggregationType.AVERAGE
+
+    working = pd.DataFrame({
+        x_col: df[x_col],
+        primary_col: _numeric_series(df, primary_col),
+        secondary_col: _numeric_series(df, secondary_col),
+    })
+
+    warnings: list[str] = []
+    used_granularity: TimeGranularity | None = None
+
+    # Numeric X (e.g. Year = 2021, 2022) is treated as ordered categories rather than
+    # parsed as dates, so years don't get resampled into mostly-empty monthly buckets.
+    x_is_numeric = _is_numeric_column(df, x_col)
+    if not x_is_numeric and _looks_like_dates(df, x_col):
+        x_axis_type = "date"
+        working[x_col] = _datetime_series(working, x_col)
+        working = working.dropna(subset=[x_col])
+        if working.empty:
+            raise error_response(status_code=400, detail=f"No valid dates found in '{x_col}'.")
+
+        if req.granularity == TimeGranularity.AUTO:
+            freq, used_granularity = _auto_granularity_freq(working[x_col])
+        else:
+            freq = _PANDAS_FREQ.get(req.granularity)
+            if not freq:
+                raise error_response(status_code=400, detail=f"Unknown granularity: {req.granularity}")
+            used_granularity = req.granularity
+
+        resampled = working.set_index(x_col).resample(freq)
+        combined = pd.DataFrame({
+            "primary": _resample_aggregate(resampled, primary_col, primary_agg),
+            "secondary": _resample_aggregate(resampled, secondary_col, secondary_agg),
+        }).dropna(how="all")
+        labels = [ts.strftime("%Y-%m-%d") for ts in combined.index]
+    else:
+        x_axis_type = "category"
+        if x_is_numeric:
+            working[x_col] = _numeric_series(working, x_col)
+        combined = pd.DataFrame({
+            "primary": _apply_groupby_aggregation(working, x_col, primary_col, primary_agg),
+            "secondary": _apply_groupby_aggregation(working, x_col, secondary_col, secondary_agg),
+        }).dropna(how="all")
+
+        if len(combined) > MAX_GROUPS:
+            warnings.append(f"Result truncated to top {MAX_GROUPS} groups by primary value.")
+            combined = combined.sort_values("primary", ascending=False).iloc[:MAX_GROUPS]
+
+        # Keep a natural order for the shared axis: ascending for numeric X (years),
+        # calendar order for month names, otherwise largest primary value first.
+        month_keys = [str(k).strip().lower() for k in combined.index]
+        if x_is_numeric:
+            combined = combined.sort_index()
+        elif _is_month_name_column(df, x_col) and all(k in _MONTH_ORDER for k in month_keys):
+            combined = combined.iloc[sorted(range(len(combined)), key=lambda i: _MONTH_ORDER[month_keys[i]])]
+        else:
+            combined = combined.sort_values("primary", ascending=False)
+        labels = [_clean_label(k) for k in combined.index.tolist()]
+
+    if combined.empty:
+        raise error_response(status_code=400, detail="No data available to plot for the selected columns.")
+
+    primary_values = [_round(v) for v in combined["primary"].tolist()]
+    secondary_values = [_round(v) for v in combined["secondary"].tolist()]
+    primary_name = f"{primary_agg.value}({primary_col})"
+    secondary_name = f"{secondary_agg.value}({secondary_col})"
+
+    chart = ChartPayload(
+        chart_type=ChartType.MIXED_BAR_LINE,
+        labels=labels,
+        series=[
+            {
+                "name": primary_name,
+                "column": primary_col,
+                "aggregation": primary_agg.value,
+                "type": "bar",
+                "y_axis": "primary",
+                "axis_position": "left",
+                "data": primary_values,
+            },
+            {
+                "name": secondary_name,
+                "column": secondary_col,
+                "aggregation": secondary_agg.value,
+                "type": "line",
+                "y_axis": "secondary",
+                "axis_position": "right",
+                "data": secondary_values,
+            },
+        ],
+        extra={
+            "x_column": x_col,
+            "x_axis_type": x_axis_type,
+            "y_axes": {
+                "primary": {"column": primary_col, "label": primary_name, "position": "left", "chart": "bar"},
+                "secondary": {"column": secondary_col, "label": secondary_name, "position": "right", "chart": "line"},
+            },
+        },
+    )
+    summary: dict[str, Any] = {
+        "x_column": x_col,
+        "x_axis_type": x_axis_type,
+        "primary_y_column": primary_col,
+        "primary_aggregation": primary_agg.value,
+        "secondary_y_column": secondary_col,
+        "secondary_aggregation": secondary_agg.value,
+        "data_points": len(labels),
+    }
+    if used_granularity is not None:
+        summary["granularity"] = used_granularity.value
     return chart, summary, warnings
 
 
@@ -562,7 +772,7 @@ _ANALYSIS_HANDLERS: dict[
     AnalysisType.TIME_SERIES: _compute_time_series,
     AnalysisType.ADVANCED_DISTRIBUTION: _compute_advanced_distribution,
     AnalysisType.CORRELATION: _compute_correlation,
-    AnalysisType.PREDICTIVE_REGRESSION: _compute_predictive_regression,
+    AnalysisType.MULTI_AXIS: _compute_multi_axis,
     AnalysisType.GEOSPATIAL: _compute_geospatial,
 }
 
