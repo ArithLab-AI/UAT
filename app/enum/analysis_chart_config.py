@@ -3,8 +3,8 @@ default chart, required column roles, and supported aggregations.
 
 Direct code representation of the Data Analysis Workflow Specification
 (section 2 — Basic Analysis Module) for the analysis types exposed under
-``/basic-analysis``, including the heavier Predictive Regression and
-Geospatial & Location analyses. Drives both request validation and the
+``/basic-analysis``, including the Multi Axis and Geospatial & Location
+analyses. Drives both request validation and the
 ``GET /basic-analysis/types`` metadata endpoint that a frontend uses to
 build the pickers.
 """
@@ -78,7 +78,7 @@ ANALYSIS_TYPE_CONFIGS: dict[AnalysisType, AnalysisTypeConfig] = {
 
     # ── 2. Simple Distribution Analysis ──────────────────────────────────
     # Spec: X = categorical only. Groups by X, applies aggregation.
-    # Charts: Bar, Line, Pie, Doughnut, Line Area.
+    # Charts: Bar, Column, Line, Pie, Doughnut, Line Area.
     AnalysisType.SIMPLE_DISTRIBUTION: AnalysisTypeConfig(
         analysis_type=AnalysisType.SIMPLE_DISTRIBUTION,
         label="Simple Distribution Analysis",
@@ -86,6 +86,7 @@ ANALYSIS_TYPE_CONFIGS: dict[AnalysisType, AnalysisTypeConfig] = {
         default_chart_type=ChartType.BAR,
         supported_chart_types=(
             ChartType.BAR,
+            ChartType.COLUMN,
             ChartType.LINE,
             ChartType.PIE,
             ChartType.DOUGHNUT,
@@ -170,16 +171,17 @@ ANALYSIS_TYPE_CONFIGS: dict[AnalysisType, AnalysisTypeConfig] = {
         ),
     ),
 
-    # ── 6. Advanced Distribution Analysis / Group By ─────────────────────
+    # ── 6. Advanced Distribution Analysis ───────────────────────────────
     # Spec: X = categorical, Y = numeric MANDATORY.
+    # Charts: Bar, Column, Line, Pie, Doughnut, Line Area.
     AnalysisType.ADVANCED_DISTRIBUTION: AnalysisTypeConfig(
         analysis_type=AnalysisType.ADVANCED_DISTRIBUTION,
-        label="Advanced Distribution / Group By",
+        label="Advanced Distribution",
         tagline="Group by a category and aggregate a numeric measure",
         default_chart_type=ChartType.BAR,
         supported_chart_types=(
             ChartType.BAR,
-            ChartType.HORIZONTAL_BAR,
+            ChartType.COLUMN,
             ChartType.LINE,
             ChartType.PIE,
             ChartType.DOUGHNUT,
@@ -195,48 +197,51 @@ ANALYSIS_TYPE_CONFIGS: dict[AnalysisType, AnalysisTypeConfig] = {
     ),
 
     # ── 7. Correlation Analysis ─────────────────────────────────────────
-    # Spec: multi-select numeric, min 2 required.
-    #   Exactly 2 cols → Scatter Plot, Scatter + Trend Line.
-    #   3 or more cols → Correlation Heatmap, Pair Plot.
+    # Spec: multi-select numeric, min 2 required. Chart follows column count:
+    #   Exactly 2 cols → Scatter Plot (X independent, Y dependent).
+    #   Exactly 3 cols → Bubble Chart (3rd col = bubble size), or Heatmap.
+    #   4 or more cols → Correlation Heatmap.
     # Method: Pearson only (per spec section 3).
     AnalysisType.CORRELATION: AnalysisTypeConfig(
         analysis_type=AnalysisType.CORRELATION,
         label="Correlation Analysis",
         tagline="Measure how strongly two or more numeric variables move together",
-        default_chart_type=ChartType.SCATTER_TREND_LINE,
+        default_chart_type=ChartType.SCATTER,
         supported_chart_types=(
             ChartType.SCATTER,
-            ChartType.SCATTER_TREND_LINE,
+            ChartType.BUBBLE,
             ChartType.CORRELATION_HEATMAP,
-            ChartType.PAIR_PLOT,
         ),
         supported_aggregations=(),
         column_requirements=(
             ColumnRequirement("columns", True, "numeric",
-                              "2+ numeric columns (2 → scatter; 3+ → heatmap or pair plot)",
+                              "2+ numeric columns (2 → scatter; 3 → bubble or heatmap; 4+ → heatmap)",
                               "Sales, Profit, Quantity"),
         ),
     ),
 
-    # ── 8. Predictive Regression Analysis ────────────────────────────────
-    # Target = numeric (required). Predictors = numeric & categorical, multi-select
-    # (required). Model + train/test split are request-level choices, not columns.
-    AnalysisType.PREDICTIVE_REGRESSION: AnalysisTypeConfig(
-        analysis_type=AnalysisType.PREDICTIVE_REGRESSION,
-        label="Predictive Regression Analysis",
-        tagline="Forecast a continuous value and see which features drive it",
-        default_chart_type=ChartType.ACTUAL_VS_PREDICTED_SCATTER,
-        supported_chart_types=(
-            ChartType.ACTUAL_VS_PREDICTED_SCATTER,
-            ChartType.FEATURE_IMPORTANCE_BAR,
-        ),
-        supported_aggregations=(),
+    # ── 8. Multi Axis Analysis ───────────────────────────────────────────
+    # X = categorical or date/time (shared dimension, required).
+    # Primary Y (left axis) = numeric, higher absolute values / volume → Columns.
+    # Secondary Y (right axis) = numeric, different unit or scale (rate, ratio,
+    # average, smaller total) → Line. Chart: mixed Bar (column) + Line.
+    AnalysisType.MULTI_AXIS: AnalysisTypeConfig(
+        analysis_type=AnalysisType.MULTI_AXIS,
+        label="Multi Axis Analysis",
+        tagline="Compare two measures on different scales over a shared category or time axis",
+        default_chart_type=ChartType.MIXED_BAR_LINE,
+        supported_chart_types=(ChartType.MIXED_BAR_LINE,),
+        supported_aggregations=_SPEC_AGGREGATIONS,
         column_requirements=(
-            ColumnRequirement("target", True, "numeric", "Target column to predict (Y-axis)",
-                              "Revenue, Sales, Profit"),
-            ColumnRequirement("predictors", True, "any",
-                              "Predictor / feature columns, numeric & categorical (X-axis)",
-                              "Region, Discount, Quantity, Category"),
+            ColumnRequirement("x", True, "categorical_or_date",
+                              "Shared X axis — a category or date/time column",
+                              "Month, Year, Order Date, Product Line, Region"),
+            ColumnRequirement("y", True, "numeric",
+                              "Primary Y axis (left, columns) — high-volume measure",
+                              "Total Revenue, Units Sold, Sales Volume"),
+            ColumnRequirement("secondary_y", True, "numeric",
+                              "Secondary Y axis (right, line) — rate, ratio, average or smaller-scale measure",
+                              "Profit Margin %, Conversion Rate, Average Order Value"),
         ),
     ),
 

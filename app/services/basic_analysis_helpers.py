@@ -1,9 +1,7 @@
 """Shared, generic helpers used across the basic-analysis computation modules
-(``basic_analysis_service``, ``predictive_regression_service``,
-``geospatial_analysis_service``).
+(``basic_analysis_service``, ``geospatial_analysis_service``).
 
-Pulled out of ``basic_analysis_service`` so the newer Predictive Regression and
-Geospatial analyses can reuse the same column-typing/coercion/aggregation logic
+Pulled out of ``basic_analysis_service`` so the newer Geospatial analysis can reuse the same column-typing/coercion/aggregation logic
 without a circular import back into that module.
 """
 
@@ -115,7 +113,11 @@ def apply_groupby_aggregation(
             counts = df.groupby(group_col, dropna=False).size()
             total = counts.sum()
             return (counts / total * 100) if total > 0 else counts
-        working = df.groupby(group_col, dropna=False)[value_col].sum()
+        # Coerce first: CSV-sourced columns load as strings, and summing those
+        # concatenates text instead of adding numbers.
+        numeric_df = df[[group_col]].copy()
+        numeric_df["__value__"] = numeric_series(df, value_col)
+        working = numeric_df.groupby(group_col, dropna=False)["__value__"].sum()
         total = float(working.sum())
         return (working / total * 100) if total != 0 else working
 
