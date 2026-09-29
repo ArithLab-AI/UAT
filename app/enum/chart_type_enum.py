@@ -12,7 +12,7 @@ class ChartType(str, Enum):
     # Descriptive (spec section 2 — table view only)
     TABLE = "table"
 
-    # Simple Distribution (Bar, Line, Pie, Doughnut, Line Area per spec)
+    # Simple Distribution (Bar, Column, Line, Pie, Doughnut, Line Area)
     BAR = "bar"
     COLUMN = "column"
     LINE = "line"
@@ -26,15 +26,17 @@ class ChartType(str, Enum):
     HORIZONTAL_BAR = "horizontal_bar"
     STEP_LINE = "step_line"
 
-    # Correlation
+    # Correlation (Scatter, Bubble, Heatmap). SCATTER_TREND_LINE and PAIR_PLOT
+    # are no longer offered but kept so previously saved charts still resolve.
     SCATTER = "scatter"
+    BUBBLE = "bubble"
     SCATTER_TREND_LINE = "scatter_trend_line"
     CORRELATION_HEATMAP = "correlation_heatmap"
     PAIR_PLOT = "pair_plot"
 
-    # Predictive Regression
-    ACTUAL_VS_PREDICTED_SCATTER = "actual_vs_predicted_scatter"
-    FEATURE_IMPORTANCE_BAR = "feature_importance_bar"
+    # Multi Axis (mixed chart: columns on the primary/left Y axis, a line on the
+    # secondary/right Y axis, sharing one X axis)
+    MIXED_BAR_LINE = "mixed_bar_line"
 
     # Geospatial & Location
     CHOROPLETH_MAP = "choropleth_map"

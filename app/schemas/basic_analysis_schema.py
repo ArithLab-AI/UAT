@@ -8,7 +8,6 @@ from app.enum.aggregation_type_enum import (
 )
 from app.enum.analysis_type_enum import AnalysisType
 from app.enum.chart_type_enum import ChartType
-from app.enum.regression_enum import RegressionModelType, TrainTestSplitType
 from app.schemas.common_schema import SuccessResponse
 
 
@@ -43,7 +42,8 @@ class BasicAnalysisRequest(BaseModel):
     )
     y_column: Optional[str] = Field(
         default=None,
-        description="Y column (numeric). Optional for Top/Bottom N and Time Series.",
+        description="Y column (numeric). Optional for Top/Bottom N and Time Series. "
+        "Primary/left Y axis for Multi Axis.",
     )
     columns: Optional[list[str]] = Field(
         default=None,
@@ -57,26 +57,21 @@ class BasicAnalysisRequest(BaseModel):
     # ── Top N / Bottom N (spec: max 10) ──
     n: int = Field(default=10, ge=1, le=10)
 
-    # ── Time Series ──
+    # ── Time Series (also used by Multi Axis when X is a date column) ──
     granularity: TimeGranularity = TimeGranularity.MONTHLY
 
-    # ── Predictive Regression ──
-    target_column: Optional[str] = Field(
+    # ── Multi Axis ──
+    # x_column = shared X axis (categorical or date), y_column = primary/left axis
+    # (columns), aggregation = primary aggregation (defaults to Sum).
+    secondary_y_column: Optional[str] = Field(
         default=None,
-        description="Target/Y column to predict (numeric). Required for Predictive Regression.",
+        description="Secondary/right Y axis column (numeric, drawn as a line). Required "
+        "for Multi Axis analysis.",
     )
-    predictor_columns: Optional[list[str]] = Field(
+    secondary_aggregation: Optional[AggregationType] = Field(
         default=None,
-        description="Predictor/feature columns (numeric & categorical). Required for "
-        "Predictive Regression.",
-    )
-    regression_model: RegressionModelType = Field(
-        default=RegressionModelType.AUTO_ML,
-        description="Regression model to train for Predictive Regression.",
-    )
-    train_test_split: TrainTestSplitType = Field(
-        default=TrainTestSplitType.SPLIT_80_20,
-        description="Train/test split strategy for Predictive Regression.",
+        description="Aggregation for the secondary Y axis in Multi Axis analysis "
+        "(defaults to Average — suited to rates, ratios and averages).",
     )
 
     # ── Geospatial & Location ──
