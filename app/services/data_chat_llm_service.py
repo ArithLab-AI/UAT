@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 import re
 from typing import Any
 
@@ -68,7 +69,13 @@ _SUGGESTIONS_SYSTEM_PROMPT = (
     "- Make the questions diverse in intent, not variations of the same question.\n"
     "- Return exactly the requested count.\n"
     "- If a list of questions to avoid is given, return ones that differ in both "
-    "wording and intent from every question on that list, not just a light reword."
+    "wording and intent from every question on that list, not just a light reword.\n"
+    "- You are called repeatedly for the same dataset and never see your own past answers, "
+    "so treat every call as a fresh brainstorm: freely pick different columns, aggregations, "
+    "groupings, and phrasing than the obvious first choice, rather than converging on the "
+    "same 'safe' set of questions every time.\n"
+    "- Follow the focus hint given for this call (which columns/angles to lean toward) so "
+    "repeated calls naturally spread across different parts of the schema."
 )
 
 _SQL_EVAL_SYSTEM_PROMPT = (
@@ -342,11 +349,14 @@ def _invoke(
     *,
     label: str,
     max_tokens: int | None = None,
+    temperature: float | None = None,
 ) -> tuple[str, int]:
     capture = _TokenCapture()
     client = _client()
     if max_tokens:
         client = client.bind(max_tokens=int(max_tokens))
+    if temperature is not None:
+        client = client.bind(temperature=temperature)
     response = client.invoke(
         [SystemMessage(content=system), HumanMessage(content=user)],
         config={"callbacks": [TokenUsageLogger(label=label), capture]},
@@ -406,6 +416,20 @@ def generate_sql(
     return _extract_json(content), tokens
 
 
+_QUESTION_FOCUS_ANGLES = [
+    "totals and headline KPIs",
+    "trends over time",
+    "top/bottom rankings",
+    "category-to-category comparisons",
+    "part-to-whole breakdowns",
+    "outliers and extreme values",
+    "averages vs. medians",
+    "growth or change between periods",
+    "distribution across a specific column",
+    "correlations between two measures",
+]
+
+
 def generate_sample_questions(
     schema_context: str, count: int, avoid_questions: list[str] | None = None
 ) -> tuple[list[str], int]:
@@ -413,13 +437,24 @@ def generate_sample_questions(
 
     ``avoid_questions``, when given, is the previous batch shown to the user; passing it
     is how ``regenerate=true`` gets a genuinely different set instead of the same one again.
+
+    Nothing is persisted between calls, so uniqueness across repeated hits (not just vs. the
+    last batch) comes from randomizing the prompt itself: a random subset of "focus angles"
+    plus a non-zero temperature for this call only. Every other LLM call in this module stays
+    at temperature=0 for reproducibility; brainstorming dummy questions is the one place
+    variety matters more than determinism.
     """
     system = _SUGGESTIONS_SYSTEM_PROMPT
-    user = f"{schema_context}\n\nGenerate exactly {count} questions."
+    focus = ", ".join(random.sample(_QUESTION_FOCUS_ANGLES, k=min(3, len(_QUESTION_FOCUS_ANGLES))))
+    user = (
+        f"{schema_context}\n\n"
+        f"Generate exactly {count} questions.\n"
+        f"Focus hint for this call: lean toward {focus}."
+    )
     if avoid_questions:
         avoid_list = "\n".join(f"- {question}" for question in avoid_questions)
         user += f"\n\nQuestions to avoid (already suggested, do not repeat or reword):\n{avoid_list}"
-    content, tokens = _invoke(system, user, label="data-chat-suggestions")
+    content, tokens = _invoke(system, user, label="data-chat-suggestions", temperature=0.9)
     payload = _extract_json(content)
     questions = [str(q).strip() for q in payload.get("questions", []) if str(q).strip()]
     return questions[:count], tokens
