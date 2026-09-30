@@ -36,14 +36,16 @@ def _has_positive_metric(column_profiles: list[dict[str, Any]], *metric_names: s
 
 
 def _is_duplicate_suggestion_actionable(profile: dict[str, Any], target_columns: list[str] | None) -> bool:
+    # A duplicate suggestion is only ever valid for whole-row exact duplicates. One scoped
+    # to a subset of columns (e.g. "duplicate based on user_id and order_date") is rejected
+    # outright, even if the LLM proposed it -- those columns are expected to repeat on their
+    # own and are not a real duplicate-row issue.
+    if target_columns:
+        return False
     try:
-        if float(profile.get("duplicate_row_percent", 0.0)) > 0.0:
-            return True
+        return float(profile.get("duplicate_row_percent", 0.0)) > 0.0
     except (TypeError, ValueError):
-        pass
-
-    column_profiles = _resolve_profile_columns(profile, target_columns)
-    return _has_positive_metric(column_profiles, "key_duplicate_percent")
+        return False
 
 
 def suggestion_is_actionable(profile: dict[str, Any], suggestion: DataSuggestion) -> bool:
