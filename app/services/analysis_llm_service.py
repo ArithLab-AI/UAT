@@ -39,7 +39,12 @@ ANALYSIS_SYSTEM_PROMPT_TEMPLATE = (
     f"cleaning_prompt_type must be one of: {SUPPORTED_CLEANING_PROMPT_TYPE_LIST}. "
     "When the issue is localized, explicitly name the affected columns. "
     f"For date normalization prefer the format {DATE_OUTPUT_FORMAT}. "
-    f"For missing-value normalization prefer the placeholder token '{NULL_OUTPUT_TOKEN}'."
+    f"For missing-value normalization prefer the placeholder token '{NULL_OUTPUT_TOKEN}'. "
+    "Only propose a duplicate-row suggestion when duplicate_row_percent in the profile is "
+    "greater than 0, and only for the whole row: target_columns must be [] for it. Never "
+    "propose a duplicate suggestion scoped to a subset of columns (e.g. 'duplicate based on "
+    "user_id and order_date') -- repeated values in an id/key/date column alone are expected "
+    "and are not a duplicate-row issue."
 )
 
 
