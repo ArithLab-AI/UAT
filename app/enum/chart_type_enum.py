@@ -26,13 +26,9 @@ class ChartType(str, Enum):
     HORIZONTAL_BAR = "horizontal_bar"
     STEP_LINE = "step_line"
 
-    # Correlation (Scatter, Bubble, Heatmap). SCATTER_TREND_LINE and PAIR_PLOT
-    # are no longer offered but kept so previously saved charts still resolve.
+    # Correlation (Scatter for 2 columns, Bubble for 3)
     SCATTER = "scatter"
     BUBBLE = "bubble"
-    SCATTER_TREND_LINE = "scatter_trend_line"
-    CORRELATION_HEATMAP = "correlation_heatmap"
-    PAIR_PLOT = "pair_plot"
 
     # Multi Axis (mixed chart: columns on the primary/left Y axis, a line on the
     # secondary/right Y axis, sharing one X axis)

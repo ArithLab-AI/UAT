@@ -8,8 +8,7 @@ Analyses:
   4. Bottom N                 - rank ascending, N max 10
   5. Time Series              - resample X (date) by granularity, aggregate Y
   6. Advanced Distribution    - group by X, aggregate Y (Y mandatory)
-  7. Correlation              - Pearson only; 2 cols -> scatter; 3 -> bubble/heatmap;
-                                 4+ -> heatmap
+  7. Correlation              - Pearson only; 2 cols -> scatter; 3 -> bubble
   8. Multi Axis               - shared X (category/date), primary Y as columns on the
                                  left axis, secondary Y as a line on the right axis
   9. Geospatial & Location    - aggregate a metric per location / lat-long point
@@ -54,7 +53,6 @@ from app.utils.responses import error_response
 MAX_POINTS = 2000       # cap for scatter plots
 MAX_BUBBLES = 500       # cap for bubble charts (too many bubbles become unreadable)
 MAX_GROUPS = 100        # cap for group counts on charts
-MAX_HEATMAP_COLS = 20   # cap for correlation heatmap columns
 
 _PANDAS_FREQ: dict[TimeGranularity, str] = {
     TimeGranularity.DAILY: "D",
@@ -286,6 +284,9 @@ def _compute_time_series(
     if y_col is not None:
         if not _is_numeric_column(working, y_col):
             raise error_response(status_code=400, detail=f"'{y_col}' must be numeric for Time Series.")
+        # Coerce: CSV-sourced columns load as strings, so without this sum concatenates
+        # text, mean/median/percentage crash, and min/max compare alphabetically.
+        working[y_col] = _numeric_series(working, y_col)
 
     agg = req.aggregation or (AggregationType.COUNT if y_col is None else AggregationType.SUM)
     if y_col is None and agg not in (AggregationType.COUNT, AggregationType.PERCENTAGE):
@@ -382,11 +383,10 @@ def _compute_advanced_distribution(
 # ---------------------------------------------------------------------------
 # 7. Correlation Analysis
 # ---------------------------------------------------------------------------
-# Spec: multi-select numeric, min 2 required. Pearson only.
+# Multi-select numeric, 2 or 3 columns. Pearson only.
 # Chart type follows the column selection:
 #   Exactly 2 cols -> Scatter Plot  (X = independent, Y = dependent)
-#   Exactly 3 cols -> Bubble Chart  (X, Y, 3rd col = bubble size) or Heatmap
-#   4 or more cols -> Correlation Heatmap
+#   Exactly 3 cols -> Bubble Chart  (X, Y, 3rd col = bubble size)
 
 def _correlation_pairs(corr: pd.DataFrame, cols: list[str]) -> list[dict[str, Any]]:
     """Every unique column pair from a correlation matrix, strongest first."""
@@ -411,8 +411,11 @@ def _compute_correlation(
     df: pd.DataFrame, req: BasicAnalysisRequest, chart_type: ChartType
 ) -> tuple[ChartPayload, dict[str, Any], list[str]]:
     cols = req.columns or []
-    if len(cols) < 2:
-        raise error_response(status_code=400, detail="Correlation requires at least 2 numeric columns.")
+    if len(cols) not in (2, 3):
+        raise error_response(
+            status_code=400,
+            detail="Correlation requires 2 numeric columns (scatter) or 3 numeric columns (bubble).",
+        )
 
     missing = [c for c in cols if c not in df.columns]
     if missing:
@@ -476,99 +479,58 @@ def _compute_correlation(
         }
         return chart, summary, warnings
 
-    # Case B: Exactly 3 columns -> bubble chart (default) unless heatmap was chosen.
+    # Case B: Exactly 3 columns -> bubble chart.
     # X = independent, Y = dependent, 3rd column drives the bubble size. The raw size
     # value is returned with its min/max so the frontend can scale symbol sizes.
-    if n_cols == 3 and chart_type != ChartType.CORRELATION_HEATMAP:
-        chart_type = ChartType.BUBBLE
+    chart_type = ChartType.BUBBLE
 
-        col_x, col_y, col_size = cols[0], cols[1], cols[2]
-        triple = numeric_df[[col_x, col_y, col_size]].dropna()
-        if len(triple) < 3:
-            raise error_response(
-                status_code=400,
-                detail="Need at least 3 rows with values in all three columns.",
-            )
+    col_x, col_y, col_size = cols[0], cols[1], cols[2]
+    triple = numeric_df[[col_x, col_y, col_size]].dropna()
+    if len(triple) < 3:
+        raise error_response(
+            status_code=400,
+            detail="Need at least 3 rows with values in all three columns.",
+        )
 
-        r = float(triple[col_x].corr(triple[col_y], method="pearson"))
-        r_squared = round(r * r, 4)
-        pairs = _correlation_pairs(triple.corr(method="pearson").round(4), [col_x, col_y, col_size])
+    r = float(triple[col_x].corr(triple[col_y], method="pearson"))
+    r_squared = round(r * r, 4)
+    pairs = _correlation_pairs(triple.corr(method="pearson").round(4), [col_x, col_y, col_size])
 
-        sample = triple.sample(MAX_BUBBLES, random_state=42) if len(triple) > MAX_BUBBLES else triple
-        if len(triple) > MAX_BUBBLES:
-            warnings.append(f"Bubble chart sampled down to {MAX_BUBBLES} bubbles for readability.")
+    sample = triple.sample(MAX_BUBBLES, random_state=42) if len(triple) > MAX_BUBBLES else triple
+    if len(triple) > MAX_BUBBLES:
+        warnings.append(f"Bubble chart sampled down to {MAX_BUBBLES} bubbles for readability.")
 
-        points = [
-            {
-                "x": _round(float(row[col_x])),
-                "y": _round(float(row[col_y])),
-                "size": _round(float(row[col_size])),
-            }
-            for _, row in sample.iterrows()
-        ]
-
-        extra = {
-            "r": round(r, 4),
-            "r_squared": r_squared,
-            "strength": _correlation_strength(r),
-            "x_column": col_x,
-            "y_column": col_y,
-            "size_column": col_size,
-            "size_range": {
-                "min": _round(float(sample[col_size].min())),
-                "max": _round(float(sample[col_size].max())),
-            },
-            "pairs": pairs,
+    points = [
+        {
+            "x": _round(float(row[col_x])),
+            "y": _round(float(row[col_y])),
+            "size": _round(float(row[col_size])),
         }
+        for _, row in sample.iterrows()
+    ]
 
-        chart = ChartPayload(chart_type=chart_type, points=points, extra=extra)
-        summary = {
-            "mode": "bubble",
-            "method": "pearson",
-            "r": round(r, 4),
-            "r_squared": r_squared,
-            "strength": _correlation_strength(r),
-            "n": int(len(triple)),
-            "strongest_pair": pairs[0] if pairs else None,
-        }
-        return chart, summary, warnings
-
-    # Case C: 3 columns with heatmap chosen, or 4+ columns -> correlation heatmap
-    chart_type = ChartType.CORRELATION_HEATMAP
-
-    if n_cols > MAX_HEATMAP_COLS:
-        warnings.append(f"Truncated to first {MAX_HEATMAP_COLS} columns for the heatmap.")
-        cols = cols[:MAX_HEATMAP_COLS]
-
-    corr = numeric_df[cols].corr(method="pearson").round(4)
-
-    matrix: list[list[dict[str, Any]]] = []
-    for i, row_col in enumerate(cols):
-        row = []
-        for j, col_col in enumerate(cols):
-            v = corr.iloc[i, j]
-            row.append({
-                "x": col_col,
-                "y": row_col,
-                "value": None if pd.isna(v) else float(v),
-            })
-        matrix.append(row)
-
-    pairs = _correlation_pairs(corr, cols)
-
-    # Diverging scale: -1 (strong negative) .. 0 (none) .. +1 (strong positive).
-    extra_multi: dict[str, Any] = {
-        "matrix": matrix,
+    extra = {
+        "r": round(r, 4),
+        "r_squared": r_squared,
+        "strength": _correlation_strength(r),
+        "x_column": col_x,
+        "y_column": col_y,
+        "size_column": col_size,
+        "size_range": {
+            "min": _round(float(sample[col_size].min())),
+            "max": _round(float(sample[col_size].max())),
+        },
         "pairs": pairs,
-        "columns": cols,
-        "color_scale": {"min": -1, "max": 1, "midpoint": 0},
     }
 
-    chart = ChartPayload(chart_type=chart_type, labels=cols, extra=extra_multi)
+    chart = ChartPayload(chart_type=chart_type, points=points, extra=extra)
     summary = {
-        "mode": "matrix",
+        "mode": "bubble",
         "method": "pearson",
-        "columns_analyzed": n_cols,
+        "r": round(r, 4),
+        "r_squared": r_squared,
+        "strength": _correlation_strength(r),
+        "n": int(len(triple)),
         "strongest_pair": pairs[0] if pairs else None,
     }
     return chart, summary, warnings
@@ -593,11 +555,31 @@ _MONTH_ORDER: dict[str, int] = {
     for name in names
 }
 
+_WEEKDAY_ORDER: dict[str, int] = {
+    name: i
+    for i, names in enumerate(
+        [("mon", "monday"), ("tue", "tues", "tuesday"), ("wed", "wednesday"),
+         ("thu", "thur", "thurs", "thursday"), ("fri", "friday"), ("sat", "saturday"),
+         ("sun", "sunday")]
+    )
+    for name in names
+}
 
-def _is_month_name_column(df: pd.DataFrame, column: str) -> bool:
+
+def _calendar_name_order(df: pd.DataFrame, column: str) -> dict[str, int] | None:
+    """Month-name or weekday-name ordering when every value in the column is one, else None."""
     values = df[column].dropna().astype(str).str.strip().str.lower()
     values = values[values != ""]
-    return not values.empty and values.isin(_MONTH_ORDER.keys()).all()
+    if values.empty:
+        return None
+    for order in (_MONTH_ORDER, _WEEKDAY_ORDER):
+        if values.isin(order.keys()).all():
+            return order
+    return None
+
+
+def _is_month_name_column(df: pd.DataFrame, column: str) -> bool:
+    return _calendar_name_order(df, column) is _MONTH_ORDER
 
 
 def _looks_like_dates(df: pd.DataFrame, column: str) -> bool:
@@ -626,31 +608,45 @@ def _compute_multi_axis(
     df: pd.DataFrame, req: BasicAnalysisRequest, chart_type: ChartType
 ) -> tuple[ChartPayload, dict[str, Any], list[str]]:
     x_col = _require_column(df, req.x_column, "x")
-    primary_col = _require_column(df, req.y_column, "y")
+
+    # Primary (left axis, columns): y_columns when given, else the single y_column.
+    requested_primary = [c.strip() for c in (req.y_columns or []) if c and c.strip()]
+    if not requested_primary and req.y_column:
+        requested_primary = [req.y_column]
+    if not requested_primary:
+        raise error_response(
+            status_code=400,
+            detail="At least one primary Y column ('y_columns') is required for Multi Axis analysis.",
+        )
+    primary_cols = list(dict.fromkeys(requested_primary))  # drop duplicates, keep order
+    for col in primary_cols:
+        _require_column(df, col, "y_columns")
     secondary_col = _require_column(df, req.secondary_y_column, "secondary_y")
 
-    if primary_col == secondary_col:
+    if secondary_col in primary_cols:
         raise error_response(
             status_code=400,
             detail="Primary and secondary Y columns must be different for Multi Axis analysis.",
         )
-    if x_col in (primary_col, secondary_col):
+    if x_col in primary_cols or x_col == secondary_col:
         raise error_response(
             status_code=400,
             detail="X column cannot also be used as a Y column for Multi Axis analysis.",
         )
-    for col in (primary_col, secondary_col):
+    for col in (*primary_cols, secondary_col):
         if not _is_numeric_column(df, col):
             raise error_response(status_code=400, detail=f"'{col}' must be numeric for Multi Axis analysis.")
 
     primary_agg = req.aggregation or AggregationType.SUM
     secondary_agg = req.secondary_aggregation or AggregationType.AVERAGE
 
-    working = pd.DataFrame({
-        x_col: df[x_col],
-        primary_col: _numeric_series(df, primary_col),
-        secondary_col: _numeric_series(df, secondary_col),
-    })
+    working = pd.DataFrame({x_col: df[x_col]})
+    for col in (*primary_cols, secondary_col):
+        working[col] = _numeric_series(df, col)
+
+    # One result column per series: primary columns first (in request order), then secondary.
+    series_specs = [(col, primary_agg) for col in primary_cols] + [(secondary_col, secondary_agg)]
+    first_primary_key = 0
 
     warnings: list[str] = []
     used_granularity: TimeGranularity | None = None
@@ -675,8 +671,7 @@ def _compute_multi_axis(
 
         resampled = working.set_index(x_col).resample(freq)
         combined = pd.DataFrame({
-            "primary": _resample_aggregate(resampled, primary_col, primary_agg),
-            "secondary": _resample_aggregate(resampled, secondary_col, secondary_agg),
+            i: _resample_aggregate(resampled, col, agg) for i, (col, agg) in enumerate(series_specs)
         }).dropna(how="all")
         labels = [ts.strftime("%Y-%m-%d") for ts in combined.index]
     else:
@@ -684,69 +679,72 @@ def _compute_multi_axis(
         if x_is_numeric:
             working[x_col] = _numeric_series(working, x_col)
         combined = pd.DataFrame({
-            "primary": _apply_groupby_aggregation(working, x_col, primary_col, primary_agg),
-            "secondary": _apply_groupby_aggregation(working, x_col, secondary_col, secondary_agg),
+            i: _apply_groupby_aggregation(working, x_col, col, agg) for i, (col, agg) in enumerate(series_specs)
         }).dropna(how="all")
 
         if len(combined) > MAX_GROUPS:
-            warnings.append(f"Result truncated to top {MAX_GROUPS} groups by primary value.")
-            combined = combined.sort_values("primary", ascending=False).iloc[:MAX_GROUPS]
+            warnings.append(f"Result truncated to top {MAX_GROUPS} groups by the first primary value.")
+            combined = combined.sort_values(first_primary_key, ascending=False).iloc[:MAX_GROUPS]
 
         # Keep a natural order for the shared axis: ascending for numeric X (years),
-        # calendar order for month names, otherwise largest primary value first.
-        month_keys = [str(k).strip().lower() for k in combined.index]
+        # calendar order for month / weekday names, otherwise largest first-primary value first.
+        name_keys = [str(k).strip().lower() for k in combined.index]
+        name_order = _calendar_name_order(df, x_col)
         if x_is_numeric:
             combined = combined.sort_index()
-        elif _is_month_name_column(df, x_col) and all(k in _MONTH_ORDER for k in month_keys):
-            combined = combined.iloc[sorted(range(len(combined)), key=lambda i: _MONTH_ORDER[month_keys[i]])]
+        elif name_order is not None and all(k in name_order for k in name_keys):
+            combined = combined.iloc[sorted(range(len(combined)), key=lambda i: name_order[name_keys[i]])]
         else:
-            combined = combined.sort_values("primary", ascending=False)
+            combined = combined.sort_values(first_primary_key, ascending=False)
         labels = [_clean_label(k) for k in combined.index.tolist()]
 
     if combined.empty:
         raise error_response(status_code=400, detail="No data available to plot for the selected columns.")
 
-    primary_values = [_round(v) for v in combined["primary"].tolist()]
-    secondary_values = [_round(v) for v in combined["secondary"].tolist()]
-    primary_name = f"{primary_agg.value}({primary_col})"
-    secondary_name = f"{secondary_agg.value}({secondary_col})"
+    series: list[dict[str, Any]] = []
+    for i, (col, agg) in enumerate(series_specs):
+        is_primary = i < len(primary_cols)
+        series.append({
+            "name": f"{agg.value}({col})",
+            "column": col,
+            "aggregation": agg.value,
+            "type": "bar" if is_primary else "line",
+            "y_axis": "primary" if is_primary else "secondary",
+            "axis_position": "left" if is_primary else "right",
+            "y_axis_index": 0 if is_primary else 1,
+            "data": [_round(v) for v in combined[i].tolist()],
+        })
+
+    primary_names = [s["name"] for s in series if s["y_axis"] == "primary"]
+    secondary_name = series[-1]["name"]
 
     chart = ChartPayload(
         chart_type=ChartType.MIXED_BAR_LINE,
         labels=labels,
-        series=[
-            {
-                "name": primary_name,
-                "column": primary_col,
-                "aggregation": primary_agg.value,
-                "type": "bar",
-                "y_axis": "primary",
-                "axis_position": "left",
-                "data": primary_values,
-            },
-            {
-                "name": secondary_name,
-                "column": secondary_col,
-                "aggregation": secondary_agg.value,
-                "type": "line",
-                "y_axis": "secondary",
-                "axis_position": "right",
-                "data": secondary_values,
-            },
-        ],
+        series=series,
         extra={
             "x_column": x_col,
             "x_axis_type": x_axis_type,
             "y_axes": {
-                "primary": {"column": primary_col, "label": primary_name, "position": "left", "chart": "bar"},
-                "secondary": {"column": secondary_col, "label": secondary_name, "position": "right", "chart": "line"},
+                "primary": {
+                    "columns": primary_cols,
+                    "label": ", ".join(primary_names),
+                    "position": "left",
+                    "chart": "bar",
+                },
+                "secondary": {
+                    "column": secondary_col,
+                    "label": secondary_name,
+                    "position": "right",
+                    "chart": "line",
+                },
             },
         },
     )
     summary: dict[str, Any] = {
         "x_column": x_col,
         "x_axis_type": x_axis_type,
-        "primary_y_column": primary_col,
+        "primary_y_columns": primary_cols,
         "primary_aggregation": primary_agg.value,
         "secondary_y_column": secondary_col,
         "secondary_aggregation": secondary_agg.value,
