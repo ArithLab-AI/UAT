@@ -47,7 +47,6 @@ TEXT_SEMANTIC_COLUMN_HINTS = (
     "skill",
     "profession",
 )
-KEY_COLUMN_HINTS = ("id", "email", "phone", "mobile")
 
 EMAIL_PATTERN = re.compile(r"^[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}$", re.IGNORECASE)
 PHONE_PATTERN = re.compile(r"^\d{10,15}$")
@@ -345,7 +344,6 @@ def _compact_column_profile(column_profile: dict[str, Any]) -> dict[str, Any]:
         "invalid_age_percent",
         "age_format_inconsistency_percent",
         "semantic_type_mismatch_percent",
-        "key_duplicate_percent",
         "casing_inconsistency_percent",
         "whitespace_inconsistency_percent",
         "examples",
@@ -369,7 +367,6 @@ def _column_issue_percent(column_profile: dict[str, Any]) -> float:
         "invalid_age_percent",
         "age_format_inconsistency_percent",
         "semantic_type_mismatch_percent",
-        "key_duplicate_percent",
         "casing_inconsistency_percent",
         "whitespace_inconsistency_percent",
     )
@@ -397,7 +394,6 @@ def _init_column_stats(column_name: str) -> dict[str, Any]:
         "date_valid_count": 0,
         "date_format_inconsistency_count": 0,
         "text_like_count": 0,
-        "key_duplicate_count": 0,
         "whitespace_inconsistency_count": 0,
         "text_length_sum": 0,
         "unique_values": set(),
@@ -417,7 +413,6 @@ def _init_column_stats(column_name: str) -> dict[str, Any]:
         "age_format_examples": [],
         "semantic_type_mismatch_examples": [],
         "text_examples": [],
-        "seen_key_values": set(),
     }
 
 
@@ -597,13 +592,6 @@ def _update_column_stats(stats: dict[str, Any], series: pd.Series) -> None:
                 stats["unique_values"].clear()
                 stats["lower_unique_values"].clear()
                 break
-
-    if _candidate_by_name(stats["name"], KEY_COLUMN_HINTS):
-        for value in stripped_non_null.str.lower().tolist():
-            if value in stats["seen_key_values"]:
-                stats["key_duplicate_count"] += 1
-            else:
-                stats["seen_key_values"].add(value)
 
 
 def build_dataset_profile_from_chunks(chunks: Iterable[pd.DataFrame]) -> dict[str, Any]:
@@ -845,13 +833,6 @@ def build_dataset_profile_from_chunks(chunks: Iterable[pd.DataFrame]) -> dict[st
                 invalid_format_percents.append(semantic_type_mismatch_percent)
                 issue_score = max(issue_score, semantic_type_mismatch_percent)
                 _append_issue(dataset_issues, "header_type_mismatches")
-
-        if _candidate_by_name(column_name_lower, KEY_COLUMN_HINTS):
-            key_duplicate_percent = round(float(stats["key_duplicate_count"]) / non_null_count * 100, 2) if non_null_count else 0.0
-            if key_duplicate_percent > 0:
-                profile["key_duplicate_percent"] = key_duplicate_percent
-                issue_score = max(issue_score, key_duplicate_percent)
-                _append_issue(dataset_issues, "key_column_duplicates")
 
         unique_count = len(stats["unique_values"]) if stats["track_uniques"] else 61
         lower_unique_count = len(stats["lower_unique_values"]) if stats["track_uniques"] else 61
