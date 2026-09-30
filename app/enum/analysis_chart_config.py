@@ -197,38 +197,37 @@ ANALYSIS_TYPE_CONFIGS: dict[AnalysisType, AnalysisTypeConfig] = {
     ),
 
     # ── 7. Correlation Analysis ─────────────────────────────────────────
-    # Spec: multi-select numeric, min 2 required. Chart follows column count:
+    # Multi-select numeric, 2 or 3 columns. Chart follows column count:
     #   Exactly 2 cols → Scatter Plot (X independent, Y dependent).
-    #   Exactly 3 cols → Bubble Chart (3rd col = bubble size), or Heatmap.
-    #   4 or more cols → Correlation Heatmap.
+    #   Exactly 3 cols → Bubble Chart (3rd col = bubble size).
     # Method: Pearson only (per spec section 3).
     AnalysisType.CORRELATION: AnalysisTypeConfig(
         analysis_type=AnalysisType.CORRELATION,
         label="Correlation Analysis",
-        tagline="Measure how strongly two or more numeric variables move together",
+        tagline="Measure how strongly two or three numeric variables move together",
         default_chart_type=ChartType.SCATTER,
         supported_chart_types=(
             ChartType.SCATTER,
             ChartType.BUBBLE,
-            ChartType.CORRELATION_HEATMAP,
         ),
         supported_aggregations=(),
         column_requirements=(
             ColumnRequirement("columns", True, "numeric",
-                              "2+ numeric columns (2 → scatter; 3 → bubble or heatmap; 4+ → heatmap)",
+                              "2 or 3 numeric columns (2 → scatter; 3 → bubble)",
                               "Sales, Profit, Quantity"),
         ),
     ),
 
     # ── 8. Multi Axis Analysis ───────────────────────────────────────────
     # X = categorical or date/time (shared dimension, required).
-    # Primary Y (left axis) = numeric, higher absolute values / volume → Columns.
+    # Primary Y (left axis) = one or more numeric, higher absolute values / volume → Columns.
     # Secondary Y (right axis) = numeric, different unit or scale (rate, ratio,
     # average, smaller total) → Line. Chart: mixed Bar (column) + Line.
     AnalysisType.MULTI_AXIS: AnalysisTypeConfig(
         analysis_type=AnalysisType.MULTI_AXIS,
         label="Multi Axis Analysis",
-        tagline="Compare two measures on different scales over a shared category or time axis",
+        tagline="Compare volume measures (columns) with a rate or average (line) on two Y axes "
+        "over a shared category or time axis",
         default_chart_type=ChartType.MIXED_BAR_LINE,
         supported_chart_types=(ChartType.MIXED_BAR_LINE,),
         supported_aggregations=_SPEC_AGGREGATIONS,
@@ -236,8 +235,8 @@ ANALYSIS_TYPE_CONFIGS: dict[AnalysisType, AnalysisTypeConfig] = {
             ColumnRequirement("x", True, "categorical_or_date",
                               "Shared X axis — a category or date/time column",
                               "Month, Year, Order Date, Product Line, Region"),
-            ColumnRequirement("y", True, "numeric",
-                              "Primary Y axis (left, columns) — high-volume measure",
+            ColumnRequirement("y_columns", True, "numeric",
+                              "Primary Y axis (left, columns) — one or more high-volume measures",
                               "Total Revenue, Units Sold, Sales Volume"),
             ColumnRequirement("secondary_y", True, "numeric",
                               "Secondary Y axis (right, line) — rate, ratio, average or smaller-scale measure",

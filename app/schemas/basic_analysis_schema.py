@@ -47,7 +47,7 @@ class BasicAnalysisRequest(BaseModel):
     )
     columns: Optional[list[str]] = Field(
         default=None,
-        description="For Correlation: 2+ numeric columns.",
+        description="For Correlation: 2 or 3 numeric columns (2 → scatter, 3 → bubble).",
     )
 
     # ── Aggregation (Simple Distribution, Top/Bottom N, Time Series, Advanced
@@ -61,8 +61,13 @@ class BasicAnalysisRequest(BaseModel):
     granularity: TimeGranularity = TimeGranularity.MONTHLY
 
     # ── Multi Axis ──
-    # x_column = shared X axis (categorical or date), y_column = primary/left axis
-    # (columns), aggregation = primary aggregation (defaults to Sum).
+    # x_column = shared X axis (categorical or date), y_column / y_columns = primary/left
+    # axis (columns), aggregation = primary aggregation (defaults to Sum).
+    y_columns: Optional[list[str]] = Field(
+        default=None,
+        description="Multi Axis: one or more primary/left Y axis columns (numeric), each "
+        "drawn as its own set of columns. Takes precedence over y_column.",
+    )
     secondary_y_column: Optional[str] = Field(
         default=None,
         description="Secondary/right Y axis column (numeric, drawn as a line). Required "
