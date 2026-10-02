@@ -47,7 +47,8 @@ class BasicAnalysisRequest(BaseModel):
     )
     columns: Optional[list[str]] = Field(
         default=None,
-        description="For Correlation: 2 or 3 numeric columns (2 → scatter, 3 → bubble).",
+        description="For Correlation — depends on chart_type: scatter = exactly 2 (X, Y); "
+        "bubble = 3 or 4 (X, Y, size, optional color); heatmap = 2 to 10.",
     )
 
     # ── Aggregation (Simple Distribution, Top/Bottom N, Time Series, Advanced
