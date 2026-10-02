@@ -8,7 +8,7 @@ Analyses:
   4. Bottom N                 - rank ascending, N max 10
   5. Time Series              - resample X (date) by granularity, aggregate Y
   6. Advanced Distribution    - group by X, aggregate Y (Y mandatory)
-  7. Correlation              - Pearson only; 2 cols -> scatter; 3 -> bubble
+  7. Correlation              - Pearson only; user picks scatter, bubble or heat map
   8. Multi Axis               - shared X (category/date), primary Y as columns on the
                                  left axis, secondary Y as a line on the right axis
   9. Geospatial & Location    - aggregate a metric per location / lat-long point
@@ -383,10 +383,19 @@ def _compute_advanced_distribution(
 # ---------------------------------------------------------------------------
 # 7. Correlation Analysis
 # ---------------------------------------------------------------------------
-# Multi-select numeric, 2 or 3 columns. Pearson only.
-# Chart type follows the column selection:
-#   Exactly 2 cols -> Scatter Plot  (X = independent, Y = dependent)
-#   Exactly 3 cols -> Bubble Chart  (X, Y, 3rd col = bubble size)
+# Multi-select numeric columns. Pearson only.
+# The user picks ONE chart type and only that chart is built:
+#   Scatter Plot -> exactly 2 cols: X (independent) vs Y (dependent)
+#   Bubble Chart -> 3 or 4 cols: X, Y, 3rd col = bubble size, 4th col = bubble color
+#   Heat Map     -> 2 to 10 cols: pairwise correlation matrix of every selected column
+# No chart_type -> picked from the column count (2 -> scatter, 3-4 -> bubble, 5+ -> heat map).
+
+_CORRELATION_COLUMN_LIMITS: dict[ChartType, tuple[int, int]] = {
+    ChartType.SCATTER: (2, 2),
+    ChartType.BUBBLE: (3, 4),
+    ChartType.HEATMAP: (2, 10),
+}
+
 
 def _correlation_pairs(corr: pd.DataFrame, cols: list[str]) -> list[dict[str, Any]]:
     """Every unique column pair from a correlation matrix, strongest first."""
@@ -407,14 +416,118 @@ def _correlation_pairs(corr: pd.DataFrame, cols: list[str]) -> list[dict[str, An
     return pairs
 
 
+def _xy_stats(r: float, col_x: str, col_y: str) -> dict[str, Any]:
+    return {
+        "r": _round(r),
+        "r_squared": _round(r * r),
+        "strength": _correlation_strength(None if pd.isna(r) else r),
+        "x_column": col_x,
+        "y_column": col_y,
+    }
+
+
+def _value_range(series: pd.Series) -> dict[str, float | None]:
+    return {"min": _round(float(series.min())), "max": _round(float(series.max()))}
+
+
+def _correlation_scatter(
+    pair: pd.DataFrame, col_x: str, col_y: str, r: float, warnings: list[str]
+) -> ChartPayload:
+    """Chart 1 - Scatter: direct linear relationship between X and Y."""
+    sample = pair.sample(MAX_POINTS, random_state=42) if len(pair) > MAX_POINTS else pair
+    if len(pair) > MAX_POINTS:
+        warnings.append(f"Scatter sampled down to {MAX_POINTS} points for performance.")
+
+    points = [
+        {"x": _round(float(row[col_x])), "y": _round(float(row[col_y]))}
+        for _, row in sample.iterrows()
+    ]
+    extra = {"title": "Scatter Plot", **_xy_stats(r, col_x, col_y)}
+    return ChartPayload(chart_type=ChartType.SCATTER, points=points, extra=extra)
+
+
+def _correlation_bubble(
+    rows: pd.DataFrame,
+    col_x: str,
+    col_y: str,
+    col_size: str,
+    col_color: str | None,
+    r: float,
+    warnings: list[str],
+) -> ChartPayload:
+    """Chart 2 - Bubble: up to 4 dimensions - X, Y, size (3rd col), color (4th col)."""
+    bubble_cols = [col_x, col_y, col_size] + ([col_color] if col_color else [])
+    sample = rows.sample(MAX_BUBBLES, random_state=42) if len(rows) > MAX_BUBBLES else rows
+    if len(rows) > MAX_BUBBLES:
+        warnings.append(f"Bubble chart sampled down to {MAX_BUBBLES} bubbles for readability.")
+
+    points = []
+    for _, row in sample.iterrows():
+        point = {
+            "x": _round(float(row[col_x])),
+            "y": _round(float(row[col_y])),
+            "size": _round(float(row[col_size])),
+        }
+        if col_color:
+            point["color"] = _round(float(row[col_color]))
+        points.append(point)
+
+    # Raw size/color values are returned with their min/max so the frontend can scale
+    # symbol sizes and map color onto a continuous palette (e.g. viridis).
+    extra: dict[str, Any] = {
+        "title": "Bubble Chart",
+        **_xy_stats(r, col_x, col_y),
+        "size_column": col_size,
+        "size_range": _value_range(sample[col_size]),
+        "pairs": _correlation_pairs(rows.corr(method="pearson").round(4), bubble_cols),
+    }
+    if col_color:
+        extra["color_column"] = col_color
+        extra["color_range"] = _value_range(sample[col_color])
+    return ChartPayload(chart_type=ChartType.BUBBLE, points=points, extra=extra)
+
+
+def _correlation_heatmap(corr: pd.DataFrame, cols: list[str]) -> ChartPayload:
+    """Chart 3 - Heat Map: pairwise correlation matrix on a fixed -1..1 diverging scale."""
+    matrix = [[_round(corr.iloc[i, j]) for j in range(len(cols))] for i in range(len(cols))]
+    # One cell per (row, column), so the frontend can render it directly as a heat map.
+    points = [
+        {"x": cols[j], "y": cols[i], "value": matrix[i][j]}
+        for i in range(len(cols))
+        for j in range(len(cols))
+    ]
+    extra = {
+        "title": "Heat Map",
+        "columns": cols,
+        "matrix": matrix,
+        "scale": {"min": -1, "max": 1, "center": 0},
+    }
+    return ChartPayload(chart_type=ChartType.HEATMAP, labels=cols, points=points, extra=extra)
+
+
 def _compute_correlation(
     df: pd.DataFrame, req: BasicAnalysisRequest, chart_type: ChartType
 ) -> tuple[ChartPayload, dict[str, Any], list[str]]:
-    cols = req.columns or []
-    if len(cols) not in (2, 3):
+    cols = list(dict.fromkeys(req.columns or []))  # drop duplicates, keep order
+
+    # The resolved chart_type always falls back to SCATTER, so read the raw request to
+    # tell an explicit choice from "not selected".
+    if req.chart_type is not None:
+        chart_type = req.chart_type
+    elif len(cols) <= 2:
+        chart_type = ChartType.SCATTER
+    elif len(cols) <= 4:
+        chart_type = ChartType.BUBBLE
+    else:
+        chart_type = ChartType.HEATMAP
+
+    lo, hi = _CORRELATION_COLUMN_LIMITS[chart_type]
+    if not lo <= len(cols) <= hi:
+        expected = f"exactly {lo}" if lo == hi else f"{lo} to {hi}"
         raise error_response(
             status_code=400,
-            detail="Correlation requires 2 numeric columns (scatter) or 3 numeric columns (bubble).",
+            detail=f"{chart_type.value.replace('_', ' ').title()} correlation requires {expected} "
+            f"distinct numeric columns; {len(cols)} selected.",
         )
 
     missing = [c for c in cols if c not in df.columns]
@@ -434,105 +547,44 @@ def _compute_correlation(
     numeric_df = numeric_df.replace([np.inf, -np.inf], np.nan)
 
     warnings: list[str] = []
-    n_cols = len(cols)
+    constant = [c for c in cols if numeric_df[c].nunique(dropna=True) < 2]
+    if constant:
+        warnings.append(f"Correlation is undefined for constant column(s): {constant}")
 
-    # Case A: Exactly 2 columns -> scatter plot
-    if n_cols == 2:
-        chart_type = ChartType.SCATTER
+    summary: dict[str, Any] = {"method": "pearson", "columns": cols}
 
-        col_x, col_y = cols[0], cols[1]
-        pair = numeric_df[[col_x, col_y]].dropna()
-        if len(pair) < 3:
-            raise error_response(
-                status_code=400,
-                detail="Need at least 3 rows with values in both columns.",
-            )
-
-        r = float(pair[col_x].corr(pair[col_y], method="pearson"))
-        r_squared = round(r * r, 4)
-
-        sample = pair.sample(min(len(pair), MAX_POINTS), random_state=42) if len(pair) > MAX_POINTS else pair
-        if len(pair) > MAX_POINTS:
-            warnings.append(f"Scatter sampled down to {MAX_POINTS} points for performance.")
-
-        points = [
-            {"x": _round(float(row[col_x])), "y": _round(float(row[col_y]))}
-            for _, row in sample.iterrows()
-        ]
-
-        extra: dict[str, Any] = {
-            "r": round(r, 4),
-            "r_squared": r_squared,
-            "strength": _correlation_strength(r),
-            "x_column": col_x,
-            "y_column": col_y,
-        }
-
-        chart = ChartPayload(chart_type=chart_type, points=points, extra=extra)
-        summary = {
-            "mode": "pairwise",
-            "method": "pearson",
-            "r": round(r, 4),
-            "r_squared": r_squared,
-            "strength": _correlation_strength(r),
-            "n": int(len(pair)),
-        }
+    if chart_type == ChartType.HEATMAP:
+        # Pairwise-complete Pearson matrix: each cell uses every row where both columns have values.
+        corr = numeric_df.corr(method="pearson").round(4)
+        pairs = _correlation_pairs(corr, cols)
+        chart = _correlation_heatmap(corr, cols)
+        summary.update({
+            "mode": "matrix",
+            "strongest_pair": pairs[0] if pairs else None,
+            "pairs": pairs,
+        })
         return chart, summary, warnings
 
-    # Case B: Exactly 3 columns -> bubble chart.
-    # X = independent, Y = dependent, 3rd column drives the bubble size. The raw size
-    # value is returned with its min/max so the frontend can scale symbol sizes.
-    chart_type = ChartType.BUBBLE
-
-    col_x, col_y, col_size = cols[0], cols[1], cols[2]
-    triple = numeric_df[[col_x, col_y, col_size]].dropna()
-    if len(triple) < 3:
+    col_x, col_y = cols[0], cols[1]
+    rows = numeric_df.dropna()
+    if len(rows) < 3:
         raise error_response(
             status_code=400,
-            detail="Need at least 3 rows with values in all three columns.",
+            detail=f"Need at least 3 rows with values in all selected columns: {cols}",
         )
+    r = float(rows[col_x].corr(rows[col_y], method="pearson"))
 
-    r = float(triple[col_x].corr(triple[col_y], method="pearson"))
-    r_squared = round(r * r, 4)
-    pairs = _correlation_pairs(triple.corr(method="pearson").round(4), [col_x, col_y, col_size])
+    if chart_type == ChartType.SCATTER:
+        chart = _correlation_scatter(rows, col_x, col_y, r, warnings)
+        summary["mode"] = "pairwise"
+    else:
+        chart = _correlation_bubble(
+            rows, col_x, col_y, cols[2], cols[3] if len(cols) == 4 else None, r, warnings
+        )
+        pairs = chart.extra["pairs"]
+        summary.update({"mode": "bubble", "strongest_pair": pairs[0] if pairs else None})
 
-    sample = triple.sample(MAX_BUBBLES, random_state=42) if len(triple) > MAX_BUBBLES else triple
-    if len(triple) > MAX_BUBBLES:
-        warnings.append(f"Bubble chart sampled down to {MAX_BUBBLES} bubbles for readability.")
-
-    points = [
-        {
-            "x": _round(float(row[col_x])),
-            "y": _round(float(row[col_y])),
-            "size": _round(float(row[col_size])),
-        }
-        for _, row in sample.iterrows()
-    ]
-
-    extra = {
-        "r": round(r, 4),
-        "r_squared": r_squared,
-        "strength": _correlation_strength(r),
-        "x_column": col_x,
-        "y_column": col_y,
-        "size_column": col_size,
-        "size_range": {
-            "min": _round(float(sample[col_size].min())),
-            "max": _round(float(sample[col_size].max())),
-        },
-        "pairs": pairs,
-    }
-
-    chart = ChartPayload(chart_type=chart_type, points=points, extra=extra)
-    summary = {
-        "mode": "bubble",
-        "method": "pearson",
-        "r": round(r, 4),
-        "r_squared": r_squared,
-        "strength": _correlation_strength(r),
-        "n": int(len(triple)),
-        "strongest_pair": pairs[0] if pairs else None,
-    }
+    summary.update({**_xy_stats(r, col_x, col_y), "n": int(len(rows))})
     return chart, summary, warnings
 
 

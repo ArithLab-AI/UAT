@@ -26,9 +26,11 @@ class ChartType(str, Enum):
     HORIZONTAL_BAR = "horizontal_bar"
     STEP_LINE = "step_line"
 
-    # Correlation (Scatter for 2 columns, Bubble for 3)
+    # Correlation (Scatter for X vs Y, Bubble for X/Y/size/color, Heat Map for the
+    # pairwise correlation matrix of every selected column)
     SCATTER = "scatter"
     BUBBLE = "bubble"
+    HEATMAP = "heatmap"
 
     # Multi Axis (mixed chart: columns on the primary/left Y axis, a line on the
     # secondary/right Y axis, sharing one X axis)
