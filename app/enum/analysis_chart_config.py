@@ -197,24 +197,28 @@ ANALYSIS_TYPE_CONFIGS: dict[AnalysisType, AnalysisTypeConfig] = {
     ),
 
     # ── 7. Correlation Analysis ─────────────────────────────────────────
-    # Multi-select numeric, 2 or 3 columns. Chart follows column count:
-    #   Exactly 2 cols → Scatter Plot (X independent, Y dependent).
-    #   Exactly 3 cols → Bubble Chart (3rd col = bubble size).
+    # Multi-select numeric. The user picks one chart and only that chart is built:
+    #   Scatter Plot → exactly 2 cols: X (independent) vs Y (dependent).
+    #   Bubble Chart → 3 or 4 cols: X, Y, 3rd col = bubble size, 4th col = bubble color.
+    #   Heat Map     → 2 to 10 cols: pairwise correlation matrix of all selected columns.
+    # No chart_type → picked from column count (2 → scatter, 3-4 → bubble, 5+ → heat map).
     # Method: Pearson only (per spec section 3).
     AnalysisType.CORRELATION: AnalysisTypeConfig(
         analysis_type=AnalysisType.CORRELATION,
         label="Correlation Analysis",
-        tagline="Measure how strongly two or three numeric variables move together",
+        tagline="Measure how strongly numeric variables move together",
         default_chart_type=ChartType.SCATTER,
         supported_chart_types=(
             ChartType.SCATTER,
             ChartType.BUBBLE,
+            ChartType.HEATMAP,
         ),
         supported_aggregations=(),
         column_requirements=(
             ColumnRequirement("columns", True, "numeric",
-                              "2 or 3 numeric columns (2 → scatter; 3 → bubble)",
-                              "Sales, Profit, Quantity"),
+                              "Scatter: 2 columns (X, Y). Bubble: 3-4 columns (X, Y, size, "
+                              "optional color). Heat Map: 2-10 columns.",
+                              "Distance to Metro, Rental Rate, Property Size, Foot Traffic"),
         ),
     ),
 
