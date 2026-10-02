@@ -823,6 +823,20 @@ def run_ai_cleaning(
         dataset_id=dataset_id,
         dataset_type=dataset_type,
     )
+    # Reclean: when the latest cleaned job was produced by this same suggestion, the
+    # new run REPLACES it. It starts from that job's own input (its parent cleaned job,
+    # or raw) so the old fix is not applied twice, and the old job + S3 output are
+    # removed once the new run succeeds. Only the latest job can be recleaned.
+    replaces_job_id: str | None = None
+    if not source_ai_job_id and effective_source_job_id:
+        latest_detail = (
+            db.query(AICleaningJobDetail)
+            .filter(AICleaningJobDetail.job_id == effective_source_job_id)
+            .first()
+        )
+        if latest_detail is not None and latest_detail.source_suggestion_id == suggestion_id:
+            replaces_job_id = latest_detail.job_id
+            effective_source_job_id = latest_detail.source_ai_job_id
     source = _resolve_ai_source(
         db,
         current_user,
@@ -946,11 +960,32 @@ def run_ai_cleaning(
             "resolved_suggestion_id": resolved_suggestion_id,
             "resolved_cleaning_prompt_type": resolved_cleaning_prompt_type,
             "resolved_target_columns": resolved_target_columns,
+            "replaces_job_id": replaces_job_id,
         },
         daemon=True,
     ).start()
 
     return _serialize_ai_cleaning_detail(job, detail)
+
+
+def _remove_replaced_ai_job(db: Session, old_job_id: str) -> None:
+    """Delete a superseded AI cleaning job (rows + S3 output) after a reclean succeeds.
+
+    Best-effort: the new job is already committed, so a failure here must not fail it."""
+    try:
+        old_detail = db.query(AICleaningJobDetail).filter(AICleaningJobDetail.job_id == old_job_id).first()
+        old_job = db.query(CleaningJob).filter(CleaningJob.id == old_job_id).first()
+        storage_key = old_detail.cleaned_storage_key if old_detail is not None else None
+        if old_detail is not None:
+            db.delete(old_detail)
+        if old_job is not None:
+            db.delete(old_job)
+        db.commit()
+        if storage_key:
+            get_object_storage_service().delete_file(storage_key)
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to remove replaced AI cleaning job %s", old_job_id)
 
 
 def _run_ai_cleaning_worker(
@@ -965,6 +1000,7 @@ def _run_ai_cleaning_worker(
     resolved_suggestion_id: str | None,
     resolved_cleaning_prompt_type: Any,
     resolved_target_columns: Any,
+    replaces_job_id: str | None = None,
 ) -> None:
     """Background worker: download source, run AI cleaning, finalize the job.
 
@@ -1045,6 +1081,9 @@ def _run_ai_cleaning_worker(
             detail.message = result["message"]
 
             db.commit()
+
+            if replaces_job_id:
+                _remove_replaced_ai_job(db, replaces_job_id)
     except Exception as exc:
         logger.exception("AI cleaning job %s failed", job_id)
         db.rollback()
