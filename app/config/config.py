@@ -91,6 +91,18 @@ class Settings(BaseSettings):
     UAT_DATA_CHAT_SQL_EVAL_ENABLED: bool = True
     UAT_DATA_CHAT_SQL_EVAL_MIN_SCORE: int = 70
 
+    # Razorpay payment gateway. KEY_ID is public (sent to the browser for Checkout);
+    # KEY_SECRET and WEBHOOK_SECRET must stay server-side. Plan prices
+    # (subscription_plans.price) are charged in RAZORPAY_CURRENCY.
+    RAZORPAY_KEY_ID: Optional[str] = None
+    RAZORPAY_KEY_SECRET: Optional[str] = None
+    RAZORPAY_WEBHOOK_SECRET: Optional[str] = None
+    RAZORPAY_CURRENCY: str = "INR"
+    RAZORPAY_API_BASE_URL: str = "https://api.razorpay.com/v1"
+    RAZORPAY_TIMEOUT_SECONDS: float = 15.0
+    # Shown in the Razorpay Checkout popup.
+    RAZORPAY_MERCHANT_NAME: str = "ArithLab"
+
     class Config:
         env_file = ".env"
 

@@ -17,6 +17,7 @@ from app.routes.token_usage_route import router as token_usage_router
 from app.routes.data_chat_route import router as data_chat_router
 from app.routes.basic_analysis_route import router as basic_analysis_router
 from app.routes.dashboard_route import router as dashboard_router
+from app.routes.payment_route import router as payment_router
 from app.db.database import engine, Base, SessionLocal
 from app.config.config import settings
 from app.utils.auth_schema_setup import ensure_auth_schema
@@ -66,6 +67,7 @@ app.include_router(token_usage_router)
 app.include_router(data_chat_router)
 app.include_router(basic_analysis_router)
 app.include_router(dashboard_router)
+app.include_router(payment_router)
 
 @app.exception_handler(RequestValidationError)
 async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
