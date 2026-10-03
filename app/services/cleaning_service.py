@@ -150,7 +150,13 @@ def _background_clean(job_id: str, temp_path: str, ext: str, original_name: str)
             _update_job(job_id, current_step=step_idx, current_step_name=step_name, progress_pct=pct)
 
         cleaned_df, step_results = run_cleaning_pipeline(df, ALL_STEPS, on_progress=on_progress)
-        _update_job(job_id, rows_after=len(cleaned_df), columns_after=len(cleaned_df.columns), steps_applied=step_results)
+        _update_job(
+            job_id,
+            rows_after=len(cleaned_df),
+            columns_after=len(cleaned_df.columns),
+            columns_after_names=list(cleaned_df.columns),
+            steps_applied=step_results,
+        )
 
         # 4. Write cleaned file locally
         _update_job(job_id, status="writing", current_step_name="Writing cleaned file")

@@ -61,6 +61,8 @@ def get_openai_client():
         model=model,
         temperature=float(settings.UAT_ANALYSIS_LLM_TEMPERATURE),
         max_tokens=int(settings.UAT_ANALYSIS_LLM_MAX_TOKENS),
+        timeout=float(settings.UAT_AI_LLM_TIMEOUT_SECONDS),
+        max_retries=int(settings.UAT_AI_LLM_MAX_RETRIES),
     )
 
 

@@ -1,9 +1,19 @@
 import secrets
 import logging
+import re
+from google.auth import exceptions as google_auth_exceptions
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token
+from app.models.ai_cleaning_models import AICleaningJobDetail
+from app.models.analysis_models import AnalysisSuggestion, DatasetAnalysis
 from app.models import auth_models
+from app.models.csv_dataset_models import CsvMergedDataset, CsvUploadedDataset
+from app.models.file_upload_models import UploadedFile
+from app.models.subscription_models import UserSubscription, UserUploadStorageUsage
 from app.schemas import auth_schema
 from fastapi import APIRouter, Depends, status
 from jose import jwt, JWTError
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from app.auth import auth
@@ -11,8 +21,13 @@ from app.db.database import get_db
 from app.config.deps import get_current_user, send_otp_email
 from app.config.config import settings
 from app.auth.security import hash_password, verify_password
+from app.enum.user_role_enum import FREE_USER
 from app.schemas.common_schema import MessageSuccessResponse
-from app.services.subscription_service import ensure_default_free_subscription
+from app.services.subscription_service import (
+    ensure_default_free_subscription,
+    get_active_subscription,
+    normalize_plan_tier,
+)
 from app.services.file_retention_service import get_user_retention_summary
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from app.utils.responses import error_response, success_response
@@ -20,6 +35,48 @@ from app.utils.responses import error_response, success_response
 security = HTTPBearer(auto_error=False)
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 logger = logging.getLogger(__name__)
+ENTERPRISE_SSO_OTP_PURPOSE = "enterprise_sso"
+GENERAL_OTP_PURPOSE = "general"
+
+
+def _token_response(user: auth_models.User, message: str) -> dict:
+    """Return the API's standard token envelope for an authenticated user."""
+    access_token = auth.create_access_token({"sub": user.email})
+    refresh_token = auth.create_refresh_token({"sub": user.email})
+    return success_response(
+        message,
+        data={
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+        },
+    )
+
+
+def _google_username(email: str, db: Session) -> str:
+    """Return a readable, unused local username for a first-time Google user."""
+    base = re.sub(r"[^a-zA-Z0-9_.-]", "", email.split("@", 1)[0]) or "google_user"
+    candidate = base
+    suffix = 1
+    while db.query(auth_models.User.id).filter(auth_models.User.username == candidate).first():
+        suffix += 1
+        candidate = f"{base}{suffix}"
+    return candidate
+
+
+def _get_enterprise_user(db: Session, email: str) -> auth_models.User:
+    normalized_email = email.strip().lower()
+    user = db.query(auth_models.User).filter(
+        func.lower(func.trim(auth_models.User.email)) == normalized_email
+    ).first()
+    if not user:
+        raise error_response(status_code=status.HTTP_403_FORBIDDEN, detail="Enterprise SSO is not available for this account")
+
+    subscription = get_active_subscription(db, user.id)
+    plan_name = subscription.plan.name if subscription and subscription.plan else None
+    if normalize_plan_tier(plan_name) != "enterprise":
+        raise error_response(status_code=status.HTTP_403_FORBIDDEN, detail="Enterprise SSO requires an active Enterprise subscription")
+    return user
 
 @router.post("/register", response_model=auth_schema.UserSuccessResponse, status_code=201)
 def register(payload: auth_schema.Register, db: Session = Depends(get_db)):
@@ -53,12 +110,22 @@ def register(payload: auth_schema.Register, db: Session = Depends(get_db)):
         username=payload.username,
         first_name=payload.first_name,
         last_name=payload.last_name,
-        user_role=payload.user_role,
+        user_role=FREE_USER,
         password=hash_password(payload.password),
         is_verified=True
     )
 
     db.add(user)
+    db.flush()
+    subscription = ensure_default_free_subscription(db, user.id)
+    if not subscription or not subscription.plan:
+        db.rollback()
+        logger.error("Register failed for email=%s: default free subscription was not assigned", payload.email)
+        raise error_response(
+            status_code=500,
+            detail="Default free subscription is not configured",
+        )
+
     db.commit()
     db.refresh(user)
     logger.info("User registered successfully user_id=%s email=%s", user.id, user.email)
@@ -114,6 +181,130 @@ def login(payload: auth_schema.Login, db: Session = Depends(get_db)):
             "token_type": "bearer",
         },
     )
+
+@router.post("/google", response_model=auth_schema.TokenSuccessResponse)
+def google_login(payload: auth_schema.GoogleLogin, db: Session = Depends(get_db)):
+    """Exchange a verified Google Identity Services credential for API tokens."""
+    if not settings.GOOGLE_CLIENT_ID:
+        logger.error("Google login requested but GOOGLE_CLIENT_ID is not configured")
+        raise error_response(status_code=503, detail="Google login is not configured")
+
+    try:
+        google_user = id_token.verify_oauth2_token(
+            payload.credential,
+            google_requests.Request(),
+            settings.GOOGLE_CLIENT_ID,
+        )
+    except ValueError:
+        logger.warning("Google login failed: invalid ID token")
+        raise error_response(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Google credential")
+    except google_auth_exceptions.TransportError:
+        logger.exception("Google login failed: Google token verification service is unavailable")
+        raise error_response(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google login is temporarily unavailable",
+        )
+
+    if not google_user.get("email_verified") or not google_user.get("email") or not google_user.get("sub"):
+        logger.warning("Google login failed: account has no verified email")
+        raise error_response(status_code=status.HTTP_401_UNAUTHORIZED, detail="Google account email is not verified")
+
+    email = str(google_user["email"]).lower()
+    subject = str(google_user["sub"])
+    user = db.query(auth_models.User).filter(auth_models.User.google_subject == subject).first()
+    if not user:
+        # A verified Google email may safely link a previously password-created account.
+        user = db.query(auth_models.User).filter(
+            func.lower(auth_models.User.email) == email
+        ).first()
+        if user:
+            user.google_subject = subject
+        else:
+            user = auth_models.User(
+                email=email,
+                username=_google_username(email, db),
+                first_name=google_user.get("given_name"),
+                last_name=google_user.get("family_name"),
+                google_subject=subject,
+                user_role=FREE_USER,
+                is_verified=True,
+            )
+            db.add(user)
+            db.flush()
+
+    user.last_login = datetime.utcnow()
+    ensure_default_free_subscription(db, user.id)
+    db.commit()
+    logger.info("Google login successful user_id=%s email=%s", user.id, user.email)
+    return _token_response(user, "Google login successful")
+
+
+@router.post("/sso/request-otp", response_model=MessageSuccessResponse)
+def request_enterprise_sso_otp(
+    payload: auth_schema.EnterpriseSSORequestOTP,
+    db: Session = Depends(get_db),
+):
+    """Email a one-time code to an existing Enterprise subscriber."""
+    email = str(payload.email).lower()
+    user = _get_enterprise_user(db, email)
+
+    db.query(auth_models.OTP).filter(
+        auth_models.OTP.email == user.email,
+        auth_models.OTP.purpose == ENTERPRISE_SSO_OTP_PURPOSE,
+        auth_models.OTP.is_used == False,
+    ).delete(synchronize_session=False)
+
+    otp_code = str(secrets.randbelow(900000) + 100000)
+    db.add(
+        auth_models.OTP(
+            email=user.email,
+            otp_code=hash_password(otp_code),
+            purpose=ENTERPRISE_SSO_OTP_PURPOSE,
+            expires_at=datetime.utcnow() + timedelta(minutes=settings.OTP_EXPIRE_MINUTES),
+        )
+    )
+    db.flush()
+
+    try:
+        send_otp_email(user.email, otp_code)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    logger.info("Enterprise SSO OTP sent for user_id=%s", user.id)
+    return success_response("Enterprise SSO OTP sent successfully", data=None)
+
+
+@router.post("/sso/verify-otp", response_model=auth_schema.TokenSuccessResponse)
+def verify_enterprise_sso_otp(
+    payload: auth_schema.EnterpriseSSOVerifyOTP,
+    db: Session = Depends(get_db),
+):
+    """Verify an Enterprise SSO OTP and issue the normal API token pair."""
+    email = str(payload.email).lower()
+    user = _get_enterprise_user(db, email)
+    db_otp = db.query(auth_models.OTP).filter(
+        auth_models.OTP.email == user.email,
+        auth_models.OTP.purpose == ENTERPRISE_SSO_OTP_PURPOSE,
+        auth_models.OTP.is_used == False,
+    ).order_by(auth_models.OTP.id.desc()).first()
+
+    if not db_otp:
+        raise error_response(status_code=400, detail="Enterprise SSO OTP not found")
+    if db_otp.expires_at < datetime.utcnow():
+        raise error_response(status_code=400, detail="Enterprise SSO OTP expired")
+    if not verify_password(payload.otp, db_otp.otp_code):
+        logger.warning("Enterprise SSO OTP verification failed for user_id=%s", user.id)
+        raise error_response(status_code=400, detail="Invalid Enterprise SSO OTP")
+
+    db_otp.is_used = True
+    user.is_verified = True
+    user.last_login = datetime.utcnow()
+    db.commit()
+
+    logger.info("Enterprise SSO login successful user_id=%s", user.id)
+    return _token_response(user, "Enterprise SSO login successful")
 
 @router.post("/refresh", response_model=auth_schema.TokenSuccessResponse)
 def refresh_token(payload: auth_schema.RefreshToken, db: Session = Depends(get_db)):
@@ -188,6 +379,7 @@ def request_otp(payload: auth_schema.RequestOTP, db: Session = Depends(get_db)):
 
     db.query(auth_models.OTP).filter(
         auth_models.OTP.email == payload.email,
+        auth_models.OTP.purpose == GENERAL_OTP_PURPOSE,
         auth_models.OTP.is_used == False
     ).delete()
 
@@ -196,6 +388,7 @@ def request_otp(payload: auth_schema.RequestOTP, db: Session = Depends(get_db)):
     db_otp = auth_models.OTP(
         email=payload.email,
         otp_code=otp_code,
+        purpose=GENERAL_OTP_PURPOSE,
         expires_at=datetime.utcnow() + timedelta(
             minutes=settings.OTP_EXPIRE_MINUTES
         )
@@ -220,6 +413,7 @@ def verify_otp(payload: auth_schema.VerifyOTP, db: Session = Depends(get_db)):
 
     db_otp = db.query(auth_models.OTP).filter(
         auth_models.OTP.email == payload.email,
+        auth_models.OTP.purpose == GENERAL_OTP_PURPOSE,
         auth_models.OTP.is_used == False
     ).order_by(auth_models.OTP.id.desc()).first()
 
@@ -276,6 +470,7 @@ def forgot_password(payload: auth_schema.ForgotPassword, db: Session = Depends(g
     # Delete previous unused OTPs
     db.query(auth_models.OTP).filter(
         auth_models.OTP.email == payload.email,
+        auth_models.OTP.purpose == GENERAL_OTP_PURPOSE,
         auth_models.OTP.is_used == False
     ).delete()
 
@@ -284,6 +479,7 @@ def forgot_password(payload: auth_schema.ForgotPassword, db: Session = Depends(g
     db_otp = auth_models.OTP(
         email=user.email,
         otp_code=otp_code,
+        purpose=GENERAL_OTP_PURPOSE,
         expires_at=datetime.utcnow() + timedelta(
             minutes=settings.OTP_EXPIRE_MINUTES
         )
@@ -315,6 +511,7 @@ def reset_password(payload: auth_schema.ResetPassword, db: Session = Depends(get
 
     db_otp = db.query(auth_models.OTP).filter(
         auth_models.OTP.email == payload.email,
+        auth_models.OTP.purpose == GENERAL_OTP_PURPOSE,
         auth_models.OTP.is_used == False
     ).order_by(auth_models.OTP.id.desc()).first()
 
@@ -363,6 +560,106 @@ def protected_route(
             **retention_summary,
         },
     )
+
+
+@router.get("/my-account", response_model=auth_schema.UserSuccessResponse)
+def get_my_account(
+    current_user: auth_models.User = Depends(get_current_user),
+):
+    logger.info("My-account fetched for user_id=%s", current_user.id)
+    return success_response("Account fetched successfully", data=current_user)
+
+
+@router.patch("/my-account", response_model=auth_schema.UserSuccessResponse)
+def update_my_account(
+    payload: auth_schema.MyAccountUpdate,
+    current_user: auth_models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    new_email = str(payload.email).strip().lower() if payload.email is not None else None
+    new_username = payload.username.strip() if payload.username is not None else None
+
+    if new_email and new_email != current_user.email:
+        existing_email = (
+            db.query(auth_models.User)
+            .filter(
+                auth_models.User.email == new_email,
+                auth_models.User.id != current_user.id,
+            )
+            .first()
+        )
+        if existing_email:
+            logger.warning(
+                "My-account update rejected for user_id=%s: email already registered",
+                current_user.id,
+            )
+            raise error_response(status_code=400, detail="Email already registered")
+        current_user.email = new_email
+
+    if new_username and new_username != current_user.username:
+        existing_username = (
+            db.query(auth_models.User)
+            .filter(
+                auth_models.User.username == new_username,
+                auth_models.User.id != current_user.id,
+            )
+            .first()
+        )
+        if existing_username:
+            logger.warning(
+                "My-account update rejected for user_id=%s: username already taken",
+                current_user.id,
+            )
+            raise error_response(status_code=400, detail="Username already taken")
+        current_user.username = new_username
+
+    db.commit()
+    db.refresh(current_user)
+    logger.info("My-account updated for user_id=%s", current_user.id)
+    return success_response("Account updated successfully", data=current_user)
+
+
+@router.delete("/my-account", response_model=MessageSuccessResponse)
+def delete_my_account(
+    current_user: auth_models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    user_id = current_user.id
+    user_email = current_user.email
+    logger.info("My-account delete requested for user_id=%s", user_id)
+
+    db.query(AnalysisSuggestion).filter(
+        AnalysisSuggestion.created_by_user_id == user_id
+    ).delete(synchronize_session=False)
+    db.query(DatasetAnalysis).filter(
+        DatasetAnalysis.created_by_user_id == user_id
+    ).delete(synchronize_session=False)
+    db.query(AICleaningJobDetail).filter(
+        AICleaningJobDetail.created_by_user_id == user_id
+    ).delete(synchronize_session=False)
+    db.query(UserUploadStorageUsage).filter(
+        UserUploadStorageUsage.user_id == user_id
+    ).delete(synchronize_session=False)
+    db.query(UserSubscription).filter(
+        UserSubscription.user_id == user_id
+    ).delete(synchronize_session=False)
+    db.query(UploadedFile).filter(
+        UploadedFile.created_by_user_id == user_id
+    ).delete(synchronize_session=False)
+    db.query(CsvMergedDataset).filter(
+        CsvMergedDataset.created_by_user_id == user_id
+    ).delete(synchronize_session=False)
+    db.query(CsvUploadedDataset).filter(
+        CsvUploadedDataset.created_by_user_id == user_id
+    ).delete(synchronize_session=False)
+    db.query(auth_models.OTP).filter(
+        auth_models.OTP.email == user_email
+    ).delete(synchronize_session=False)
+
+    db.delete(current_user)
+    db.commit()
+    logger.info("My-account deleted for user_id=%s", user_id)
+    return success_response("Account deleted successfully", data=None)
 
 
 @router.post("/logout", response_model=MessageSuccessResponse)

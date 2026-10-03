@@ -278,6 +278,7 @@ def merge_uploaded_datasets(
         source_datasets=source_datasets,
         columns=output_columns,
         internal_columns=output_internal_columns,
+        rows=merged_rows,
         total_rows=len(merged_rows),
     )
     db.add(merged_dataset)

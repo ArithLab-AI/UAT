@@ -1,9 +1,9 @@
 from typing import Generic, TypeVar
-from pydantic.generics import GenericModel
+from pydantic import BaseModel
 
 T = TypeVar("T")
 
-class SuccessResponse(GenericModel, Generic[T]):
+class SuccessResponse(BaseModel, Generic[T]):
     status_code: int
     message: str
     data: T

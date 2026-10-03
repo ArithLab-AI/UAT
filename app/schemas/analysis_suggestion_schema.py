@@ -11,6 +11,7 @@ class AnalysisSuggestionDetailResponse(BaseModel):
     source_dataset_id: int
     source_type: str
     created_by_user_id: int
+    title: str
     issue_description: str
     priority: str
     resolution_prompt: str

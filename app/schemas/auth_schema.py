@@ -1,9 +1,9 @@
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, EmailStr, validator
+from pydantic import BaseModel, EmailStr, Field, model_validator, validator
 
-from app.enum.user_role_enum import DEFAULT_USER_ROLE
+from app.enum.user_role_enum import DEFAULT_USER_ROLE, FREE_USER
 from app.enum.user_role_enum import normalize_user_role
 from app.schemas.common_schema import SuccessResponse
 
@@ -18,12 +18,20 @@ class Register(BaseModel):
 
     @validator("user_role", pre=True)
     def validate_user_role(cls, value):
-        return normalize_user_role(value)
+        normalized_role = normalize_user_role(value)
+        if normalized_role != FREE_USER:
+            raise ValueError("New users must register with the Free plan")
+        return normalized_role
 
 
 class Login(BaseModel):
     email: EmailStr
     password: str
+
+class GoogleLogin(BaseModel):
+    # Credential returned by Google Identity Services after the user selects an
+    # account. It is a signed Google ID token, not an access token.
+    credential: str = Field(min_length=1)
 
 
 class RequestOTP(BaseModel):
@@ -33,6 +41,15 @@ class RequestOTP(BaseModel):
 class VerifyOTP(BaseModel):
     email: EmailStr
     otp: str
+
+
+class EnterpriseSSORequestOTP(BaseModel):
+    email: EmailStr
+
+
+class EnterpriseSSOVerifyOTP(BaseModel):
+    email: EmailStr
+    otp: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
 
 
 class ForgotPassword(BaseModel):
@@ -53,6 +70,19 @@ class Token(BaseModel):
 
 class RefreshToken(BaseModel):
     refresh_token: str
+
+
+class MyAccountUpdate(BaseModel):
+    email: EmailStr | None = None
+    username: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def require_update_field(self):
+        if self.email is None and self.username is None:
+            raise ValueError("Email or username is required")
+        if self.username is not None and not self.username.strip():
+            raise ValueError("Username cannot be empty")
+        return self
 
 
 class UserResponse(BaseModel):

@@ -1,4 +1,8 @@
+import logging
+
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from urllib.parse import urlparse
 from fastapi.exceptions import RequestValidationError
 from app.routes.auth_route import router as auth_router
 from app.routes.csv_dataset_route import router as csv_dataset_router
@@ -9,22 +13,46 @@ from app.routes.ai_cleaning_route import router as ai_cleaning_router
 from app.routes.analysis_route import router as analysis_router
 from app.routes.analysis_suggestion_route import router as analysis_suggestion_router
 from app.routes.test_llm_route import router as test_llm_router
+from app.routes.token_usage_route import router as token_usage_router
+from app.routes.data_chat_route import router as data_chat_router
+from app.routes.basic_analysis_route import router as basic_analysis_router
+from app.routes.dashboard_route import router as dashboard_router
+from app.routes.payment_route import router as payment_router
 from app.db.database import engine, Base, SessionLocal
 from app.config.config import settings
 from app.utils.auth_schema_setup import ensure_auth_schema
 from app.utils.csv_dataset_setup import ensure_csv_dataset_schema
+from app.utils.dashboard_schema_setup import ensure_dashboard_schema, ensure_dashboard_builder_schema
 from app.utils.file_upload_schema_setup import ensure_file_upload_schema
 from app.utils.object_storage import get_object_storage_service
-from app.utils.responses import http_exception_response, validation_error_response
+from app.utils.responses import (
+    http_exception_response,
+    unexpected_error_response,
+    validation_error_response,
+)
 from app.utils.subs_plan_seed import seed_subscription_plans
 from app.utils.ai_cleaning_schema_setup import ensure_ai_cleaning_schema
+from app.utils.ai_cleaning_job_reaper import reap_stale_ai_cleaning_jobs
 from app.utils.subscription_schema_setup import ensure_subscription_schema
 from app.services.file_retention_service import (
     start_file_retention_scheduler,
     stop_file_retention_scheduler,
 )
 
+logger = logging.getLogger(__name__)
+
 app = FastAPI(title="Authentication API")
+
+# CORS origins cannot include a path.  The Google sign-in page is configured as
+# https://www.arithlab.ai, so allow its browser origin to call /auth/google.
+frontend_login_origin = urlparse(settings.FRONTEND_LOGIN_URL).scheme + "://" + urlparse(settings.FRONTEND_LOGIN_URL).netloc
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[frontend_login_origin],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(health_router)
 app.include_router(auth_router)
@@ -35,6 +63,11 @@ app.include_router(ai_cleaning_router)
 app.include_router(analysis_router)
 app.include_router(analysis_suggestion_router)
 app.include_router(test_llm_router)
+app.include_router(token_usage_router)
+app.include_router(data_chat_router)
+app.include_router(basic_analysis_router)
+app.include_router(dashboard_router)
+app.include_router(payment_router)
 
 @app.exception_handler(RequestValidationError)
 async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -44,6 +77,13 @@ async def request_validation_exception_handler(request: Request, exc: RequestVal
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     return http_exception_response(exc)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    # Technical detail sirf logs me; client ko hamesha JSON error body milti hai.
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return unexpected_error_response()
 
 
 @app.on_event("startup")
@@ -60,14 +100,17 @@ def startup_event():
 
     Base.metadata.create_all(bind=engine)
     ensure_auth_schema(engine)
-    ensure_subscription_schema(engine)
     ensure_csv_dataset_schema(engine)
+    ensure_dashboard_schema(engine)
+    ensure_dashboard_builder_schema(engine)
+    ensure_subscription_schema(engine)
     ensure_file_upload_schema(engine)
     ensure_ai_cleaning_schema(engine)
     get_object_storage_service().ensure_bucket()
     db = SessionLocal()
     try:
         seed_subscription_plans(db)
+        reap_stale_ai_cleaning_jobs(db)
     finally:
         db.close()
     start_file_retention_scheduler()

@@ -3,6 +3,24 @@ import re
 from app.services.analysis_profile_service import DataSuggestion
 
 
+SUPPORTED_CLEANING_PROMPT_TYPES = {
+    "age_normalization",
+    "boolean_validation",
+    "date_normalization",
+    "duplicate_removal",
+    "email_normalization",
+    "float_validation",
+    "header_type_normalization",
+    "integer_validation",
+    "date_missing_imputation",
+    "missing_value_normalization",
+    "numeric_missing_imputation",
+    "numeric_normalization",
+    "phone_normalization",
+    "text_normalization",
+}
+
+
 def _normalize_text(value: str | None) -> str:
     if not value:
         return ""
@@ -15,6 +33,50 @@ def _normalize_targets(values: list[str] | None) -> set[str]:
         for value in (values or [])
         if isinstance(value, str) and value.strip()
     }
+
+
+def normalize_cleaning_prompt_type(
+    cleaning_prompt_type: str | None,
+    *,
+    resolution_prompt: str | None = None,
+    issue_description: str | None = None,
+) -> str | None:
+    normalized_type = _normalize_text(cleaning_prompt_type).replace(" ", "_")
+    if normalized_type:
+        normalized_type = normalized_type.replace("-", "_")
+    if normalized_type in SUPPORTED_CLEANING_PROMPT_TYPES:
+        return normalized_type
+
+    alias_map = {
+        "date_format_normalization": "date_normalization",
+        "missing_value_replacement": "missing_value_normalization",
+        "missing_value_imputation": "missing_value_normalization",
+        "deduplication": "duplicate_removal",
+    }
+    if normalized_type in alias_map:
+        return alias_map[normalized_type]
+
+    category = (
+        classify_issue_category(resolution_prompt, cleaning_prompt_type)
+        or classify_issue_category(issue_description, cleaning_prompt_type)
+    )
+    category_to_prompt_type = {
+        "age": "age_normalization",
+        "boolean": "boolean_validation",
+        "date": "date_normalization",
+        "duplicate": "duplicate_removal",
+        "email": "email_normalization",
+        "float": "float_validation",
+        "date_imputation": "date_missing_imputation",
+        "integer": "integer_validation",
+        "missing": "missing_value_normalization",
+        "numeric_imputation": "numeric_missing_imputation",
+        "numeric": "numeric_normalization",
+        "phone": "phone_normalization",
+        "schema_type": "header_type_normalization",
+        "text": "text_normalization",
+    }
+    return category_to_prompt_type.get(category)
 
 
 def classify_issue_category(
@@ -35,6 +97,8 @@ def classify_issue_category(
             "missing_value_normalization": "missing",
             "missing_value_replacement": "missing",
             "missing_value_imputation": "missing",
+            "numeric_missing_imputation": "numeric_imputation",
+            "date_missing_imputation": "date_imputation",
             "duplicate_removal": "duplicate",
             "deduplication": "duplicate",
             "text_normalization": "text",
@@ -58,7 +122,9 @@ def classify_issue_category(
         "integer": ("strict integer", "valid integers", "non-integer", "integer-like"),
         "float": ("valid float", "float-like", "not valid floats"),
         "phone": ("phone", "mobile", "contact number", "country code", "phone-like"),
+        "date_imputation": ("most frequent", "most common", "highest frequency", "max frequency", "modal value", "mode value"),
         "date": ("date", "dates", "datetime", "timestamp", "date format"),
+        "numeric_imputation": ("impute", "imputed", "imputation", "mean (average)", "rounded median", "fill empty", "fill missing"),
         "missing": ("missing", "null", "blank", "empty", "placeholder"),
         "duplicate": ("duplicate", "duplicates", "deduplicate", "redundant copies"),
         "text": ("whitespace", "casing", "text normalization", "normalize text", "repeated text"),

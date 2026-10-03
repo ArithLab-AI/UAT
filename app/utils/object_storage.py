@@ -127,6 +127,35 @@ class ObjectStorageService:
     def object_uri(self, key: str) -> str:
         return f"s3://{self.bucket_name}/{key}"
 
+    def object_key_from_uri(self, key_or_uri: str) -> str:
+        """Accept either a raw object key or an ``s3://bucket/key`` URI and return the key."""
+        if not key_or_uri:
+            return ""
+        if key_or_uri.startswith("s3://"):
+            without_scheme = key_or_uri[len("s3://"):]
+            _, _, key = without_scheme.partition("/")
+            return key
+        return key_or_uri
+
+    def presigned_download_url(self, key_or_uri: str, *, expires_in: int = 3600) -> str | None:
+        """Generate a temporary, directly-downloadable HTTPS URL for an object.
+
+        Accepts a raw key or an ``s3://bucket/key`` URI. Returns None when storage is
+        not configured or signing fails, so callers can degrade gracefully."""
+        client = self._get_client()
+        key = self.object_key_from_uri(key_or_uri)
+        if client is None or not key:
+            return None
+        try:
+            return client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": self.bucket_name, "Key": key},
+                ExpiresIn=expires_in,
+            )
+        except Exception as exc:  # noqa: BLE001 - never break listing on a signing failure
+            logger.warning("Failed to presign download URL for key '%s': %s", key, exc)
+            return None
+
 
 @lru_cache(maxsize=1)
 def get_object_storage_service() -> ObjectStorageService:

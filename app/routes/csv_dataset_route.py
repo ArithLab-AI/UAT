@@ -1,35 +1,52 @@
 import logging
 import os
+from math import ceil
+from datetime import datetime, timezone
+from typing import Any, Literal
 
-from fastapi import APIRouter, Body, Depends, Request
+from fastapi import APIRouter, Body, Depends, Query, Request
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.config.deps import get_current_user
 from app.db.database import get_db
+from app.models.ai_cleaning_models import AICleaningJobDetail
+from app.models.analysis_models import AnalysisSuggestion, DatasetAnalysis
 from app.models.auth_models import User
+from app.models.cleaning_models import CleaningJob
 from app.models.csv_dataset_models import CsvMergedDataset, CsvUploadedDataset
+from app.models.data_chat_models import DataChatSession
+from app.models.subscription_models import UserUploadStorageUsage
 from app.schemas.csv_dataset_schema import (
+    CsvDatasetItemSuccessResponse,
     CsvDatasetListSuccessResponse,
     CsvMergedDatasetSuccessResponse,
+    CsvUploadedDatasetSuccessResponse,
     CsvUploadedDatasetListSuccessResponse,
     MergeCsvDatasetsRequest,
     MergeSuggestionsRequest,
     MergeSourceDatasetsRequest,
     MergeSuggestionsSuccessResponse,
+    GoogleSheetImportRequest,
     PreviewMergeRequest,
     PreviewMergeSuccessResponse,
+    RenameDatasetRequest,
     SelectExcelSheetRequest,
 )
 from app.schemas.common_schema import MessageSuccessResponse
 from app.services.csv_service import (
+    build_dataset_column_details,
     build_dataset_name,
     count_user_active_datasets,
     create_uploaded_dataset,
     delete_merged_dataset,
     delete_uploaded_dataset,
+    new_staged_csv_path,
+    parse_csv_source_file,
     ParsedUpload,
     PendingSheetSelection,
     parse_csv_upload,
+    resolve_dataset_column_types,
 )
 from app.services.excel_sheet_service import process_temporary_upload_selection
 from app.services.merge_service import (
@@ -42,8 +59,10 @@ from app.services.file_retention_service import (
     retention_dataset_for_user,
     set_dataset_retention_expiry,
 )
+from app.services.google_sheets_service import download_google_sheet_csv
 from app.services.subscription_service import (
     ensure_upload_storage_available,
+    get_recorded_upload_count,
     get_user_plan_capabilities,
     record_upload_storage_usage,
 )
@@ -51,6 +70,7 @@ from app.services.temporary_upload_service import (
     delete_temporary_upload,
     validate_temporary_upload,
 )
+from app.utils.object_storage import get_object_storage_service
 from app.utils.responses import error_response, success_response
 
 UPLOAD_MULTIPLE_OPENAPI = {
@@ -78,7 +98,8 @@ UPLOAD_MULTIPLE_OPENAPI = {
 
 router = APIRouter(prefix="/csv-datasets", tags=["CSV Datasets"])
 logger = logging.getLogger(__name__)
-
+DEFAULT_DATASET_PAGE_SIZE = 10
+MAX_DATASET_PAGE_SIZE = 100
 
 def _get_file_size(file) -> int | None:
     if not hasattr(file, "file"):
@@ -104,9 +125,197 @@ def _build_uploaded_dataset_name(file_name: str, sheet_name: str | None = None) 
     return dataset_name
 
 
-def _serialize_merged_dataset(merged_dataset, source_dataset_map=None):
+def _build_uploaded_file_name(file_name: str, sheet_name: str | None = None) -> str:
+    if sheet_name:
+        return f"{file_name} ({sheet_name})"
+    return file_name
+
+
+def _build_merged_file_name(merged_dataset) -> str:
+    name = merged_dataset.name.strip()
+    if name.lower().endswith(".csv"):
+        return name
+    return f"{name}.csv"
+
+
+def _normalize_rename_name(name: str) -> str:
+    normalized_name = " ".join(name.strip().split())
+    if not normalized_name:
+        raise error_response(status_code=400, detail="Dataset name cannot be empty")
+    if "/" in normalized_name or "\\" in normalized_name:
+        raise error_response(status_code=400, detail="Dataset name cannot contain a path")
+    return normalized_name
+
+
+def _uploaded_rename_values(dataset: CsvUploadedDataset, requested_name: str) -> tuple[str, str]:
+    """Keep file metadata intact while using the requested dataset display name."""
+    sheet_suffix = f" ({dataset.sheet_name})" if dataset.sheet_name else ""
+    requested_base = requested_name
+    if sheet_suffix and requested_base.lower().endswith(sheet_suffix.lower()):
+        requested_base = requested_base[: -len(sheet_suffix)].rstrip()
+
+    original_file_name = dataset.file_name
+    if sheet_suffix and original_file_name.lower().endswith(sheet_suffix.lower()):
+        original_file_name = original_file_name[: -len(sheet_suffix)]
+    _, extension = os.path.splitext(original_file_name)
+    if extension and requested_base.lower().endswith(extension.lower()):
+        requested_base = requested_base[: -len(extension)].rstrip()
+    if not requested_base:
+        raise error_response(status_code=400, detail="Dataset name cannot be empty")
+
+    # ``sheet_name`` is already returned separately.  It must not be folded into the
+    # dataset name, otherwise a rename such as "Sales" appears as
+    # "Sales (Sheet1)" again in the dataset list.  Retain it only on ``file_name``
+    # so existing file and sheet-specific flows continue to identify the same data.
+    return requested_base, f"{requested_base}{extension}{sheet_suffix}"
+
+
+def _merged_rename_value(requested_name: str) -> str:
+    if requested_name.lower().endswith(".csv"):
+        requested_name = requested_name[:-4].rstrip()
+    if not requested_name:
+        raise error_response(status_code=400, detail="Dataset name cannot be empty")
+    return requested_name
+
+
+def _rename_dataset_references(
+    db: Session,
+    *,
+    dataset_id: int,
+    dataset_type: Literal["uploaded", "merged"],
+    user_id: int,
+    dataset_name: str,
+    file_name: str,
+    previous_file_name: str,
+) -> None:
+    """Keep display-only references in user-scoped records in sync with a rename."""
+    db.query(DatasetAnalysis).filter(
+        DatasetAnalysis.source_dataset_id == dataset_id,
+        DatasetAnalysis.source_type == dataset_type,
+        DatasetAnalysis.created_by_user_id == user_id,
+    ).update(
+        {"dataset_name": dataset_name, "file_name": file_name},
+        synchronize_session=False,
+    )
+    db.query(AICleaningJobDetail).filter(
+        AICleaningJobDetail.source_dataset_id == dataset_id,
+        AICleaningJobDetail.source_dataset_type == dataset_type,
+        AICleaningJobDetail.created_by_user_id == user_id,
+    ).update(
+        {"source_dataset_name": dataset_name, "source_file_name": file_name},
+        synchronize_session=False,
+    )
+    db.query(DataChatSession).filter(
+        DataChatSession.source_dataset_id == dataset_id,
+        DataChatSession.source_type == dataset_type,
+        DataChatSession.created_by_user_id == user_id,
+    ).update({"dataset_name": dataset_name}, synchronize_session=False)
+    # Manual cleaning jobs predate source-type/user metadata. Matching the stable dataset
+    # id together with its prior filename keeps existing cleaned data discoverable.
+    db.query(CleaningJob).filter(
+        CleaningJob.source_dataset_id == dataset_id,
+        CleaningJob.original_filename == previous_file_name,
+    ).update({"original_filename": file_name}, synchronize_session=False)
+
+    if dataset_type == "uploaded":
+        db.query(UserUploadStorageUsage).filter(
+            UserUploadStorageUsage.user_id == user_id,
+            UserUploadStorageUsage.uploaded_dataset_id == dataset_id,
+        ).update({"file_name": file_name}, synchronize_session=False)
+
+
+def _normalize_sort_timestamp(value: datetime | None) -> float:
+    if value is None:
+        return float("-inf")
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.timestamp()
+
+
+def _clean_file_url(clean_state: dict) -> str | None:
+    """Return the cleaned file as a presigned, directly-downloadable HTTPS URL.
+
+    Falls back to the raw ``s3://`` URI if signing is unavailable (e.g. storage off)."""
+    raw_url = clean_state.get("clean_file_url")
+    if not raw_url:
+        return None
+    return get_object_storage_service().presigned_download_url(raw_url) or raw_url
+
+
+def _serialize_dataset_columns(columns, column_types) -> list[dict]:
+    """Pair every column name with its inferred datatype.
+
+    ``type`` is null only for datasets stored before column types were saved and whose file
+    could not be read back to infer them."""
+    column_types = list(column_types or [])
+    return [
+        {
+            "name": column,
+            "type": column_types[index] if index < len(column_types) else None,
+        }
+        for index, column in enumerate(columns or [])
+    ]
+
+
+def _ensure_dataset_column_types(db: Session, dataset) -> None:
+    """Backfill and store the column types of a dataset saved before they were recorded."""
+    if dataset.column_types and len(dataset.column_types) == len(dataset.columns or []):
+        return
+
+    column_types = resolve_dataset_column_types(dataset)
+    if not column_types:
+        return
+
+    dataset.column_types = column_types
+    db.commit()
+
+
+def _dataset_columns_response(db: Session, dataset):
+    """Detailed view of a dataset: only its columns, each with its own stats."""
+    column_details = build_dataset_column_details(dataset)
+    if not column_details:
+        return success_response(
+            "Dataset fetched successfully",
+            data={"columns": _serialize_dataset_columns(dataset.columns, dataset.column_types)},
+        )
+
+    # The details were inferred from every stored row, so keep them for datasets saved
+    # before column types were recorded instead of reading the file again later.
+    if not dataset.column_types:
+        dataset.column_types = [column["type"] for column in column_details]
+        db.commit()
+
+    return success_response("Dataset fetched successfully", data={"columns": column_details})
+
+
+def _serialize_uploaded_dataset(uploaded_dataset, clean_state=None):
+    clean_state = clean_state or {}
+    return {
+        "id": uploaded_dataset.id,
+        "name": uploaded_dataset.name,
+        "file_name": uploaded_dataset.file_name,
+        "sheet_name": uploaded_dataset.sheet_name,
+        "table_name": uploaded_dataset.table_name,
+        "storage_key": uploaded_dataset.storage_key,
+        "file_url": uploaded_dataset.file_url,
+        "is_clean": bool(clean_state.get("is_clean", False)),
+        "clean_file_url": _clean_file_url(clean_state),
+        "file_size": uploaded_dataset.file_size,
+        "total_rows": uploaded_dataset.total_rows,
+        "columns": _serialize_dataset_columns(
+            uploaded_dataset.columns, uploaded_dataset.column_types
+        ),
+        "is_retention": uploaded_dataset.is_retention,
+        "retention_until": uploaded_dataset.retention_until,
+        "retention_at": uploaded_dataset.retention_at,
+        "created_at": uploaded_dataset.created_at,
+    }
+
+
+def _serialize_merged_dataset(merged_dataset, source_dataset_map=None, clean_state=None):
     metadata = merged_dataset.source_datasets_metadata or []
     source_dataset_map = source_dataset_map or {}
+    clean_state = clean_state or {}
     seen_source_ids = set()
 
     source_datasets = []
@@ -128,15 +337,244 @@ def _serialize_merged_dataset(merged_dataset, source_dataset_map=None):
     return {
         "id": merged_dataset.id,
         "name": merged_dataset.name,
+        "file_name": _build_merged_file_name(merged_dataset),
         "table_name": merged_dataset.table_name,
         "storage_key": merged_dataset.storage_key,
         "file_url": merged_dataset.file_url,
+        "is_clean": bool(clean_state.get("is_clean", False)),
+        "clean_file_url": _clean_file_url(clean_state),
         "file_size": merged_dataset.file_size,
         "total_rows": merged_dataset.total_rows,
-        "columns": merged_dataset.columns,
+        "columns": _serialize_dataset_columns(
+            merged_dataset.columns, merged_dataset.column_types
+        ),
         "created_at": merged_dataset.created_at,
         "source_datasets": source_datasets,
     }
+
+
+def _update_dataset_clean_state(
+    clean_state_map: dict[tuple[str, int], dict[str, Any]],
+    dataset_key: tuple[str, int],
+    *,
+    clean_file_url: str | None,
+    cleaned_at: datetime | None,
+):
+    if not clean_file_url or dataset_key not in clean_state_map:
+        return
+
+    candidate_sort_key = _normalize_sort_timestamp(cleaned_at)
+    current_state = clean_state_map[dataset_key]
+    if candidate_sort_key < current_state["_sort_key"]:
+        return
+
+    current_state["is_clean"] = True
+    current_state["clean_file_url"] = clean_file_url
+    current_state["_sort_key"] = candidate_sort_key
+
+
+def _build_dataset_clean_state_map(
+    db: Session,
+    *,
+    current_user: User,
+    uploaded_datasets: list[CsvUploadedDataset],
+    merged_datasets: list[CsvMergedDataset],
+) -> dict[tuple[str, int], dict[str, Any]]:
+    clean_state_map: dict[tuple[str, int], dict[str, Any]] = {
+        ("uploaded", dataset.id): {
+            "is_clean": False,
+            "clean_file_url": None,
+            "_sort_key": float("-inf"),
+        }
+        for dataset in uploaded_datasets
+    }
+    clean_state_map.update(
+        {
+            ("merged", dataset.id): {
+                "is_clean": False,
+                "clean_file_url": None,
+                "_sort_key": float("-inf"),
+            }
+            for dataset in merged_datasets
+        }
+    )
+
+    dataset_ids = sorted(
+        {dataset.id for dataset in uploaded_datasets}
+        | {dataset.id for dataset in merged_datasets}
+    )
+    if not dataset_ids:
+        return clean_state_map
+
+    uploaded_name_map = {
+        (dataset.id, dataset.file_name): ("uploaded", dataset.id)
+        for dataset in uploaded_datasets
+    }
+    merged_name_map = {
+        (dataset.id, f"{dataset.name}.csv"): ("merged", dataset.id)
+        for dataset in merged_datasets
+    }
+
+    ai_records = (
+        db.query(CleaningJob, AICleaningJobDetail)
+        .join(AICleaningJobDetail, AICleaningJobDetail.job_id == CleaningJob.id)
+        .filter(
+            CleaningJob.ai_cleaning_type.is_(True),
+            CleaningJob.status == "completed",
+            AICleaningJobDetail.created_by_user_id == current_user.id,
+            AICleaningJobDetail.source_dataset_id.in_(dataset_ids),
+            AICleaningJobDetail.cleaned_file_path.isnot(None),
+        )
+        .order_by(AICleaningJobDetail.updated_at.desc(), AICleaningJobDetail.created_at.desc())
+        .all()
+    )
+    for job, detail in ai_records:
+        dataset_type = (detail.source_dataset_type or "").strip()
+        dataset_key = (dataset_type, detail.source_dataset_id)
+        _update_dataset_clean_state(
+            clean_state_map,
+            dataset_key,
+            clean_file_url=detail.cleaned_file_path,
+            cleaned_at=detail.updated_at or detail.created_at or job.completed_at or job.created_at,
+        )
+
+    manual_records = (
+        db.query(CleaningJob)
+        .filter(
+            CleaningJob.ai_cleaning_type.is_not(True),
+            CleaningJob.status == "completed",
+            CleaningJob.source_dataset_id.in_(dataset_ids),
+            CleaningJob.s3_cleaned_url.isnot(None),
+        )
+        .order_by(CleaningJob.completed_at.desc(), CleaningJob.created_at.desc())
+        .all()
+    )
+    for job in manual_records:
+        candidate_dataset_keys = []
+        uploaded_key = uploaded_name_map.get((job.source_dataset_id, job.original_filename))
+        if uploaded_key is not None:
+            candidate_dataset_keys.append(uploaded_key)
+
+        merged_key = merged_name_map.get((job.source_dataset_id, job.original_filename))
+        if merged_key is not None:
+            candidate_dataset_keys.append(merged_key)
+
+        for dataset_key in candidate_dataset_keys:
+            _update_dataset_clean_state(
+                clean_state_map,
+                dataset_key,
+                clean_file_url=job.s3_cleaned_url,
+                cleaned_at=job.completed_at or job.created_at,
+            )
+
+    return clean_state_map
+
+
+def _build_dataset_fully_clean_map(
+    db: Session,
+    *,
+    current_user: User,
+    uploaded_datasets: list[CsvUploadedDataset],
+    merged_datasets: list[CsvMergedDataset],
+) -> dict[tuple[str, int], bool]:
+    """Map each dataset to whether its most recent analysis found zero issues.
+
+    True only when an analysis has actually run for the dataset and that latest run
+    produced no suggestion rows. A dataset that was never analysed stays False --
+    "no suggestions stored" and "never analysed" look identical in the tables, and
+    reporting an unanalysed file as fully clean would be wrong.
+    """
+    fully_clean_map: dict[tuple[str, int], bool] = {
+        ("uploaded", dataset.id): False for dataset in uploaded_datasets
+    }
+    fully_clean_map.update(
+        {("merged", dataset.id): False for dataset in merged_datasets}
+    )
+
+    dataset_ids = sorted(
+        {dataset.id for dataset in uploaded_datasets}
+        | {dataset.id for dataset in merged_datasets}
+    )
+    if not dataset_ids:
+        return fully_clean_map
+
+    analyses = (
+        db.query(
+            DatasetAnalysis.id,
+            DatasetAnalysis.source_type,
+            DatasetAnalysis.source_dataset_id,
+        )
+        .filter(
+            DatasetAnalysis.created_by_user_id == current_user.id,
+            DatasetAnalysis.source_dataset_id.in_(dataset_ids),
+        )
+        .order_by(DatasetAnalysis.updated_at.desc(), DatasetAnalysis.created_at.desc())
+        .all()
+    )
+
+    # Rows arrive newest-first, so the first hit per dataset is its latest analysis.
+    latest_analysis_ids: dict[tuple[str, int], str] = {}
+    for analysis_id, source_type, source_dataset_id in analyses:
+        dataset_key = ((source_type or "").strip(), source_dataset_id)
+        if dataset_key in fully_clean_map and dataset_key not in latest_analysis_ids:
+            latest_analysis_ids[dataset_key] = analysis_id
+
+    if not latest_analysis_ids:
+        return fully_clean_map
+
+    suggestion_counts = dict(
+        db.query(AnalysisSuggestion.analysis_id, func.count(AnalysisSuggestion.id))
+        .filter(AnalysisSuggestion.analysis_id.in_(list(latest_analysis_ids.values())))
+        .group_by(AnalysisSuggestion.analysis_id)
+        .all()
+    )
+    for dataset_key, analysis_id in latest_analysis_ids.items():
+        fully_clean_map[dataset_key] = suggestion_counts.get(analysis_id, 0) == 0
+
+    return fully_clean_map
+
+
+def _normalize_search_query(search: str | None) -> str | None:
+    if search is None:
+        return None
+
+    normalized_search = search.strip()
+    return normalized_search or None
+
+def _pagination_meta(total: int, page: int, page_size: int) -> dict[str, int]:
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": ceil(total / page_size) if total else 0,
+    }
+
+def _selected_sheet_names_for_route(selection: SelectExcelSheetRequest) -> list[str]:
+    sheet_names = [sheet_name.strip() for sheet_name in selection.selected_sheet_names()]
+    if len(set(sheet_names)) != len(sheet_names):
+        raise error_response(
+            status_code=400,
+            detail="Sheet names must be unique for each file token",
+        )
+    return sheet_names
+
+
+def _ensure_merge_allowed(plan_capabilities: dict, source_count: int) -> None:
+    if not plan_capabilities["can_merge"]:
+        raise error_response(
+            status_code=400,
+            detail="Data merging is not available on your current plan. Please upgrade your plan.",
+        )
+
+    max_merge_sources = plan_capabilities["max_merge_sources"]
+    if max_merge_sources is not None and source_count > max_merge_sources:
+        raise error_response(
+            status_code=400,
+            detail=(
+                f"Your current plan allows merging up to {max_merge_sources} source datasets at a time. "
+                "Please upgrade your plan."
+            ),
+        )
 
 
 @router.post(
@@ -161,118 +599,209 @@ async def upload_multiple_csv_datasets(
         )
 
     plan_capabilities = get_user_plan_capabilities(db, current_user)
-    active_dataset_count = count_user_active_datasets(db, current_user.id)
+    recorded_upload_count = get_recorded_upload_count(db, current_user.id)
     max_active_datasets = plan_capabilities["max_active_datasets"]
 
     if (
         max_active_datasets is not None
-        and active_dataset_count + len(files) > max_active_datasets
+        and recorded_upload_count + len(files) > max_active_datasets
     ):
         raise error_response(
             status_code=400,
             detail=(
-                f"Your current plan allows up to {max_active_datasets} active datasets. "
-                "Please delete an existing dataset or upgrade your plan."
+                f"Your current plan allows up to {max_active_datasets} uploaded files. "
+                "You have reached your upload limit. Please upgrade your plan."
             ),
         )
 
     parsed_uploads: list[ParsedUpload] = []
     pending_sheet_selections: list[PendingSheetSelection] = []
-    for file in files:
-        if not hasattr(file, "filename") or not hasattr(file, "read"):
-            raise error_response(status_code=400, detail="Invalid file input")
+    # Staged CSV files live on disk until object storage has them, so they are removed
+    # on every exit path rather than left behind on the instance.
+    try:
+        for file in files:
+            if not hasattr(file, "filename") or not hasattr(file, "read"):
+                raise error_response(status_code=400, detail="Invalid file input")
 
-        file_size = _get_file_size(file)
-        max_file_size_bytes = plan_capabilities["max_file_size_bytes"]
-        if (
-            file_size is not None
-            and max_file_size_bytes is not None
-            and file_size > max_file_size_bytes
-        ):
-            raise error_response(
-                status_code=400,
-                detail=(
-                    f"{file.filename} exceeds your current plan file size limit of "
-                    f"{_format_file_size_limit(max_file_size_bytes)}. Please upgrade your plan."
-                ),
+            file_size = _get_file_size(file)
+            max_file_size_bytes = plan_capabilities["max_file_size_bytes"]
+            if (
+                file_size is not None
+                and max_file_size_bytes is not None
+                and file_size > max_file_size_bytes
+            ):
+                raise error_response(
+                    status_code=400,
+                    detail=(
+                        f"{file.filename} exceeds your current plan file size limit of "
+                        f"{_format_file_size_limit(max_file_size_bytes)}. Please upgrade your plan."
+                    ),
+                )
+
+            parsed_upload = await parse_csv_upload(file, user_id=current_user.id)
+            if isinstance(parsed_upload, PendingSheetSelection):
+                pending_sheet_selections.append(parsed_upload)
+                continue
+            parsed_uploads.append(parsed_upload)
+
+        created_datasets = []
+        total_upload_size = sum(parsed_upload.file_size for parsed_upload in parsed_uploads)
+        ensure_upload_storage_available(
+            db,
+            user_id=current_user.id,
+            plan_capabilities=plan_capabilities,
+            upload_size_bytes=total_upload_size,
+        )
+        for parsed_upload in parsed_uploads:
+            dataset_name = _build_uploaded_dataset_name(parsed_upload.file_name, parsed_upload.sheet_name)
+            dataset = create_uploaded_dataset(
+                db,
+                dataset_name=dataset_name,
+                file_name=parsed_upload.file_name,
+                sheet_name=parsed_upload.sheet_name,
+                file_size=parsed_upload.file_size,
+                columns=parsed_upload.columns,
+                internal_columns=parsed_upload.internal_columns,
+                source_path=parsed_upload.staged_path,
+                total_rows=parsed_upload.total_rows,
+                sample_rows=parsed_upload.sample_rows,
+                user_id=current_user.id,
+            )
+            set_dataset_retention_expiry(
+                db=db,
+                dataset=dataset,
+                user_id=current_user.id,
+            )
+            created_datasets.append(dataset)
+
+        db.flush()
+        for dataset in created_datasets:
+            record_upload_storage_usage(db, dataset=dataset, user_id=current_user.id)
+
+        db.commit()
+
+        for dataset in created_datasets:
+            db.refresh(dataset)
+
+        if pending_sheet_selections:
+            pending_files = [
+                {
+                    "requires_sheet_selection": pending_upload.requires_sheet_selection,
+                    "file_token": pending_upload.file_token,
+                    "file_name": pending_upload.file_name,
+                    "available_sheets": pending_upload.available_sheets,
+                    "sheet_count": pending_upload.sheet_count,
+                    "preview_row_count": pending_upload.preview_row_count,
+                }
+                for pending_upload in pending_sheet_selections
+            ]
+            response_data = {
+                "requires_sheet_selection": True,
+                "pending_files": pending_files,
+                "uploaded_datasets": [
+                    _serialize_uploaded_dataset(dataset)
+                    for dataset in created_datasets
+                ],
+            }
+
+            return success_response(
+                "Sheet selection is required before upload can continue",
+                data=response_data,
             )
 
-        parsed_upload = await parse_csv_upload(file, user_id=current_user.id)
-        if isinstance(parsed_upload, PendingSheetSelection):
-            pending_sheet_selections.append(parsed_upload)
-            continue
-        parsed_uploads.append(parsed_upload)
+        logger.info(
+            "Created %s uploaded datasets for user_id=%s",
+            len(created_datasets),
+            current_user.id,
+        )
+        return success_response(
+            "Uploaded datasets created successfully",
+            status_code=201,
+            data=[
+                _serialize_uploaded_dataset(dataset)
+                for dataset in created_datasets
+            ],
+        )
+    finally:
+        for parsed_upload in parsed_uploads:
+            parsed_upload.cleanup()
 
-    created_datasets = []
-    total_upload_size = sum(parsed_upload.file_size for parsed_upload in parsed_uploads)
-    ensure_upload_storage_available(
-        db,
-        user_id=current_user.id,
-        plan_capabilities=plan_capabilities,
-        upload_size_bytes=total_upload_size,
-    )
-    for parsed_upload in parsed_uploads:
-        dataset_name = _build_uploaded_dataset_name(parsed_upload.file_name, parsed_upload.sheet_name)
+
+@router.post(
+    "/upload/google-sheet",
+    response_model=CsvUploadedDatasetSuccessResponse,
+    status_code=201,
+)
+def upload_google_sheet(
+    payload: GoogleSheetImportRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Import the selected public Google Sheets tab through the standard CSV workflow."""
+    plan_capabilities = get_user_plan_capabilities(db, current_user)
+    recorded_upload_count = get_recorded_upload_count(db, current_user.id)
+    max_active_datasets = plan_capabilities["max_active_datasets"]
+    if max_active_datasets is not None and recorded_upload_count + 1 > max_active_datasets:
+        raise error_response(
+            status_code=400,
+            detail=(
+                f"Your current plan allows up to {max_active_datasets} uploaded files. "
+                "You have reached your upload limit. Please upgrade your plan."
+            ),
+        )
+
+    google_export = None
+    parsed_upload = None
+    try:
+        google_export = download_google_sheet_csv(
+            sheet_url=payload.url,
+            max_file_size_bytes=plan_capabilities["max_file_size_bytes"],
+        )
+        parsed_upload = parse_csv_source_file(
+            file_name=google_export.file_name,
+            source_path=google_export.source_path,
+            file_size=google_export.file_size,
+            empty_detail="The selected Google Sheet is empty or does not contain data rows",
+        )
+        ensure_upload_storage_available(
+            db,
+            user_id=current_user.id,
+            plan_capabilities=plan_capabilities,
+            upload_size_bytes=parsed_upload.file_size,
+        )
         dataset = create_uploaded_dataset(
             db,
-            dataset_name=dataset_name,
+            dataset_name=_build_uploaded_dataset_name(parsed_upload.file_name),
             file_name=parsed_upload.file_name,
-            sheet_name=parsed_upload.sheet_name,
             file_size=parsed_upload.file_size,
             columns=parsed_upload.columns,
             internal_columns=parsed_upload.internal_columns,
-            rows=parsed_upload.rows,
+            source_path=parsed_upload.staged_path,
+            total_rows=parsed_upload.total_rows,
+            sample_rows=parsed_upload.sample_rows,
             user_id=current_user.id,
         )
-        set_dataset_retention_expiry(
-            db=db,
-            dataset=dataset,
-            user_id=current_user.id,
-        )
-        created_datasets.append(dataset)
-
-    db.flush()
-    for dataset in created_datasets:
+        set_dataset_retention_expiry(db=db, dataset=dataset, user_id=current_user.id)
+        db.flush()
         record_upload_storage_usage(db, dataset=dataset, user_id=current_user.id)
-
-    db.commit()
-
-    for dataset in created_datasets:
+        db.commit()
         db.refresh(dataset)
 
-    if pending_sheet_selections:
-        pending_files = [
-            {
-                "requires_sheet_selection": pending_upload.requires_sheet_selection,
-                "file_token": pending_upload.file_token,
-                "file_name": pending_upload.file_name,
-                "available_sheets": pending_upload.available_sheets,
-                "sheet_count": pending_upload.sheet_count,
-                "preview_row_count": pending_upload.preview_row_count,
-            }
-            for pending_upload in pending_sheet_selections
-        ]
-        response_data = {
-            "requires_sheet_selection": True,
-            "pending_files": pending_files,
-            "uploaded_datasets": created_datasets,
-        }
-
-        return success_response(
-            "Sheet selection is required before upload can continue",
-            data=response_data,
+        logger.info(
+            "Imported Google Sheet dataset_id=%s for user_id=%s",
+            dataset.id,
+            current_user.id,
         )
-
-    logger.info(
-        "Created %s uploaded datasets for user_id=%s",
-        len(created_datasets),
-        current_user.id,
-    )
-    return success_response(
-        "Uploaded datasets created successfully",
-        status_code=201,
-        data=created_datasets,
-    )
+        return success_response(
+            "Google Sheet imported successfully",
+            status_code=201,
+            data=_serialize_uploaded_dataset(dataset),
+        )
+    finally:
+        if parsed_upload is not None:
+            parsed_upload.cleanup()
+        if google_export is not None:
+            google_export.cleanup()
 
 
 @router.post(
@@ -305,99 +834,134 @@ def select_excel_sheet_for_upload(
             detail="At least one sheet selection is required",
         )
 
-    selected_sheet_count = sum(len(selection.selected_sheet_names()) for selection in payload)
+    selected_sheet_names_by_selection = [
+        (selection, _selected_sheet_names_for_route(selection))
+        for selection in payload
+    ]
+    selected_sheet_count = sum(
+        len(sheet_names) for _, sheet_names in selected_sheet_names_by_selection
+    )
     plan_capabilities = get_user_plan_capabilities(db, current_user)
-    active_dataset_count = count_user_active_datasets(db, current_user.id)
+    recorded_upload_count = get_recorded_upload_count(db, current_user.id)
     max_active_datasets = plan_capabilities["max_active_datasets"]
     if (
         max_active_datasets is not None
-        and active_dataset_count + selected_sheet_count > max_active_datasets
+        and recorded_upload_count + selected_sheet_count > max_active_datasets
     ):
         raise error_response(
             status_code=400,
             detail=(
-                f"Your current plan allows up to {max_active_datasets} active datasets. "
-                "Please delete an existing dataset or upgrade your plan."
+                f"Your current plan allows up to {max_active_datasets} uploaded files. "
+                "You have reached your upload limit. Please upgrade your plan."
             ),
         )
 
     selected_uploads = []
     total_selected_upload_size = 0
-    for selection in payload:
-        temporary_upload = validate_temporary_upload(
-            token=selection.file_token,
-            user_id=current_user.id,
-        )
-        for selected_sheet_name in selection.selected_sheet_names():
-            (
-                file_name,
-                file_size,
-                columns,
-                internal_columns,
-                rows,
-                sheet_name,
-            ) = process_temporary_upload_selection(
-                upload=temporary_upload,
-                sheet_name=selected_sheet_name,
-            )
-            total_selected_upload_size += file_size
-            ensure_upload_storage_available(
-                db,
+    seen_file_sheet_selections: set[tuple[str, str]] = set()
+    # Each selected sheet is staged to its own normalized CSV, so the sheets are never all
+    # held as rows at once. They are removed on every exit path.
+    try:
+        for selection, selected_sheet_names in selected_sheet_names_by_selection:
+            temporary_upload = validate_temporary_upload(
+                token=selection.file_token,
                 user_id=current_user.id,
-                plan_capabilities=plan_capabilities,
-                upload_size_bytes=total_selected_upload_size,
             )
-            selected_uploads.append(
-                {
-                    "file_name": file_name,
-                    "file_size": file_size,
-                    "columns": columns,
-                    "internal_columns": internal_columns,
-                    "rows": rows,
-                    "sheet_name": sheet_name,
-                }
+            for selected_sheet_name in selected_sheet_names:
+                file_sheet_key = (selection.file_token, selected_sheet_name)
+                if file_sheet_key in seen_file_sheet_selections:
+                    raise error_response(
+                        status_code=400,
+                        detail="Each sheet can only be selected once per uploaded file",
+                    )
+                seen_file_sheet_selections.add(file_sheet_key)
+                staged_path = new_staged_csv_path()
+                try:
+                    (
+                        file_name,
+                        file_size,
+                        columns,
+                        internal_columns,
+                        total_rows,
+                        sample_rows,
+                        sheet_name,
+                    ) = process_temporary_upload_selection(
+                        upload=temporary_upload,
+                        sheet_name=selected_sheet_name,
+                        dest_path=staged_path,
+                    )
+                except Exception:
+                    staged_path.unlink(missing_ok=True)
+                    raise
+                selected_uploads.append(
+                    {
+                        "file_name": file_name,
+                        "display_file_name": _build_uploaded_file_name(file_name, sheet_name),
+                        "file_size": file_size,
+                        "columns": columns,
+                        "internal_columns": internal_columns,
+                        "staged_path": staged_path,
+                        "total_rows": total_rows,
+                        "sample_rows": sample_rows,
+                        "sheet_name": sheet_name,
+                    }
+                )
+                total_selected_upload_size += file_size
+                ensure_upload_storage_available(
+                    db,
+                    user_id=current_user.id,
+                    plan_capabilities=plan_capabilities,
+                    upload_size_bytes=total_selected_upload_size,
+                )
+
+        created_datasets = []
+        for selected_upload in selected_uploads:
+            dataset = create_uploaded_dataset(
+                db,
+                dataset_name=_build_uploaded_dataset_name(
+                    selected_upload["file_name"],
+                    selected_upload["sheet_name"],
+                ),
+                file_name=selected_upload["display_file_name"],
+                sheet_name=selected_upload["sheet_name"],
+                file_size=selected_upload["file_size"],
+                columns=selected_upload["columns"],
+                internal_columns=selected_upload["internal_columns"],
+                source_path=selected_upload["staged_path"],
+                total_rows=selected_upload["total_rows"],
+                sample_rows=selected_upload["sample_rows"],
+                user_id=current_user.id,
             )
+            set_dataset_retention_expiry(
+                db=db,
+                dataset=dataset,
+                user_id=current_user.id,
+            )
+            created_datasets.append(dataset)
 
-    created_datasets = []
-    for selected_upload in selected_uploads:
-        dataset = create_uploaded_dataset(
-            db,
-            dataset_name=_build_uploaded_dataset_name(
-                selected_upload["file_name"],
-                selected_upload["sheet_name"],
-            ),
-            file_name=selected_upload["file_name"],
-            sheet_name=selected_upload["sheet_name"],
-            file_size=selected_upload["file_size"],
-            columns=selected_upload["columns"],
-            internal_columns=selected_upload["internal_columns"],
-            rows=selected_upload["rows"],
-            user_id=current_user.id,
+        db.flush()
+        for dataset in created_datasets:
+            record_upload_storage_usage(db, dataset=dataset, user_id=current_user.id)
+
+        db.commit()
+
+        for dataset in created_datasets:
+            db.refresh(dataset)
+
+        for file_token in {selection.file_token for selection in payload}:
+            delete_temporary_upload(file_token)
+
+        return success_response(
+            "Uploaded datasets created successfully",
+            status_code=201,
+            data=[
+                _serialize_uploaded_dataset(dataset)
+                for dataset in created_datasets
+            ],
         )
-        set_dataset_retention_expiry(
-            db=db,
-            dataset=dataset,
-            user_id=current_user.id,
-        )
-        created_datasets.append(dataset)
-
-    db.flush()
-    for dataset in created_datasets:
-        record_upload_storage_usage(db, dataset=dataset, user_id=current_user.id)
-
-    db.commit()
-
-    for dataset in created_datasets:
-        db.refresh(dataset)
-
-    for file_token in {selection.file_token for selection in payload}:
-        delete_temporary_upload(file_token)
-
-    return success_response(
-        "Uploaded datasets created successfully",
-        status_code=201,
-        data=created_datasets,
-    )
+    finally:
+        for selected_upload in selected_uploads:
+            selected_upload["staged_path"].unlink(missing_ok=True)
 
 
 @router.post("/merge/suggestions", response_model=MergeSuggestionsSuccessResponse)
@@ -407,11 +971,7 @@ def suggest_csv_dataset_merge(
     current_user: User = Depends(get_current_user),
 ):
     plan_capabilities = get_user_plan_capabilities(db, current_user)
-    if not plan_capabilities["can_merge"]:
-        raise error_response(
-            status_code=400,
-            detail="Data merging is not available on your current plan. Please upgrade your plan.",
-        )
+    _ensure_merge_allowed(plan_capabilities, len(payload.source_dataset_ids))
 
     source_datasets = get_ordered_uploaded_datasets(
         db,
@@ -431,11 +991,7 @@ def preview_csv_dataset_merge(
     current_user: User = Depends(get_current_user),
 ):
     plan_capabilities = get_user_plan_capabilities(db, current_user)
-    if not plan_capabilities["can_merge"]:
-        raise error_response(
-            status_code=400,
-            detail="Data merging is not available on your current plan. Please upgrade your plan.",
-        )
+    _ensure_merge_allowed(plan_capabilities, len(payload.source_dataset_ids))
 
     source_datasets = get_ordered_uploaded_datasets(
         db,
@@ -459,21 +1015,7 @@ def merge_csv_datasets(
     current_user: User = Depends(get_current_user),
 ):
     plan_capabilities = get_user_plan_capabilities(db, current_user)
-    if not plan_capabilities["can_merge"]:
-        raise error_response(
-            status_code=400,
-            detail="Data merging is not available on your current plan. Please upgrade your plan.",
-        )
-
-    max_merge_sources = plan_capabilities["max_merge_sources"]
-    if max_merge_sources is not None and len(payload.source_dataset_ids) > max_merge_sources:
-        raise error_response(
-            status_code=400,
-            detail=(
-                f"Your current plan allows merging up to {max_merge_sources} source datasets at a time. "
-                "Please upgrade your plan."
-            ),
-        )
+    _ensure_merge_allowed(plan_capabilities, len(payload.source_dataset_ids))
 
     active_dataset_count = count_user_active_datasets(db, current_user.id)
     max_active_datasets = plan_capabilities["max_active_datasets"]
@@ -518,21 +1060,71 @@ def merge_csv_datasets(
 
 @router.get("", response_model=CsvDatasetListSuccessResponse)
 def list_csv_datasets(
+    search: str | None = Query(
+        default=None,
+        description="Search term applied to uploaded and merged dataset file names.",
+    ),
+    dataset_type: Literal["uploaded", "merged"] | None = Query(
+        default=None,
+        description="Filter datasets by type.",
+    ),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(
+        default=DEFAULT_DATASET_PAGE_SIZE,
+        ge=1,
+        le=MAX_DATASET_PAGE_SIZE,
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    uploaded_datasets = (
-        db.query(CsvUploadedDataset)
-        .filter(CsvUploadedDataset.created_by_user_id == current_user.id)
-        .order_by(CsvUploadedDataset.id.desc())
-        .all()
+    search_term = _normalize_search_query(search)
+
+    uploaded_datasets = []
+    if dataset_type in (None, "uploaded"):
+        uploaded_query = db.query(CsvUploadedDataset).filter(
+            CsvUploadedDataset.created_by_user_id == current_user.id
+        )
+        if search_term:
+            uploaded_query = uploaded_query.filter(
+                CsvUploadedDataset.file_name.ilike(f"%{search_term}%")
+            )
+        uploaded_datasets = uploaded_query.order_by(CsvUploadedDataset.id.desc()).all()
+
+    merged_datasets = []
+    if dataset_type in (None, "merged"):
+        merged_query = db.query(CsvMergedDataset).filter(
+            CsvMergedDataset.created_by_user_id == current_user.id
+        )
+        merged_datasets = merged_query.order_by(CsvMergedDataset.id.desc()).all()
+        if search_term:
+            normalized_search_term = search_term.lower()
+            merged_datasets = [
+                dataset
+                for dataset in merged_datasets
+                if normalized_search_term in _build_merged_file_name(dataset).lower()
+            ]
+
+    combined_datasets = [
+        ("uploaded", dataset)
+        for dataset in uploaded_datasets
+    ] + [
+        ("merged", dataset)
+        for dataset in merged_datasets
+    ]
+    combined_datasets.sort(
+        key=lambda item: (_normalize_sort_timestamp(item[1].created_at), item[1].id),
+        reverse=True,
     )
-    merged_datasets = (
-        db.query(CsvMergedDataset)
-        .filter(CsvMergedDataset.created_by_user_id == current_user.id)
-        .order_by(CsvMergedDataset.id.desc())
-        .all()
-    )
+    total = len(combined_datasets)
+    start_index = (page - 1) * page_size
+    paginated_datasets = combined_datasets[start_index:start_index + page_size]
+    uploaded_datasets = [
+        dataset for dataset_type, dataset in paginated_datasets if dataset_type == "uploaded"
+    ]
+    merged_datasets = [
+        dataset for dataset_type, dataset in paginated_datasets if dataset_type == "merged"
+    ]
+
     source_dataset_ids = sorted(
         {
             item["id"]
@@ -552,14 +1144,146 @@ def list_csv_datasets(
     )
     source_dataset_map = {dataset.id: dataset for dataset in source_datasets}
 
+    clean_state_map = _build_dataset_clean_state_map(
+        db,
+        current_user=current_user,
+        uploaded_datasets=uploaded_datasets,
+        merged_datasets=merged_datasets,
+    )
+    fully_clean_map = _build_dataset_fully_clean_map(
+        db,
+        current_user=current_user,
+        uploaded_datasets=uploaded_datasets,
+        merged_datasets=merged_datasets,
+    )
+    datasets = []
+    for dataset_type, dataset in paginated_datasets:
+        if dataset_type == "uploaded":
+            datasets.append(
+                {
+                    **_serialize_uploaded_dataset(
+                        dataset,
+                        clean_state_map.get(("uploaded", dataset.id)),
+                    ),
+                    "dataset_type": "uploaded",
+                    "is_fully_clean": fully_clean_map.get(("uploaded", dataset.id), False),
+                }
+            )
+        else:
+            datasets.append(
+                {
+                    **_serialize_merged_dataset(
+                        dataset,
+                        source_dataset_map,
+                        clean_state_map.get(("merged", dataset.id)),
+                    ),
+                    "dataset_type": "merged",
+                    "is_fully_clean": fully_clean_map.get(("merged", dataset.id), False),
+                }
+            )
+
     return success_response(
         "Datasets fetched successfully",
         data={
-            "uploaded_datasets": uploaded_datasets,
-            "merged_datasets": [
-                _serialize_merged_dataset(merged_dataset, source_dataset_map)
-                for merged_dataset in merged_datasets
-            ],
+            "datasets": datasets,
+            "pagination": _pagination_meta(total, page, page_size),
+        },
+    )
+
+
+@router.get("/{dataset_id}", response_model=CsvDatasetItemSuccessResponse)
+def get_csv_dataset(
+    dataset_id: int,
+    dataset_type: Literal["uploaded", "merged"] = Query(
+        ...,
+        description="Whether dataset_id refers to an uploaded or a merged dataset.",
+    ),
+    is_detail: bool = Query(
+        False,
+        description=(
+            "Return only the dataset's columns, each with its datatype, missing values, unique "
+            "values and a short value sample. Reads the stored rows, so it is slower than the "
+            "default response."
+        ),
+    ),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if dataset_type == "uploaded":
+        dataset = (
+            db.query(CsvUploadedDataset)
+            .filter(
+                CsvUploadedDataset.id == dataset_id,
+                CsvUploadedDataset.created_by_user_id == current_user.id,
+            )
+            .first()
+        )
+        if not dataset:
+            raise error_response(status_code=404, detail="Uploaded dataset not found")
+
+        if is_detail:
+            return _dataset_columns_response(db, dataset)
+
+        _ensure_dataset_column_types(db, dataset)
+        clean_state_map = _build_dataset_clean_state_map(
+            db,
+            current_user=current_user,
+            uploaded_datasets=[dataset],
+            merged_datasets=[],
+        )
+        return success_response(
+            "Dataset fetched successfully",
+            data={
+                **_serialize_uploaded_dataset(dataset, clean_state_map.get(("uploaded", dataset.id))),
+                "dataset_type": "uploaded",
+            },
+        )
+
+    dataset = (
+        db.query(CsvMergedDataset)
+        .filter(
+            CsvMergedDataset.id == dataset_id,
+            CsvMergedDataset.created_by_user_id == current_user.id,
+        )
+        .first()
+    )
+    if not dataset:
+        raise error_response(status_code=404, detail="Merged dataset not found")
+
+    if is_detail:
+        return _dataset_columns_response(db, dataset)
+
+    _ensure_dataset_column_types(db, dataset)
+    source_dataset_ids = sorted(
+        {item["id"] for item in (dataset.source_datasets_metadata or [])}
+    )
+    source_datasets = (
+        db.query(CsvUploadedDataset)
+        .filter(
+            CsvUploadedDataset.created_by_user_id == current_user.id,
+            CsvUploadedDataset.id.in_(source_dataset_ids),
+        )
+        .all()
+        if source_dataset_ids
+        else []
+    )
+    source_dataset_map = {source.id: source for source in source_datasets}
+
+    clean_state_map = _build_dataset_clean_state_map(
+        db,
+        current_user=current_user,
+        uploaded_datasets=[],
+        merged_datasets=[dataset],
+    )
+    return success_response(
+        "Dataset fetched successfully",
+        data={
+            **_serialize_merged_dataset(
+                dataset,
+                source_dataset_map,
+                clean_state_map.get(("merged", dataset.id)),
+            ),
+            "dataset_type": "merged",
         },
     )
 
@@ -604,6 +1328,91 @@ def retention_csv_uploaded_dataset(
             "retention_until": dataset.retention_until,
             "retention_at": dataset.retention_at,
         },
+    )
+
+
+@router.patch(
+    "/uploaded/{dataset_id}/rename",
+    response_model=CsvUploadedDatasetSuccessResponse,
+)
+def rename_csv_uploaded_dataset(
+    dataset_id: int,
+    payload: RenameDatasetRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    dataset = (
+        db.query(CsvUploadedDataset)
+        .filter(
+            CsvUploadedDataset.id == dataset_id,
+            CsvUploadedDataset.created_by_user_id == current_user.id,
+        )
+        .first()
+    )
+    if not dataset:
+        raise error_response(status_code=404, detail="Uploaded dataset not found")
+
+    requested_name = _normalize_rename_name(payload.name)
+    previous_file_name = dataset.file_name
+    dataset.name, dataset.file_name = _uploaded_rename_values(dataset, requested_name)
+    _rename_dataset_references(
+        db,
+        dataset_id=dataset.id,
+        dataset_type="uploaded",
+        user_id=current_user.id,
+        dataset_name=dataset.name,
+        file_name=dataset.file_name,
+        previous_file_name=previous_file_name,
+    )
+    db.commit()
+    db.refresh(dataset)
+
+    logger.info("Renamed uploaded dataset_id=%s for user_id=%s", dataset_id, current_user.id)
+    return success_response(
+        "Uploaded dataset renamed successfully",
+        data=_serialize_uploaded_dataset(dataset),
+    )
+
+
+@router.patch(
+    "/merged/{dataset_id}/rename",
+    response_model=CsvMergedDatasetSuccessResponse,
+)
+def rename_csv_merged_dataset(
+    dataset_id: int,
+    payload: RenameDatasetRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    dataset = (
+        db.query(CsvMergedDataset)
+        .filter(
+            CsvMergedDataset.id == dataset_id,
+            CsvMergedDataset.created_by_user_id == current_user.id,
+        )
+        .first()
+    )
+    if not dataset:
+        raise error_response(status_code=404, detail="Merged dataset not found")
+
+    previous_file_name = _build_merged_file_name(dataset)
+    dataset.name = _merged_rename_value(_normalize_rename_name(payload.name))
+    _rename_dataset_references(
+        db,
+        dataset_id=dataset.id,
+        dataset_type="merged",
+        user_id=current_user.id,
+        dataset_name=dataset.name,
+        file_name=_build_merged_file_name(dataset),
+        previous_file_name=previous_file_name,
+    )
+    db.commit()
+    db.refresh(dataset)
+
+    logger.info("Renamed merged dataset_id=%s for user_id=%s", dataset_id, current_user.id)
+    return success_response(
+        "Merged dataset renamed successfully",
+        data=_serialize_merged_dataset(dataset),
     )
 
 

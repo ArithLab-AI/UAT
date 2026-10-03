@@ -28,7 +28,11 @@ def coalesce_priority_clean_quality_score(
         current_score,
         raw_score if raw_score is not None else current_score,
     )
-    if previous_clean_score is not None and previous_clean_score <= baseline_score:
+    # Floor the cleaned score at any previously achieved clean score so re-analysing an
+    # already-cleaned dataset can never regress below an earlier clean result. The old
+    # `previous_clean_score <= baseline_score` guard made this a no-op in exactly the
+    # regression case (previous_clean_score > baseline_score), which let the score drop.
+    if previous_clean_score is not None:
         baseline_score = max(baseline_score, previous_clean_score)
     if not changes_detected or previous_clean_score is not None:
         return min(100, baseline_score)

@@ -34,6 +34,7 @@ class UserUploadStorageUsage(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    subscription_id = Column(Integer,ForeignKey("user_subscriptions.id"),nullable=True,)
     uploaded_dataset_id = Column(Integer, nullable=True, index=True)
     file_size_bytes = Column(Integer, nullable=False, default=0)
     file_name = Column(String, nullable=True)

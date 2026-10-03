@@ -32,6 +32,7 @@ class CleaningJob(Base):
     rows_after = Column(Integer, nullable=True)
     columns_before = Column(Integer, nullable=True)
     columns_after = Column(Integer, nullable=True)
+    columns_after_names = Column(JSON, nullable=True)
     source_dataset_id = Column(Integer, nullable=True, index=True)
     ai_cleaning_type = Column(Boolean, nullable=False, default=False)
     steps_applied = Column(JSON, nullable=True)

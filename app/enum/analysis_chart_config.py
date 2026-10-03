@@ -1,0 +1,288 @@
+"""Static metadata tying each basic AnalysisType to its supported chart types,
+default chart, required column roles, and supported aggregations.
+
+Direct code representation of the Data Analysis Workflow Specification
+(section 2 — Basic Analysis Module) for the analysis types exposed under
+``/basic-analysis``, including the Multi Axis and Geospatial & Location
+analyses. Drives both request validation and the
+``GET /basic-analysis/types`` metadata endpoint that a frontend uses to
+build the pickers.
+"""
+
+from dataclasses import dataclass
+
+from app.enum.aggregation_type_enum import AggregationType
+from app.enum.analysis_type_enum import AnalysisType
+from app.enum.chart_type_enum import ChartType
+
+ColumnDataType = str  # "numeric" | "categorical" | "date" | "any"
+
+
+@dataclass(frozen=True)
+class ColumnRequirement:
+    role: str
+    required: bool
+    data_type: ColumnDataType
+    label: str
+    example: str
+
+
+@dataclass(frozen=True)
+class AnalysisTypeConfig:
+    analysis_type: AnalysisType
+    label: str
+    tagline: str
+    default_chart_type: ChartType
+    supported_chart_types: tuple[ChartType, ...]
+    supported_aggregations: tuple[AggregationType, ...]
+    column_requirements: tuple[ColumnRequirement, ...]
+
+
+# Aggregation set shared by most spec analyses (Simple Dist, Top/Bottom N,
+# Time Series, Advanced Distribution). Spec section 2.
+_SPEC_AGGREGATIONS: tuple[AggregationType, ...] = (
+    AggregationType.COUNT,
+    AggregationType.SUM,
+    AggregationType.AVERAGE,
+    AggregationType.MEDIAN,
+    AggregationType.MINIMUM,
+    AggregationType.MAXIMUM,
+    AggregationType.PERCENTAGE,
+)
+
+# Geospatial & Location Analysis aggregation set (spec Step 5) — same as
+# _SPEC_AGGREGATIONS minus PERCENTAGE, which isn't offered for this analysis.
+_GEO_AGGREGATIONS: tuple[AggregationType, ...] = (
+    AggregationType.SUM,
+    AggregationType.AVERAGE,
+    AggregationType.COUNT,
+    AggregationType.MEDIAN,
+    AggregationType.MINIMUM,
+    AggregationType.MAXIMUM,
+)
+
+
+ANALYSIS_TYPE_CONFIGS: dict[AnalysisType, AnalysisTypeConfig] = {
+    # ── 1. Descriptive Analysis ──────────────────────────────────────────
+    # Spec: auto-picks all numeric columns, no user column selection,
+    # returns table (Count/Mean/Std/Min/25%/50%/75%/Max), view type = Table.
+    AnalysisType.DESCRIPTIVE: AnalysisTypeConfig(
+        analysis_type=AnalysisType.DESCRIPTIVE,
+        label="Descriptive Analysis",
+        tagline="Summary statistics across all numeric columns",
+        default_chart_type=ChartType.TABLE,
+        supported_chart_types=(ChartType.TABLE,),
+        supported_aggregations=(),  # auto — no user aggregation
+        column_requirements=(),  # no user column selection
+    ),
+
+    # ── 2. Simple Distribution Analysis ──────────────────────────────────
+    # Spec: X = categorical only. Groups by X, applies aggregation.
+    # Charts: Bar, Column, Line, Pie, Doughnut, Line Area.
+    AnalysisType.SIMPLE_DISTRIBUTION: AnalysisTypeConfig(
+        analysis_type=AnalysisType.SIMPLE_DISTRIBUTION,
+        label="Simple Distribution Analysis",
+        tagline="Group by a category and see counts, sums, or percentages",
+        default_chart_type=ChartType.BAR,
+        supported_chart_types=(
+            ChartType.BAR,
+            ChartType.COLUMN,
+            ChartType.LINE,
+            ChartType.PIE,
+            ChartType.DOUGHNUT,
+            ChartType.LINE_AREA,
+        ),
+        supported_aggregations=_SPEC_AGGREGATIONS,
+        column_requirements=(
+            ColumnRequirement("x", True, "categorical", "Category to group by",
+                              "Region, Product, Category"),
+        ),
+    ),
+
+    # ── 3. Top N Analysis ────────────────────────────────────────────────
+    # Spec: X = categorical (required). Y = numeric (optional).
+    # If Y not selected → default to Count of X. Sorted descending, N max = 10.
+    # Charts: Bar, Column, Line, Line Area only — no table view.
+    AnalysisType.TOP_N: AnalysisTypeConfig(
+        analysis_type=AnalysisType.TOP_N,
+        label="Top N Analysis",
+        tagline="Rank the highest-performing entities by a metric",
+        default_chart_type=ChartType.BAR,
+        supported_chart_types=(
+            ChartType.BAR,
+            ChartType.COLUMN,
+            ChartType.LINE,
+            ChartType.LINE_AREA,
+        ),
+        supported_aggregations=_SPEC_AGGREGATIONS,
+        column_requirements=(
+            ColumnRequirement("x", True, "categorical", "Entity to rank",
+                              "Region, Product, Category"),
+            ColumnRequirement("y", False, "numeric", "Metric to rank by (optional — defaults to Count of X)",
+                              "Sales, Profit"),
+        ),
+    ),
+
+    # ── 4. Bottom N Analysis ────────────────────────────────────────────
+    # Spec: same as Top N but sorted ascending. N max = 10.
+    # Charts: Bar, Column, Line, Line Area only — no table view.
+    AnalysisType.BOTTOM_N: AnalysisTypeConfig(
+        analysis_type=AnalysisType.BOTTOM_N,
+        label="Bottom N Analysis",
+        tagline="Rank the lowest-performing entities by a metric",
+        default_chart_type=ChartType.BAR,
+        supported_chart_types=(
+            ChartType.BAR,
+            ChartType.COLUMN,
+            ChartType.LINE,
+            ChartType.LINE_AREA,
+        ),
+        supported_aggregations=_SPEC_AGGREGATIONS,
+        column_requirements=(
+            ColumnRequirement("x", True, "categorical", "Entity to rank",
+                              "Region, Product, Category"),
+            ColumnRequirement("y", False, "numeric", "Metric to rank by (optional — defaults to Count of X)",
+                              "Sales, Profit"),
+        ),
+    ),
+
+    # ── 5. Time Series Analysis ─────────────────────────────────────────
+    # Spec: X = date/datetime (required). Y = numeric (optional).
+    # If Y not selected → aggregation locks to Count.
+    # Charts: Line, Line Area, Bar, Horizontal Bar, Step Line.
+    AnalysisType.TIME_SERIES: AnalysisTypeConfig(
+        analysis_type=AnalysisType.TIME_SERIES,
+        label="Time Series Analysis",
+        tagline="Analyze how a metric evolves over time",
+        default_chart_type=ChartType.LINE,
+        supported_chart_types=(
+            ChartType.LINE,
+            ChartType.LINE_AREA,
+            ChartType.BAR,
+            ChartType.HORIZONTAL_BAR,
+            ChartType.STEP_LINE,
+        ),
+        supported_aggregations=_SPEC_AGGREGATIONS,
+        column_requirements=(
+            ColumnRequirement("x", True, "date", "Date/time axis",
+                              "Order Date, Transaction Date, Month"),
+            ColumnRequirement("y", False, "numeric", "Metric over time (optional — defaults to Count)",
+                              "Sales, Revenue, Quantity"),
+        ),
+    ),
+
+    # ── 6. Advanced Distribution Analysis ───────────────────────────────
+    # Spec: X = categorical, Y = numeric MANDATORY.
+    # Charts: Bar, Column, Line, Pie, Doughnut, Line Area.
+    AnalysisType.ADVANCED_DISTRIBUTION: AnalysisTypeConfig(
+        analysis_type=AnalysisType.ADVANCED_DISTRIBUTION,
+        label="Advanced Distribution",
+        tagline="Group by a category and aggregate a numeric measure",
+        default_chart_type=ChartType.BAR,
+        supported_chart_types=(
+            ChartType.BAR,
+            ChartType.COLUMN,
+            ChartType.LINE,
+            ChartType.PIE,
+            ChartType.DOUGHNUT,
+            ChartType.LINE_AREA,
+        ),
+        supported_aggregations=_SPEC_AGGREGATIONS,
+        column_requirements=(
+            ColumnRequirement("x", True, "categorical", "Grouping dimension",
+                              "City, Department, Product"),
+            ColumnRequirement("y", True, "numeric", "Metric to aggregate (mandatory)",
+                              "Revenue, Orders, Profit"),
+        ),
+    ),
+
+    # ── 7. Correlation Analysis ─────────────────────────────────────────
+    # Multi-select numeric. The user picks one chart and only that chart is built:
+    #   Scatter Plot → exactly 2 cols: X (independent) vs Y (dependent).
+    #   Bubble Chart → 3 or 4 cols: X, Y, 3rd col = bubble size, 4th col = bubble color.
+    #   Heat Map     → 2 to 10 cols: pairwise correlation matrix of all selected columns.
+    # No chart_type → picked from column count (2 → scatter, 3-4 → bubble, 5+ → heat map).
+    # Method: Pearson only (per spec section 3).
+    AnalysisType.CORRELATION: AnalysisTypeConfig(
+        analysis_type=AnalysisType.CORRELATION,
+        label="Correlation Analysis",
+        tagline="Measure how strongly numeric variables move together",
+        default_chart_type=ChartType.SCATTER,
+        supported_chart_types=(
+            ChartType.SCATTER,
+            ChartType.BUBBLE,
+            ChartType.HEATMAP,
+        ),
+        supported_aggregations=(),
+        column_requirements=(
+            ColumnRequirement("columns", True, "numeric",
+                              "Scatter: 2 columns (X, Y). Bubble: 3-4 columns (X, Y, size, "
+                              "optional color). Heat Map: 2-10 columns.",
+                              "Distance to Metro, Rental Rate, Property Size, Foot Traffic"),
+        ),
+    ),
+
+    # ── 8. Multi Axis Analysis ───────────────────────────────────────────
+    # X = categorical or date/time (shared dimension, required).
+    # Primary Y (left axis) = one or more numeric, higher absolute values / volume → Columns.
+    # Secondary Y (right axis) = numeric, different unit or scale (rate, ratio,
+    # average, smaller total) → Line. Chart: mixed Bar (column) + Line.
+    AnalysisType.MULTI_AXIS: AnalysisTypeConfig(
+        analysis_type=AnalysisType.MULTI_AXIS,
+        label="Multi Axis Analysis",
+        tagline="Compare volume measures (columns) with a rate or average (line) on two Y axes "
+        "over a shared category or time axis",
+        default_chart_type=ChartType.MIXED_BAR_LINE,
+        supported_chart_types=(ChartType.MIXED_BAR_LINE,),
+        supported_aggregations=_SPEC_AGGREGATIONS,
+        column_requirements=(
+            ColumnRequirement("x", True, "categorical_or_date",
+                              "Shared X axis — a category or date/time column",
+                              "Month, Year, Order Date, Product Line, Region"),
+            ColumnRequirement("y_columns", True, "numeric",
+                              "Primary Y axis (left, columns) — one or more high-volume measures",
+                              "Total Revenue, Units Sold, Sales Volume"),
+            ColumnRequirement("secondary_y", True, "numeric",
+                              "Secondary Y axis (right, line) — rate, ratio, average or smaller-scale measure",
+                              "Profit Margin %, Conversion Rate, Average Order Value"),
+        ),
+    ),
+
+    # ── 9. Geospatial & Location Analysis ────────────────────────────────
+    # Location = geographic column(s): City/State/Country/Zip, or a Latitude +
+    # Longitude pair. Metric = numeric (optional — defaults to Count of records).
+    AnalysisType.GEOSPATIAL: AnalysisTypeConfig(
+        analysis_type=AnalysisType.GEOSPATIAL,
+        label="Geospatial & Location Analysis",
+        tagline="Map and analyze a metric across geographic locations",
+        default_chart_type=ChartType.CHOROPLETH_MAP,
+        supported_chart_types=(
+            ChartType.CHOROPLETH_MAP,
+            ChartType.PIN_MAP,
+            ChartType.HEATMAP_MAP,
+            ChartType.BUBBLE_MAP,
+        ),
+        supported_aggregations=_GEO_AGGREGATIONS,
+        column_requirements=(
+            ColumnRequirement("location", True, "geographic",
+                              "Location column (City, State, Country, Zip Code, or Latitude — "
+                              "pair with a Longitude column via location_column_2)",
+                              "City, State, Zip Code, Latitude"),
+            ColumnRequirement("metric", False, "numeric",
+                              "Metric to aggregate (optional — defaults to Count of records)",
+                              "Sales, Revenue, Orders, Active Users"),
+        ),
+    ),
+}
+
+
+def get_analysis_type_config(analysis_type: AnalysisType) -> AnalysisTypeConfig:
+    return ANALYSIS_TYPE_CONFIGS[analysis_type]
+
+
+def resolve_chart_type(analysis_type: AnalysisType, chart_type: ChartType | None) -> ChartType:
+    """Return the requested chart type if valid for this analysis, else the default."""
+    config = get_analysis_type_config(analysis_type)
+    if chart_type is not None and chart_type in config.supported_chart_types:
+        return chart_type
+    return config.default_chart_type

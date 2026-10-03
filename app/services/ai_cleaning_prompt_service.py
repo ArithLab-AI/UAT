@@ -34,6 +34,7 @@ from app.services.analysis_profile_service import (
     _to_snake_case,
 )
 from app.utils.openai_utils import get_openai_client
+from app.utils.token_usage import TokenUsageLogger
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +208,8 @@ def prompt_has_deterministic_cleaning_steps(user_prompt: str) -> bool:
     ]
     return (
         _should_normalize_headers(user_prompt)
+        or prompt_requests_numeric_imputation(user_prompt)
+        or prompt_requests_mode_imputation(user_prompt)
         or _prompt_mentions_missing_values(user_prompt)
         or _should_trim_whitespace(user_prompt)
         or prompt_removes_exact_duplicates(user_prompt)
@@ -254,10 +257,11 @@ def _apply_text_cleaning(
     *,
     normalize_missing: bool = False,
     trim_whitespace: bool = False,
+    collapse_spaces: bool = False,
     target_columns: set[str] | None = None,
     preserve_missing_literals: set[str] | None = None,
 ) -> pd.DataFrame:
-    if not normalize_missing and not trim_whitespace:
+    if not normalize_missing and not trim_whitespace and not collapse_spaces:
         return df
 
     normalized_df = df.copy()
@@ -278,7 +282,9 @@ def _apply_text_cleaning(
             if not isinstance(value, str):
                 return value
 
-            transformed = value.strip() if trim_whitespace else value
+            transformed = value.strip() if (trim_whitespace or collapse_spaces) else value
+            if collapse_spaces:
+                transformed = re.sub(r"\s+", " ", transformed)
             normalized_value = transformed.strip().lower()
             if (
                 should_normalize_column
@@ -341,8 +347,125 @@ def _should_normalize_headers(user_prompt: str) -> bool:
 
 def _should_trim_whitespace(user_prompt: str) -> bool:
     normalized_prompt = user_prompt.strip().lower()
-    whitespace_terms = ["whitespace", "leading or trailing", "trim", "strip spaces"]
+    whitespace_terms = [
+        "whitespace",
+        "leading or trailing",
+        "trim",
+        "strip spaces",
+        "extra space",
+        "extra spaces",
+        "double space",
+        "double spaces",
+        "multiple spaces",
+        "collapse space",
+        "collapse spaces",
+        "redundant space",
+        "redundant spaces",
+    ]
     return any(term in normalized_prompt for term in whitespace_terms)
+
+
+def _should_collapse_spaces(user_prompt: str) -> bool:
+    """Detect a request to collapse runs of internal whitespace down to a single
+    space (e.g. "remove extra/double/multiple spaces"), which is fully
+    deterministic and never needs the LLM."""
+    normalized_prompt = user_prompt.strip().lower()
+    collapse_terms = [
+        "extra space",
+        "extra spaces",
+        "double space",
+        "double spaces",
+        "multiple spaces",
+        "collapse space",
+        "collapse spaces",
+        "redundant space",
+        "redundant spaces",
+        "extra whitespace",
+    ]
+    return any(term in normalized_prompt for term in collapse_terms)
+
+
+def _case_conversion_mode(user_prompt: str) -> str | None:
+    """Return "lower"/"upper" for a plain, deterministic case-conversion request,
+    or None when no such request is present or the casing is context-dependent
+    (title/proper/sentence case, capitalization) and genuinely needs the LLM."""
+    normalized_prompt = user_prompt.strip().lower()
+
+    # Context-dependent casing needs judgement (e.g. proper-noun capitalization,
+    # "uppercase the first letter") -> leave it to the LLM.
+    context_dependent_terms = [
+        "capitalize",
+        "capitalization",
+        "title case",
+        "proper case",
+        "sentence case",
+        "first letter",
+        "first character",
+        "each word",
+        "initial letter",
+    ]
+    if any(term in normalized_prompt for term in context_dependent_terms):
+        return None
+
+    # Hard-semantic instructions bundled with the casing request also need the LLM.
+    hard_semantic_terms = [
+        "typo",
+        "spelling",
+        "map value",
+        "map to",
+        "category",
+        "categorize",
+        "translate",
+        "rewrite",
+        "harmonize",
+        "abbreviation",
+    ]
+    if any(term in normalized_prompt for term in hard_semantic_terms):
+        return None
+
+    lower_terms = ["lowercase", "lower case", "to lower", "all lower"]
+    upper_terms = ["uppercase", "upper case", "to upper", "all caps", "all upper"]
+    wants_lower = any(term in normalized_prompt for term in lower_terms)
+    wants_upper = any(term in normalized_prompt for term in upper_terms)
+    if wants_lower and not wants_upper:
+        return "lower"
+    if wants_upper and not wants_lower:
+        return "upper"
+    return None
+
+
+def _is_case_conversion_only_prompt(user_prompt: str) -> bool:
+    return _case_conversion_mode(user_prompt) is not None
+
+
+def _apply_case_conversion(
+    df: pd.DataFrame,
+    *,
+    mode: str,
+    target_columns: set[str] | None = None,
+) -> pd.DataFrame:
+    """Deterministically lower/upper-case string columns, scoped to
+    target_columns when provided. Non-string values and NA are left untouched."""
+    if mode not in {"lower", "upper"}:
+        return df
+
+    converted_df = df.copy()
+    scoped_columns = {str(column) for column in (target_columns or set())}
+    for column in converted_df.columns:
+        if scoped_columns and str(column) not in scoped_columns:
+            continue
+        series = converted_df[column]
+        if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
+            continue
+
+        def _transform_value(value):
+            if not isinstance(value, str):
+                return value
+            return value.lower() if mode == "lower" else value.upper()
+
+        converted_df[column] = series.map(_transform_value)
+
+    return converted_df
 
 
 def _has_semantic_value_cleaning_terms(normalized_prompt: str) -> bool:
@@ -426,8 +549,60 @@ def _is_type_validation_only_prompt(user_prompt: str) -> bool:
     )
 
 
+def prompt_requests_numeric_imputation(user_prompt: str) -> bool:
+    """Detect a request to fill missing numeric cells with a central statistic
+    (mean / median / average) rather than a fixed placeholder token."""
+    normalized_prompt = user_prompt.strip().lower()
+    has_fill_action = any(term in normalized_prompt for term in ("fill", "impute", "imputation"))
+    has_statistic = any(term in normalized_prompt for term in ("mean", "median", "average"))
+    return has_fill_action and has_statistic
+
+
+def _is_numeric_imputation_only_prompt(user_prompt: str) -> bool:
+    return prompt_requests_numeric_imputation(user_prompt)
+
+
+def numeric_imputation_strategy(user_prompt: str) -> str:
+    """Decide which statistic the numeric-imputation fill should use.
+
+    - "mean"   : prompt asks only for mean/average
+    - "median" : prompt asks only for median
+    - "smart"  : prompt mentions both (default), float -> mean, integer -> rounded median
+    """
+    normalized_prompt = user_prompt.strip().lower()
+    wants_mean = "mean" in normalized_prompt or "average" in normalized_prompt
+    wants_median = "median" in normalized_prompt
+    if wants_median and not wants_mean:
+        return "median"
+    if wants_mean and not wants_median:
+        return "mean"
+    return "smart"
+
+
+def prompt_requests_mode_imputation(user_prompt: str) -> bool:
+    """Detect a request to fill missing cells with the column's most frequent
+    (mode / highest-frequency) existing value."""
+    normalized_prompt = user_prompt.strip().lower()
+    has_fill_action = any(term in normalized_prompt for term in ("fill", "impute", "imputation", "replace"))
+    has_mode_term = any(
+        term in normalized_prompt
+        for term in ("most frequent", "most common", "highest frequency", "max frequency", "modal value", "mode value")
+    )
+    return has_fill_action and has_mode_term
+
+
+def _is_mode_imputation_only_prompt(user_prompt: str) -> bool:
+    return prompt_requests_mode_imputation(user_prompt)
+
+
+def _prompt_requests_any_imputation(user_prompt: str) -> bool:
+    return prompt_requests_numeric_imputation(user_prompt) or prompt_requests_mode_imputation(user_prompt)
+
+
 def _is_missing_value_only_prompt(user_prompt: str) -> bool:
     normalized_prompt = user_prompt.strip().lower()
+    if _prompt_requests_any_imputation(user_prompt):
+        return False
     missing_terms = ["missing", "null", "blank", "empty", "n/a", "placeholder"]
     return any(term in normalized_prompt for term in missing_terms) and not _has_semantic_value_cleaning_terms(
         normalized_prompt
@@ -436,6 +611,8 @@ def _is_missing_value_only_prompt(user_prompt: str) -> bool:
 
 def _is_date_only_prompt(user_prompt: str) -> bool:
     normalized_prompt = user_prompt.strip().lower()
+    if prompt_requests_mode_imputation(user_prompt):
+        return False
     return _prompt_requests_date_normalization(normalized_prompt) and not _has_semantic_value_cleaning_terms(
         normalized_prompt
     )
@@ -558,6 +735,8 @@ def _is_duplicate_only_prompt(user_prompt: str) -> bool:
 def _requires_ai_cleaning(user_prompt: str) -> bool:
     deterministic_only = (
         _is_duplicate_only_prompt(user_prompt)
+        or _is_numeric_imputation_only_prompt(user_prompt)
+        or _is_mode_imputation_only_prompt(user_prompt)
         or _is_missing_value_only_prompt(user_prompt)
         or _is_date_only_prompt(user_prompt)
         or _is_email_only_prompt(user_prompt)
@@ -569,6 +748,8 @@ def _requires_ai_cleaning(user_prompt: str) -> bool:
         or _is_numeric_only_prompt(user_prompt)
         or _is_header_only_prompt(user_prompt)
         or _is_header_type_only_prompt(user_prompt)
+        or _is_case_conversion_only_prompt(user_prompt)
+        or _should_collapse_spaces(user_prompt)
     )
     return not deterministic_only
 
@@ -745,6 +926,7 @@ def _apply_schema_type_validation(
     df: pd.DataFrame,
     *,
     target_columns: set[str] | None = None,
+    forced_type: str | None = None,
 ) -> pd.DataFrame:
     validated_df = df.copy()
     scoped_columns = set(target_columns or set())
@@ -754,7 +936,7 @@ def _apply_schema_type_validation(
             continue
 
         series = validated_df[column]
-        expected_type = _infer_expected_validation_type_for_cleaning(column_name, series)
+        expected_type = forced_type or _infer_expected_validation_type_for_cleaning(column_name, series)
         if expected_type == "string":
             string_series = series.astype("string")
             non_null_mask = series.notna()
@@ -1003,6 +1185,139 @@ def _replace_missing_values(
             normalized_df[column] = updated_series
 
     return normalized_df
+
+
+def _missing_value_mask(series: pd.Series) -> pd.Series:
+    string_series = series.astype("string")
+    stripped_series = string_series.str.strip()
+    return series.isna() | stripped_series.eq("") | stripped_series.str.lower().isin(_DEFAULT_NULL_TOKENS)
+
+
+def accumulate_numeric_imputation_stats(
+    df: pd.DataFrame,
+    target_columns: set[str] | None,
+    accumulator: dict[str, dict[str, Any]],
+) -> None:
+    """Collect each target numeric column's non-missing values across chunks.
+
+    Mean/median must be computed over the whole column, but cleaning runs
+    chunk-by-chunk, so values are accumulated here and finalized once at the end.
+    """
+    scoped_columns = {str(column) for column in (target_columns or set())}
+    for column in df.columns:
+        column_name = str(column)
+        if scoped_columns and column_name not in scoped_columns:
+            continue
+
+        series = df[column]
+        present_values = series[~_missing_value_mask(series)]
+        bucket = accumulator.setdefault(column_name, {"values": [], "all_integer": True})
+        for value in present_values.tolist():
+            parsed = _parse_float_value(value)
+            if parsed is None:
+                continue
+            number = float(parsed)
+            bucket["values"].append(number)
+            if not number.is_integer():
+                bucket["all_integer"] = False
+
+
+def finalize_numeric_imputation_values(
+    accumulator: dict[str, dict[str, Any]], *, strategy: str = "smart"
+) -> dict[str, Any]:
+    """Reduce accumulated values to one fill value per column.
+
+    - "smart"  (default): float columns use the mean, integer columns use the median.
+    - "mean"            : every column uses the mean (average).
+    - "median"          : every column uses the median.
+
+    Either way, integer (whole-number) columns round to a clean integer; float columns
+    keep two decimals.
+    """
+    fill_values: dict[str, Any] = {}
+    for column_name, bucket in accumulator.items():
+        values = bucket.get("values") or []
+        if not values:
+            continue
+        numeric_series = pd.Series(values, dtype="float64")
+        is_integer_column = bool(bucket.get("all_integer"))
+
+        if strategy == "mean":
+            statistic = float(numeric_series.mean())
+        elif strategy == "median":
+            statistic = float(numeric_series.median())
+        else:  # smart
+            statistic = float(numeric_series.median()) if is_integer_column else float(numeric_series.mean())
+
+        fill_values[column_name] = int(round(statistic)) if is_integer_column else round(statistic, 2)
+    return fill_values
+
+
+def accumulate_mode_imputation_stats(
+    df: pd.DataFrame,
+    target_columns: set[str] | None,
+    accumulator: dict[str, dict[str, int]],
+) -> None:
+    """Count each target column's existing (non-missing) values across chunks so
+    the most frequent value (mode) can be picked once the whole file is scanned."""
+    scoped_columns = {str(column) for column in (target_columns or set())}
+    for column in df.columns:
+        column_name = str(column)
+        if scoped_columns and column_name not in scoped_columns:
+            continue
+
+        series = df[column]
+        present_values = series[~_missing_value_mask(series)]
+        counts = accumulator.setdefault(column_name, {})
+        for value in present_values.astype("string").str.strip().tolist():
+            if value is None or value == "":
+                continue
+            counts[value] = counts.get(value, 0) + 1
+
+
+def finalize_mode_imputation_values(accumulator: dict[str, dict[str, int]]) -> dict[str, Any]:
+    """Pick the most frequent value per column. Ties break on the value itself so
+    the result is deterministic across runs."""
+    fill_values: dict[str, Any] = {}
+    for column_name, counts in accumulator.items():
+        if not counts:
+            continue
+        most_frequent_value = max(sorted(counts.items()), key=lambda item: item[1])[0]
+        fill_values[column_name] = most_frequent_value
+    return fill_values
+
+
+def _apply_imputation_values(
+    df: pd.DataFrame,
+    *,
+    target_columns: set[str] | None,
+    imputation_values: dict[str, Any] | None,
+) -> pd.DataFrame:
+    """Fill missing/blank/placeholder cells with a precomputed per-column value.
+
+    Strategy-agnostic: the value may be a numeric mean/median or a mode (most
+    frequent) value computed earlier in a whole-file pre-pass.
+    """
+    if not imputation_values:
+        return df
+
+    cleaned_df = df.copy()
+    scoped_columns = {str(column) for column in (target_columns or set())}
+    for column in cleaned_df.columns:
+        column_name = str(column)
+        if scoped_columns and column_name not in scoped_columns:
+            continue
+        if column_name not in imputation_values:
+            continue
+
+        series = cleaned_df[column]
+        missing_mask = _missing_value_mask(series)
+        if missing_mask.any():
+            updated_series = series.astype("object")
+            updated_series.loc[missing_mask] = imputation_values[column_name]
+            cleaned_df[column] = updated_series
+
+    return cleaned_df
 
 
 def _is_effectively_missing_value(value: Any) -> bool:
@@ -1289,7 +1604,11 @@ def _normalize_phone_columns(
             or pd.api.types.is_numeric_dtype(series)
         ):
             continue
-        if not _is_phone_candidate_column(column_name, series):
+        # When the column is explicitly targeted (e.g. from a suggestion's target_columns),
+        # honour it directly instead of second-guessing with the candidate heuristic — a
+        # heavily formatted or partly-invalid phone column could otherwise be skipped and
+        # left uncleaned. The heuristic still gates auto-detection when nothing is targeted.
+        if not scoped_columns and not _is_phone_candidate_column(column_name, series):
             continue
 
         normalized_values: list[Any] = []
@@ -1495,14 +1814,16 @@ def _resolve_cleaning_mode_from_hint(
         "missing_value_normalization": "missing",
         "missing_value_replacement": "missing",
         "missing_value_imputation": "missing",
+        "numeric_missing_imputation": "numeric_imputation",
+        "date_missing_imputation": "mode_imputation",
         "date_normalization": "date",
         "date_format_normalization": "date",
         "email_normalization": "email",
         "phone_normalization": "phone",
         "age_normalization": "age",
         "integer_validation": "integer_validation",
-        "float_validation": "type_validation",
-        "boolean_validation": "type_validation",
+        "float_validation": "float_validation",
+        "boolean_validation": "boolean_validation",
         "numeric_normalization": "numeric",
         "text_normalization": "text",
         "duplicate_removal": "duplicate",
@@ -1567,7 +1888,14 @@ def _compute_record_hashes(records: list[dict[str, Any]], *, columns: list[str])
     return pd.util.hash_pandas_object(comparable_df.astype(str), index=False).astype("uint64").tolist()
 
 
-def _invoke_cleaning_batch(chain, batch_json: str, user_prompt: str, expected_rows: int) -> list[dict[str, Any]]:
+def _invoke_cleaning_batch(
+    chain,
+    batch_json: str,
+    user_prompt: str,
+    expected_rows: int,
+    *,
+    max_attempts: int = 2,
+) -> list[dict[str, Any]]:
     retry_prompts = [
         user_prompt,
         (
@@ -1575,11 +1903,14 @@ def _invoke_cleaning_batch(chain, batch_json: str, user_prompt: str, expected_ro
             f"Important: return only a JSON array with exactly {expected_rows} objects, keep all original keys, "
             'and if the instruction asks for a literal placeholder like NaN then output the string value "NaN".'
         ),
-    ]
+    ][: max(1, max_attempts)]
     last_error: Exception | None = None
     for prompt in retry_prompts:
         try:
-            raw_response = chain.invoke({"batch_json": batch_json, "user_prompt": prompt})
+            raw_response = chain.invoke(
+                {"batch_json": batch_json, "user_prompt": prompt},
+                config={"callbacks": [TokenUsageLogger(label="ai-cleaning")]},
+            )
             cleaned_batch = _normalize_cleaned_batch_payload(_extract_json_payload(raw_response))
             if not isinstance(cleaned_batch, list):
                 raise ValueError(f"Expected a list of JSON objects, got {type(cleaned_batch)}")
@@ -1591,27 +1922,46 @@ def _invoke_cleaning_batch(chain, batch_json: str, user_prompt: str, expected_ro
     raise last_error if last_error is not None else ValueError("Cleaning batch failed")
 
 
-def _invoke_cleaning_batch_with_fallback(chain, batch_records: list[dict[str, Any]], user_prompt: str) -> list[dict[str, Any]]:
+def _invoke_cleaning_batch_with_fallback(
+    chain,
+    batch_records: list[dict[str, Any]],
+    user_prompt: str,
+    *,
+    _depth: int = 0,
+) -> list[dict[str, Any]]:
     expected_rows = len(batch_records)
     if expected_rows == 0:
         return []
 
+    # The top-level attempt keeps both prompts (best chance to succeed without
+    # splitting). Once we are already bisecting, retry only once per sub-batch so
+    # the same rows are not re-sent to the model twice at every level.
+    max_attempts = 2 if _depth == 0 else 1
     batch_json = json.dumps(batch_records, ensure_ascii=False, separators=(",", ":"))
     try:
-        return _invoke_cleaning_batch(chain=chain, batch_json=batch_json, user_prompt=user_prompt, expected_rows=expected_rows)
+        return _invoke_cleaning_batch(
+            chain=chain,
+            batch_json=batch_json,
+            user_prompt=user_prompt,
+            expected_rows=expected_rows,
+            max_attempts=max_attempts,
+        )
     except Exception:
-        if expected_rows == 1:
-            return [dict(batch_records[0])]
+        # Stop recursing (and re-sending) once a single row still fails or we hit
+        # the depth cap; return the original rows unchanged rather than burning
+        # more tokens on a chunk the model keeps mishandling.
+        if expected_rows == 1 or _depth >= settings.UAT_AI_CLEANING_MAX_FALLBACK_DEPTH:
+            return [dict(row) for row in batch_records]
 
         mid = expected_rows // 2
         left_records = batch_records[:mid]
         right_records = batch_records[mid:]
         try:
-            left_cleaned = _invoke_cleaning_batch_with_fallback(chain, left_records, user_prompt)
+            left_cleaned = _invoke_cleaning_batch_with_fallback(chain, left_records, user_prompt, _depth=_depth + 1)
         except Exception:
             left_cleaned = [dict(row) for row in left_records]
         try:
-            right_cleaned = _invoke_cleaning_batch_with_fallback(chain, right_records, user_prompt)
+            right_cleaned = _invoke_cleaning_batch_with_fallback(chain, right_records, user_prompt, _depth=_depth + 1)
         except Exception:
             right_cleaned = [dict(row) for row in right_records]
         return left_cleaned + right_cleaned
@@ -1754,9 +2104,14 @@ def clean_dataframe_chunk(
     target_columns_hint: list[str] | None = None,
     seen_row_hashes: set[int] | None = None,
     ai_row_cache: dict[Any, Any] | None = None,
+    imputation_values: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
-    should_normalize_missing = _prompt_mentions_missing_values(user_prompt)
+    should_normalize_missing = _prompt_mentions_missing_values(user_prompt) and not _prompt_requests_any_imputation(
+        user_prompt
+    )
     should_trim_whitespace = _should_trim_whitespace(user_prompt)
+    should_collapse_spaces = _should_collapse_spaces(user_prompt)
+    case_conversion_mode = _case_conversion_mode(user_prompt)
     target_columns = set(target_columns_hint or []) | _extract_target_columns_from_prompt([str(column) for column in df.columns], user_prompt)
     active_prompt_type_hint = _normalize_prompt_type_hint(prompt_type_hint) or (
         plan.prompt_type_hint if plan is not None else None
@@ -1774,18 +2129,44 @@ def clean_dataframe_chunk(
         df,
         normalize_missing=should_normalize_missing,
         trim_whitespace=should_trim_whitespace,
+        collapse_spaces=should_collapse_spaces,
         target_columns=target_columns,
         preserve_missing_literals={missing_replacement or NULL_OUTPUT_TOKEN},
     )
-    if hinted_mode == "missing" or _is_missing_value_only_prompt(user_prompt):
+    if case_conversion_mode:
+        cleaned_df = _apply_case_conversion(
+            cleaned_df,
+            mode=case_conversion_mode,
+            target_columns=target_columns,
+        )
+    if (
+        hinted_mode in {"numeric_imputation", "mode_imputation"}
+        or _is_numeric_imputation_only_prompt(user_prompt)
+        or _is_mode_imputation_only_prompt(user_prompt)
+    ):
+        cleaned_df = _apply_imputation_values(
+            cleaned_df,
+            target_columns=target_columns,
+            imputation_values=imputation_values,
+        )
+    elif hinted_mode == "missing" or _is_missing_value_only_prompt(user_prompt):
         cleaned_df = _replace_missing_values(
             cleaned_df,
             replacement=missing_replacement or NULL_OUTPUT_TOKEN,
             target_columns=target_columns,
         )
 
-    if hinted_mode == "type_validation" or hinted_mode == "integer_validation" or _is_type_validation_only_prompt(user_prompt):
-        cleaned_df = _apply_schema_type_validation(cleaned_df, target_columns=target_columns)
+    forced_validation_type = {
+        "integer_validation": "integer",
+        "float_validation": "float",
+        "boolean_validation": "boolean",
+    }.get(hinted_mode)
+    if hinted_mode in {"type_validation", "integer_validation", "float_validation", "boolean_validation"} or _is_type_validation_only_prompt(user_prompt):
+        cleaned_df = _apply_schema_type_validation(
+            cleaned_df,
+            target_columns=target_columns,
+            forced_type=forced_validation_type,
+        )
     if hinted_mode == "header_type" or _is_header_type_only_prompt(user_prompt):
         cleaned_df = _normalize_header_type_columns(cleaned_df, target_columns=target_columns)
     if _should_normalize_headers(user_prompt):
@@ -1799,11 +2180,20 @@ def clean_dataframe_chunk(
     if hinted_mode == "integer_format" or _is_integer_format_only_prompt(user_prompt):
         cleaned_df = _normalize_integer_format_columns(cleaned_df, target_columns=target_columns)
     if hinted_mode == "phone" or _is_phone_only_prompt(user_prompt):
+        # Replace clearly-invalid phone values (e.g. "string_phone") with the standard
+        # null token by default — consistent with the boolean/integer/float/date
+        # validators. Otherwise invalid values survive cleaning and re-analysis keeps
+        # re-flagging the same phone issue, so it never resolves. An explicit token from
+        # the prompt still wins when provided.
+        if "invalid" in normalized_prompt and generic_replacement:
+            phone_invalid_replacement = generic_replacement
+        else:
+            phone_invalid_replacement = NULL_OUTPUT_TOKEN
         cleaned_df = _normalize_phone_columns(
             cleaned_df,
             user_prompt=user_prompt,
             target_columns=target_columns,
-            invalid_replacement=generic_replacement if "invalid" in normalized_prompt else None,
+            invalid_replacement=phone_invalid_replacement,
             keep_only_valid_rows=_should_keep_only_valid_phone_rows(user_prompt),
         )
     if hinted_mode == "text" or _is_text_normalization_only_prompt(user_prompt):

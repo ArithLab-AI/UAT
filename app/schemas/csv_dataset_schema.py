@@ -1,7 +1,35 @@
 from datetime import datetime
 from typing import Literal
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.schemas.common_schema import SuccessResponse
+
+class CsvDatasetColumnResponse(BaseModel):
+    name: str
+    type: Literal["integer", "float", "boolean", "date", "string"] | None = None
+
+
+class CsvDatasetColumnDetailResponse(CsvDatasetColumnResponse):
+    """Shape of every column when a dataset is fetched with ``is_detail=true``."""
+
+    display_type: Literal["Numerical", "Categorical", "Datetime"]
+    missing_count: int
+    missing_percentage: float
+    unique_count: int
+    unique_percentage: float
+    sample: list[str]
+
+
+class CsvDatasetColumnsResponse(BaseModel):
+    """Whole payload of a dataset fetched with ``is_detail=true``: its columns, nothing else.
+
+    Extra keys are forbidden so this never quietly matches — and strips — a full dataset
+    payload that failed to validate as one, in the response-model union it shares with them.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    columns: list[CsvDatasetColumnDetailResponse | CsvDatasetColumnResponse]
+
 
 class CsvDatasetSummaryResponse(BaseModel):
     id: int
@@ -9,9 +37,11 @@ class CsvDatasetSummaryResponse(BaseModel):
     table_name: str
     storage_key: str | None = None
     file_url: str | None = None
+    is_clean: bool = False
+    clean_file_url: str | None = None
     file_size: int
     total_rows: int
-    columns: list[str]
+    columns: list[CsvDatasetColumnDetailResponse | CsvDatasetColumnResponse]
     created_at: datetime
 
     class Config:
@@ -78,13 +108,40 @@ class SelectExcelSheetRequest(BaseModel):
         }
 
 
+class GoogleSheetImportRequest(BaseModel):
+    url: str = Field(..., min_length=1, max_length=2_048)
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "url": "https://docs.google.com/spreadsheets/d/1abcDEFghiJKlmnOPq/edit#gid=0",
+            }
+        }
+
+
 class CsvMergedDatasetResponse(CsvDatasetSummaryResponse):
+    file_name: str
     source_datasets: list[CsvMergedSourceDatasetResponse]
 
+class PaginationMetaResponse(BaseModel):
+    page: int
+    page_size: int
+    total: int
+    total_pages: int
+
+class CsvDatasetListUploadedResponse(CsvUploadedDatasetResponse):
+    dataset_type: Literal["uploaded"]
+    # True only when the dataset's latest analysis run returned zero suggestions.
+    # Never analysed stays False -- see _build_dataset_fully_clean_map.
+    is_fully_clean: bool = False
+
+class CsvDatasetListMergedResponse(CsvMergedDatasetResponse):
+    dataset_type: Literal["merged"]
+    is_fully_clean: bool = False
 
 class CsvDatasetListResponse(BaseModel):
-    uploaded_datasets: list[CsvUploadedDatasetResponse]
-    merged_datasets: list[CsvMergedDatasetResponse]
+    datasets: list[CsvDatasetListUploadedResponse | CsvDatasetListMergedResponse]
+    pagination: PaginationMetaResponse
 
 
 class MergeJoinColumnMapping(BaseModel):
@@ -93,17 +150,16 @@ class MergeJoinColumnMapping(BaseModel):
 
 
 class MultiSourceJoinRequest(BaseModel):
-    source_dataset_ids: list[int] = Field(..., min_length=1)
+    source_dataset_ids: list[int] = Field(..., min_length=2)
     merge_type: Literal["inner", "left", "right", "full"] | None = None
     join_columns: list[MergeJoinColumnMapping] | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def require_join_details_for_multiple_sources(self):
-        if len(self.source_dataset_ids) > 1:
-            if self.merge_type is None:
-                raise ValueError("Merge type is required when merging multiple source datasets")
-            if not self.join_columns:
-                raise ValueError("At least one join column is required when merging multiple source datasets")
+        if self.merge_type is None:
+            raise ValueError("Merge type is required when merging source datasets")
+        if not self.join_columns:
+            raise ValueError("At least one join column is required when merging source datasets")
         return self
 
 
@@ -208,11 +264,26 @@ class MergeCsvDatasetsRequest(MultiSourceJoinRequest):
         }
 
 
+class RenameDatasetRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "name": "Customer Orders September",
+            }
+        }
+
+
 CsvUploadedDatasetListSuccessResponse = SuccessResponse[
     list[CsvUploadedDatasetResponse] | MultiSheetUploadPendingResponse
 ]
 CsvUploadedDatasetSuccessResponse = SuccessResponse[CsvUploadedDatasetResponse]
 CsvMergedDatasetSuccessResponse = SuccessResponse[CsvMergedDatasetResponse]
+CsvDatasetItemResponse = (
+    CsvDatasetListUploadedResponse | CsvDatasetListMergedResponse | CsvDatasetColumnsResponse
+)
+CsvDatasetItemSuccessResponse = SuccessResponse[CsvDatasetItemResponse]
 CsvDatasetListSuccessResponse = SuccessResponse[CsvDatasetListResponse]
 MergeSuggestionsSuccessResponse = SuccessResponse[MergeSuggestionsResponse]
 PreviewMergeSuccessResponse = SuccessResponse[PreviewMergeResponse]

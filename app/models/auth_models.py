@@ -13,6 +13,9 @@ class User(Base):
     first_name = Column(String, nullable=True)
     last_name = Column(String, nullable=True)
     password = Column(String, nullable=True)
+    # The stable Google account identifier (the ID-token `sub` claim).  Email
+    # addresses can change, so they must not be used as the provider identifier.
+    google_subject = Column(String, unique=True, index=True, nullable=True)
     user_role = Column(Integer,nullable=False,
         server_default=str(DEFAULT_USER_ROLE),
     )
@@ -26,6 +29,9 @@ class OTP(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, index=True)
     otp_code = Column(String, nullable=False)
+    # OTPs are scoped so password-reset and standard login codes cannot be used
+    # to complete the Enterprise SSO flow.
+    purpose = Column(String(50), nullable=False, default="general", server_default="general")
     expires_at = Column(DateTime, nullable=False)
     is_used = Column(Boolean, default=False)
 
